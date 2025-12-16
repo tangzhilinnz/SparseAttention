@@ -151,10 +151,10 @@ test_dataset = WikiTextDataset(test_texts, vocab_builder, max_len=MAX_LEN)
 
 # Create dataloaders
 # ==========================================================
-# FIX 1: BATCH SIZE INCREASED TO 64
-# We use accumulation_steps=2 to reach effective batch size 128
+# FIX 1: BATCH SIZE INCREASED TO 128
+# We use accumulation_steps=1 since physical batch size is large enough
 # ==========================================================
-batch_size = 64
+batch_size = 128
 # CHANGED: shuffle=False (Point 3: Maintain continuity)
 # Added pin_memory=True for faster host-to-device transfer
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, drop_last=True, pin_memory=True)
@@ -680,8 +680,8 @@ def train_transformer_model(model, train_loader, valid_loader, criterion=None, n
     
     # Gradient Accumulation Steps (Simulate larger batch size)
     # FIX 3: Increased accumulation to compensate for smaller batch size
-    # 64 batch_size * 2 accumulation = 128 effective batch size
-    accumulation_steps = 2
+    # 128 batch_size * 1 accumulation = 128 effective batch size
+    accumulation_steps = 1
 
     for epoch in range(num_epochs):
         epoch_start_time = time.time()
