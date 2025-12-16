@@ -23,6 +23,10 @@ import math
 import os
 import gc
 
+import os
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
