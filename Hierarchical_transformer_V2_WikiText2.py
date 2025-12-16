@@ -9,6 +9,8 @@ from torch.utils.data import Dataset, DataLoader
 import torch.nn.functional as F
 # Import AMP for Mixed Precision
 from torch.cuda.amp import autocast, GradScaler
+# Import Checkpointing (Critical for memory savings)
+from torch.utils.checkpoint import checkpoint
 
 # Dataset and text processing
 from datasets import load_dataset
@@ -31,7 +33,7 @@ import gc
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
-# GPU SELECTION (Force GPU 3)
+# GPU SELECTION (Force GPU 2)
 os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 
 # Set random seeds for reproducibility
@@ -141,12 +143,11 @@ test_dataset = WikiTextDataset(test_texts, vocab_builder, max_len=MAX_LEN)
 
 # Create dataloaders
 # ==========================================================
-# FIX 1: REDUCE BATCH SIZE TO PREVENT OOM
-# Reduced from 128 to 32. We compensate with accumulation_steps=4
+# FIX 1: OPTIMIZED BATCH SIZE
+# Set to 16 for d_model=512. We compensate with accumulation_steps=8
 # ==========================================================
-batch_size = 32
+batch_size = 16
 # CHANGED: shuffle=False (Point 3: Maintain continuity)
-# Added pin_memory=True for faster host-to-device transfer
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, drop_last=True, pin_memory=True)
 valid_loader = DataLoader(valid_dataset, batch_size=batch_size, drop_last=True, pin_memory=True)
 test_loader = DataLoader(test_dataset, batch_size=batch_size, drop_last=True, pin_memory=True)
@@ -179,21 +180,6 @@ def build_hierarchical_index_lookup_table(seq_len, device="cuda", dtype=torch.in
     """
     Build a hierarchical index lookup table storing only neighbor nodes
     across different levels (excluding the leaf itself).
-
-    The relationship follows:
-        level 0: n ^ 1
-        level 1: (n // 2 + seq_len) ^ 1
-        level 2: (n1 // 2 + seq_len) ^ 1
-        ...
-    Stops when the next index exceeds total_nodes - 2.
-
-    Args:
-        seq_len (int): number of leaf tokens (must be a power of 2)
-        device (str): 'cuda' or 'cpu'
-        dtype (torch.dtype): index dtype (default int32)
-
-    Returns:
-        idx_map: [seq_len, level_num] int tensor
     """
     assert (seq_len & (seq_len - 1)) == 0, "seq_len must be a power of 2"
 
@@ -218,8 +204,6 @@ def build_hierarchical_index_lookup_table(seq_len, device="cuda", dtype=torch.in
                 pair = n_cur        # The leaf itself
             else:
                 # Formula: (Child_Index // 2) + Offset
-                # Note: We use n_cur (which is the *neighbor* from prev loop).
-                # This works because floor(neighbor / 2) == floor(self / 2).
                 n_next = (n_cur // 2 + seq_len) ^ 1 # Uncle
                 pair = (n_cur // 2 + seq_len)       # Parent
 
@@ -265,16 +249,11 @@ class HierarchicalSparseAttention(nn.Module):
         """
         Smart retrieval: Returns cached table if L matches, otherwise recomputes.
         """
-        # Check if we can reuse the cache
-        # 1. Cache exists
-        # 2. Sequence length matches
-        # 3. Device matches (crucial for moving model CPU <-> GPU)
         if (self.cached_idx_table is not None and 
             self.cached_seq_len == L and 
             self.cached_idx_table.device == device):
             return self.cached_idx_table, self.cached_causal_mask
 
-        # If not, recompute and update cache
         idx_table, mask = build_hierarchical_index_lookup_table(L, device=device, dtype=torch.int64)
         
         self.cached_idx_table = idx_table
@@ -291,7 +270,6 @@ class HierarchicalSparseAttention(nn.Module):
         q_unsqueezed = q.unsqueeze(3)  # Adds singleton dim at child axis
 
         # Step 2: Compute dot product with keys using einsum
-        # Use letters only; 'x' = singleton dim for q, 'c' = child dim, 'd' = head dim
         logits = torch.einsum('b h m x d, b h m c d -> b h m c', q_unsqueezed, k)  # [B,H,M,2]
 
         # Step 3: Scale by sqrt(head_dim) for stable softmax
@@ -341,10 +319,7 @@ class HierarchicalSparseAttention(nn.Module):
             # -----------------------------
             # 2 Parent queries its two children (compute attention weights)
             # -----------------------------
-            # Compute pair attention weights per parent
-            # Each parent attends to its 2 children’s keys
             w0, w1 = self._compute_pair_weights(Q_parent, K_pairs)
-            # w0, w1: [B, H, num_parents, 1]
 
             # -----------------------------
             # 3 Weighted combination to form parent K/V (and optionally Q)
@@ -380,7 +355,7 @@ class HierarchicalSparseAttention(nn.Module):
             attn_mask=mask, 
             dropout_p=0.1 if self.training else 0.0
         )
-        return output, None # FlashAttention does not easily return weights
+        return output, None 
 
     def forward(self, query, key, value, mask=None, return_attention=False):
         B, L_Q, D = query.size()
@@ -398,27 +373,16 @@ class HierarchicalSparseAttention(nn.Module):
             V = self.dropout(V)
 
             # 2. Build Hierarchy
-            # We still need hierarchy_Q to build the tree, but we won't use it for the final attention.
             _, hierarchy_K, hierarchy_V = self._build_hierarchy(Q, K, V)
 
             # 2a. Flatten K and V for indexing
-            # Note: We exclude the last element of the hierarchy lists if they represent the 
-            # single root node that might not be addressable in the table logic, 
-            # but usually we just cat everything. 
-            # Your original code did `[..., :-1, :]` likely to align with 2*seq_len-1 structure?
-            # We will concat normally.
             flat_hierarchy_K = torch.cat(hierarchy_K, dim=2) # [B, H, TotalNodes, D]
             flat_hierarchy_V = torch.cat(hierarchy_V, dim=2) # [B, H, TotalNodes, D]
 
             # 3. Retrieve Lookup Table
             idx_table, neighbor_causal_mask = self._get_lookup_table(L, device=Q.device)
             
-            # Assert table validity
-            # assert (idx_table != -1).all(), "Index table contains invalid entries."
-
             # 4. Gather Neighbors (K and V)
-            # idx_table is [L, Levels]. 
-            # We gather from dimension 2 (node index).
             gather_indices = idx_table
             
             # neighbors_k: [B, H, L, Levels, D]
@@ -426,26 +390,17 @@ class HierarchicalSparseAttention(nn.Module):
             neighbors_v = flat_hierarchy_V[:, :, gather_indices, :]
 
             # 5. Compute Self Logits (Leaf Q * Leaf K)
-            # [B, H, L, D] * [B, H, L, D] -> [B, H, L]
             self_logits = torch.einsum('b h n d, b h n d -> b h n', Q, K) / math.sqrt(Dh)
 
             # 6. Compute Neighbor Logits (Leaf Q * Neighbor K)
-            # Q: [B, H, L, D] -> unsqueeze -> [B, H, L, 1, D]
-            # neighbors_k: [B, H, L, Levels, D]
-            # Result: [B, H, L, Levels]
             neighbors_logits = torch.einsum('b h l x d, b h l n d -> b h l n', Q.unsqueeze(3), neighbors_k)
             neighbors_logits = neighbors_logits / math.sqrt(Dh)
 
             # 7. Apply Causal Mask
             if mask is not None:
-                # neighbor_causal_mask is [L, Levels]. 
-                # True means "future" (masked).
                 neighbors_logits = neighbors_logits.masked_fill(neighbor_causal_mask, float('-inf'))
 
             # 8. Concatenate (Self + Neighbors)
-            # V: [B, H, L, D] -> [B, H, L, 1, D]
-            # self_logits: [B, H, L] -> [B, H, L, 1]
-            
             all_v = torch.cat([V.unsqueeze(3), neighbors_v], dim=3)         # [B, H, L, Levels+1, D]
             all_logits = torch.cat([self_logits.unsqueeze(3), neighbors_logits], dim=3) # [B, H, L, Levels+1]
 
@@ -494,11 +449,10 @@ class PositionalEncoding(nn.Module):
         x = x + Variable(self.pe[:, :x.size(1), :], requires_grad=False)
         return self.dropout(x)
 
-# --- IMPROVED DECODER LAYER (Pre-LN Architecture) ---
+# --- IMPROVED DECODER LAYER WITH CHECKPOINTING ---
 class DecoderLayer(nn.Module):
     def __init__(self, d_model, num_heads, d_ff, dropout=0.1):
         super().__init__()
-        #self.self_attn = MultiHeadAttention(d_model, num_heads, dropout)
         self.self_attn = HierarchicalSparseAttention(d_model, num_heads, dropout)
         self.feed_forward = PositionwiseFeedForward(d_model, d_ff, dropout)
         self.norm1 = nn.LayerNorm(d_model)
@@ -506,19 +460,23 @@ class DecoderLayer(nn.Module):
         self.dropout = nn.Dropout(dropout)
         
     def forward(self, x, trg_mask=None, return_attention=False):
-        # PRE-LAYER NORMALIZATION (Apply Norm BEFORE Attention)
-        # This significantly improves stability and convergence speed
-        
-        # 1. Norm -> Attention -> Add
         norm_x = self.norm1(x)
-        if return_attention:
-            attn_output, self_attn_weights = self.self_attn(norm_x, norm_x, norm_x, mask=trg_mask, return_attention=True)
+        
+        # ======================================================
+        # FIX 2: GRADIENT CHECKPOINTING (Essential for Custom Attention)
+        # ======================================================
+        if self.training and x.requires_grad and not return_attention:
+            # Checkpointing recomputes the forward pass during backward pass
+            # This saves massive amounts of memory for tree structures
+            attn_output = checkpoint(self._custom_attn_wrapper, norm_x, trg_mask, use_reentrant=False)
         else:
             attn_output = self.self_attn(norm_x, norm_x, norm_x, mask=trg_mask)
+            if return_attention:
+                if isinstance(attn_output, tuple):
+                     attn_output, self_attn_weights = attn_output
             
         x = x + self.dropout(attn_output) # Residual
         
-        # 2. Norm -> FeedForward -> Add
         norm_x = self.norm2(x)
         ff_output = self.feed_forward(norm_x)
         x = x + self.dropout(ff_output) # Residual
@@ -526,6 +484,10 @@ class DecoderLayer(nn.Module):
         if return_attention:
             return x, self_attn_weights
         return x
+
+    def _custom_attn_wrapper(self, x, mask):
+        # Helper for checkpoint to unpack arguments
+        return self.self_attn(x, x, x, mask=mask)
 
 # --- IMPROVED MODEL CLASS (Added Initialization) ---
 class TransformerLM(nn.Module):
@@ -642,8 +604,8 @@ def train_transformer_model(model, train_loader, valid_loader, criterion=None, n
     
     # Gradient Accumulation Steps (Simulate larger batch size)
     # FIX 3: Increased accumulation to compensate for smaller batch size
-    # 32 batch_size * 4 accumulation = 128 effective batch size
-    accumulation_steps = 4 
+    # 16 batch_size * 8 accumulation = 128 effective batch size
+    accumulation_steps = 8
 
     for epoch in range(num_epochs):
         epoch_start_time = time.time()
@@ -852,15 +814,14 @@ print("\n<> Initializing Transformer Model...")
 vocab_size = len(vocab_builder.word2idx)
 print(f"Actual Vocab Size: {vocab_size}")
 
-# OPTIMIZED HYPERPARAMETERS
-# Using TransformerLM instead of Seq2Seq
+# RESTORED HYPERPARAMETERS AS REQUESTED
 model = TransformerLM(
     vocab_size=vocab_size,
-    d_model=768,        # UPDATED: 768
-    num_heads=12,       # UPDATED: 12
-    d_ff=3072,          # UPDATED: 3072
-    num_layers=12,      # UPDATED: 12
-    dropout=0.1         # UPDATED: 0.1
+    d_model=512,        # RESTORED: 512
+    num_heads=8,        # RESTORED: 8
+    d_ff=2048,          # RESTORED: 2048
+    num_layers=12,      # RESTORED: 12
+    dropout=0.1         
 )
 
 # ENABLE MULTI-GPU SUPPORT (DataParallel)
@@ -894,11 +855,11 @@ checkpoint = torch.load('best_transformer_wikitext.pt')
 # My training loop logic saves model.module if available, so we load into a fresh instance
 best_model = TransformerLM(
     vocab_size=vocab_size,
-    d_model=768,        # UPDATED: 768
-    num_heads=12,       # UPDATED: 12
-    d_ff=3072,          # UPDATED: 3072
-    num_layers=12,      # UPDATED: 12
-    dropout=0.1         # UPDATED: 0.1
+    d_model=512,        # RESTORED: 512
+    num_heads=8,        # RESTORED: 8
+    d_ff=2048,          # RESTORED: 2048
+    num_layers=12,      # RESTORED: 12
+    dropout=0.1         
 )
 best_model.load_state_dict(checkpoint['model_state_dict'])
 best_model = best_model.to(device)
