@@ -27,6 +27,8 @@ import gc
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+
 # Set random seeds for reproducibility
 def set_seed(seed=42):
     random.seed(seed)
@@ -135,7 +137,7 @@ test_dataset = WikiTextDataset(test_texts, vocab_builder, max_len=MAX_LEN)
 # Create dataloaders
 # HYPERPARAMETER: batch_size
 # INCREASED TO 64 (32 per GPU)
-batch_size = 64
+batch_size = 128
 # CHANGED: shuffle=False (Point 3: Maintain continuity)
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, drop_last=True)
 valid_loader = DataLoader(valid_dataset, batch_size=batch_size, drop_last=True)

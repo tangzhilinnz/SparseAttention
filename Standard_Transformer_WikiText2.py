@@ -23,8 +23,7 @@ import math
 import os
 import gc
 
-import os
-
+# FORCE GPU 3 SELECTION
 os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 
 # Set device
@@ -138,8 +137,8 @@ test_dataset = WikiTextDataset(test_texts, vocab_builder, max_len=MAX_LEN)
 
 # Create dataloaders
 # HYPERPARAMETER: batch_size
-# INCREASED TO 64 (32 per GPU)
-batch_size = 64
+# INCREASED TO 128 for A100 stability
+batch_size = 128
 # CHANGED: shuffle=False (Point 3: Maintain continuity)
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, drop_last=True)
 valid_loader = DataLoader(valid_dataset, batch_size=batch_size, drop_last=True)
@@ -176,62 +175,31 @@ class MultiHeadAttention(nn.Module):
         self.out_proj = nn.Linear(d_model, d_model)
         
         self.dropout = nn.Dropout(dropout)
-        self.scale = math.sqrt(self.head_dim)
         
     def forward(self, query, key, value, mask=None, return_attention=False):
         batch_size = query.shape[0]
         
-        Q = self.q_proj(query)
-        K = self.k_proj(key)
-        V = self.v_proj(value)
+        # 1. Project and Reshape [Batch, Seq, Heads, Dim] -> [Batch, Heads, Seq, Dim]
+        Q = self.q_proj(query).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        K = self.k_proj(key).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        V = self.v_proj(value).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
         
-        Q = Q.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
-        K = K.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
-        V = V.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
-        
-        #scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
-        #
-        #if mask is not None:
-        #    # Mask needs to be handled carefully with DataParallel
-        #    # But since mask is usually passed per-batch inside the forward, it's fine.
-        #    scores = scores.masked_fill(mask == 0, -1e9)
-        #
-        #attn_weights = F.softmax(scores, dim=-1)
-        #attn_weights = self.dropout(attn_weights)
-        #
-        #output = torch.matmul(attn_weights, V)
-        #output = output.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
-        #output = self.out_proj(output)
-        #
-        #output = F.scaled_dot_product_attention(Q, K, V, attn_mask=mask, dropout_p=0.1 if self.training else 0.0)
-        #
-        #if return_attention:
-        #    return output, attn_weights
-        #
-        #return output
-
-        # 2. Flash Attention (Optimized Kernel)
-        # Output shape: [Batch, Num_Heads, Seq_Len, Head_Dim]
+        # 2. Flash Attention (Optimized Kernel for A100)
         output = F.scaled_dot_product_attention(
             Q, K, V, 
             attn_mask=mask, 
             dropout_p=0.1 if self.training else 0.0
         )
         
-        # 3. CRITICAL MISSING STEP: Reshape back to [Batch, Seq_Len, d_model]
-        # Transpose to [Batch, Seq_Len, Num_Heads, Head_Dim]
-        output = output.transpose(1, 2).contiguous()
-        
-        # Flatten heads: [Batch, Seq_Len, d_model]
-        output = output.view(batch_size, -1, self.d_model)
+        # 3. CRITICAL FIX: Reshape back to [Batch, Seq_Len, d_model]
+        output = output.transpose(1, 2).contiguous() # [Batch, Seq, Heads, Dim]
+        output = output.view(batch_size, -1, self.d_model) # Flatten heads
         
         # 4. Final Projection
         output = self.out_proj(output)
         
         if return_attention:
-            # Note: scaled_dot_product_attention doesn't return weights easily.
-            # If you strictly need weights, you can't use the F.scaled version without is_causal=False trickery 
-            # or returning None. For now returning None to avoid breaking loop.
+            # FlashAttention doesn't return weights easily, returning None to avoid breaking loop.
             return output, None 
         
         return output
@@ -242,7 +210,7 @@ class PositionwiseFeedForward(nn.Module):
         self.fc1 = nn.Linear(d_model, d_ff)
         self.fc2 = nn.Linear(d_ff, d_model)
         self.dropout = nn.Dropout(p=dropout)
-    
+        
     def forward(self, x):
         return self.fc2(self.dropout(F.relu(self.fc1(x))))
 
@@ -257,7 +225,7 @@ class PositionalEncoding(nn.Module):
         pe[:, 1::2] = torch.cos(position * div_term)
         pe = pe.unsqueeze(0)
         self.register_buffer('pe', pe)
-    
+        
     def forward(self, x):
         x = x + Variable(self.pe[:, :x.size(1), :], requires_grad=False)
         return self.dropout(x)
@@ -274,7 +242,6 @@ class DecoderLayer(nn.Module):
         
     def forward(self, x, trg_mask=None, return_attention=False):
         # PRE-LAYER NORMALIZATION (Apply Norm BEFORE Attention)
-        # This significantly improves stability and convergence speed
         
         # 1. Norm -> Attention -> Add
         norm_x = self.norm1(x)
@@ -372,7 +339,7 @@ class TransformerLM(nn.Module):
 # 3. TRAINING LOOP (Added Auto-Exit / Early Stopping)
 # ==========================================
 
-def train_transformer_model(model, train_loader, valid_loader, criterion=None, num_epochs=100, learning_rate=3e-4, patience=6):
+def train_transformer_model(model, train_loader, valid_loader, criterion=None, num_epochs=100, learning_rate=5e-4, patience=6):
     if criterion is None:
         # NOTE: Using Label Smoothing for better generalization
         criterion = nn.CrossEntropyLoss(ignore_index=0, label_smoothing=0.1)
@@ -385,8 +352,16 @@ def train_transformer_model(model, train_loader, valid_loader, criterion=None, n
     
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
     
-    # CHANGED: Use Cosine Annealing (Point 7: Better scheduler)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, verbose=False)
+    # CHANGED: Use OneCycleLR for better convergence on large batch
+    total_steps = len(train_loader) * num_epochs
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer, 
+        max_lr=learning_rate, 
+        total_steps=total_steps,
+        pct_start=0.3,
+        div_factor=25,
+        final_div_factor=1000
+    )
     
     best_valid_loss = float('inf')
     train_losses, valid_losses = [], []
@@ -395,8 +370,8 @@ def train_transformer_model(model, train_loader, valid_loader, criterion=None, n
     # --- EARLY STOPPING VARIABLES ---
     patience_counter = 0
     
-    # Gradient Accumulation Steps (Simulate larger batch size)
-    accumulation_steps = 8 
+    # Gradient Accumulation Steps (Reduced because batch size is now large)
+    accumulation_steps = 2 
 
     for epoch in range(num_epochs):
         epoch_start_time = time.time()
@@ -432,14 +407,17 @@ def train_transformer_model(model, train_loader, valid_loader, criterion=None, n
             if (batch_idx + 1) % accumulation_steps == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
+                scheduler.step() # Step per batch for OneCycle
                 optimizer.zero_grad()
             
             # Multiply back for reporting
             total_train_loss += loss.item() * accumulation_steps
             
+            current_lr = scheduler.get_last_lr()[0]
             progress_bar.set_postfix({
                 'loss': f'{loss.item() * accumulation_steps:.4f}',
-                'ppl': f'{math.exp(min(loss.item() * accumulation_steps, 10)):.2f}'
+                'ppl': f'{math.exp(min(loss.item() * accumulation_steps, 10)):.2f}',
+                'lr': f'{current_lr:.6f}'
             })
         
         avg_train_loss = total_train_loss / len(train_loader)
@@ -465,9 +443,6 @@ def train_transformer_model(model, train_loader, valid_loader, criterion=None, n
                 total_valid_loss += loss.item()
         
         avg_valid_loss = total_valid_loss / len(valid_loader)
-        
-        # CHANGED: Scheduler step now per epoch without metric
-        scheduler.step()
         
         epoch_end_time = time.time()
         epoch_time = epoch_end_time - epoch_start_time
@@ -587,15 +562,14 @@ print("\n<> Initializing Transformer Model...")
 vocab_size = len(vocab_builder.word2idx)
 print(f"Actual Vocab Size: {vocab_size}")
 
-# OPTIMIZED HYPERPARAMETERS
-# Using TransformerLM instead of Seq2Seq
+# OPTIMIZED HYPERPARAMETERS (SCALED FOR A100)
 model = TransformerLM(
     vocab_size=vocab_size,
-    d_model=512,        # INCREASED from 256
-    num_heads=8,        
-    d_ff=2048,          # INCREASED from 1024
-    num_layers=12,       
-    dropout=0.2         # CHANGED: Increased from 0.1 to 0.2 (Point 7)
+    d_model=768,        # GPT-2 Base size
+    num_heads=12,       # 768 / 12 = 64
+    d_ff=3072,          # 4 * 768
+    num_layers=12,        
+    dropout=0.1         # Better stability for large models
 )
 
 # ENABLE MULTI-GPU SUPPORT (DataParallel)
@@ -609,7 +583,7 @@ print(f"Using device: {device}")
 
 # Training parameters
 num_epochs = 100     # SET HIGH as requested (auto-exit will stop it)
-learning_rate = 1e-4 # LOWERED for stability with larger model
+learning_rate = 5e-4 # INCREASED for OneCycleLR
 
 print("\n<> Starting Training...")
 results = train_transformer_model(
@@ -629,11 +603,11 @@ checkpoint = torch.load('best_transformer_wikitext.pt')
 # My training loop logic saves model.module if available, so we load into a fresh instance
 best_model = TransformerLM(
     vocab_size=vocab_size,
-    d_model=512,
-    num_heads=8,        
-    d_ff=2048,
-    num_layers=12,       
-    dropout=0.2
+    d_model=768,
+    num_heads=12,       
+    d_ff=3072,
+    num_layers=12,        
+    dropout=0.1
 )
 best_model.load_state_dict(checkpoint['model_state_dict'])
 best_model = best_model.to(device)
