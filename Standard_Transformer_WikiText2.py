@@ -24,7 +24,7 @@ import os
 import gc
 
 # FORCE GPU 3 SELECTION
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

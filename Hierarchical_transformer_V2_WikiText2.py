@@ -7,6 +7,8 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import torch.nn.functional as F
+# Import AMP for Mixed Precision
+from torch.cuda.amp import autocast, GradScaler
 
 # Dataset and text processing
 from datasets import load_dataset
@@ -30,7 +32,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 # GPU SELECTION (Force GPU 3)
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 
 # Set random seeds for reproducibility
 def set_seed(seed=42):
@@ -138,13 +140,16 @@ valid_dataset = WikiTextDataset(valid_texts, vocab_builder, max_len=MAX_LEN)
 test_dataset = WikiTextDataset(test_texts, vocab_builder, max_len=MAX_LEN)
 
 # Create dataloaders
-# HYPERPARAMETER: batch_size
-# INCREASED TO 128 (Optimized for A100)
-batch_size = 128
+# ==========================================================
+# FIX 1: REDUCE BATCH SIZE TO PREVENT OOM
+# Reduced from 128 to 32. We compensate with accumulation_steps=4
+# ==========================================================
+batch_size = 32
 # CHANGED: shuffle=False (Point 3: Maintain continuity)
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, drop_last=True)
-valid_loader = DataLoader(valid_dataset, batch_size=batch_size, drop_last=True)
-test_loader = DataLoader(test_dataset, batch_size=batch_size, drop_last=True)
+# Added pin_memory=True for faster host-to-device transfer
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, drop_last=True, pin_memory=True)
+valid_loader = DataLoader(valid_dataset, batch_size=batch_size, drop_last=True, pin_memory=True)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, drop_last=True, pin_memory=True)
 
 # Print detailed information
 print("\n<> Dataset Statistics:")
@@ -281,13 +286,6 @@ class HierarchicalSparseAttention(nn.Module):
     def _compute_pair_weights(self, q, k):
         """
         Compute pair attention weights for a query node attending to two child nodes.
-
-        Args:
-            q: [B, H, M, D]  <- query for each parent node (M = num_parents)
-            k: [B, H, M, 2, D] <- keys for each parent's 2 child nodes
-
-        Returns:
-            w0, w1: [B, H, M, 1] attention weights for child 0 and child 1
         """
         # Step 1: Unsqueeze q to shape [B,H,M,1,D] to match child dimension
         q_unsqueezed = q.unsqueeze(3)  # Adds singleton dim at child axis
@@ -314,13 +312,6 @@ class HierarchicalSparseAttention(nn.Module):
     def _build_hierarchy(self, Q, K, V):
         """
         Build hierarchical Q, K, V representations using true parent-driven design.
-
-        Each parent node starts with its own (zero) query and computes attention
-        weights over its two children to form its Q/K/V.
-
-        Q, K, V: [B, H, L, D]
-        Returns:
-            hierarchy_Q, hierarchy_K, hierarchy_V: lists (from leaf to root)
         """
         B, H, L, D = Q.shape
 
@@ -381,7 +372,7 @@ class HierarchicalSparseAttention(nn.Module):
             level += 1
 
         return hierarchy_Q, hierarchy_K, hierarchy_V
-   
+    
     def _standard_attention(self, Q, K, V, mask):
         # Optimization: Use Flash Attention for fallback
         output = F.scaled_dot_product_attention(
@@ -611,7 +602,7 @@ class TransformerLM(nn.Module):
         return current_tokens
 
 # ==========================================
-# 3. TRAINING LOOP (Added Auto-Exit / Early Stopping)
+# 3. TRAINING LOOP (FIXED OOM with Mixed Precision)
 # ==========================================
 
 def train_transformer_model(model, train_loader, valid_loader, criterion=None, num_epochs=100, learning_rate=5e-4, patience=6):
@@ -627,6 +618,9 @@ def train_transformer_model(model, train_loader, valid_loader, criterion=None, n
     
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
     
+    # FIX 2: Initialize GradScaler for AMP
+    scaler = GradScaler()
+
     # CHANGED: Use OneCycleLR for better convergence
     # Note: total_steps is usually len(train_loader) * num_epochs
     total_steps = len(train_loader) * num_epochs
@@ -647,8 +641,9 @@ def train_transformer_model(model, train_loader, valid_loader, criterion=None, n
     patience_counter = 0
     
     # Gradient Accumulation Steps (Simulate larger batch size)
-    # Reduced to 2 because physical batch size is 128
-    accumulation_steps = 2 
+    # FIX 3: Increased accumulation to compensate for smaller batch size
+    # 32 batch_size * 4 accumulation = 128 effective batch size
+    accumulation_steps = 4 
 
     for epoch in range(num_epochs):
         epoch_start_time = time.time()
@@ -668,22 +663,32 @@ def train_transformer_model(model, train_loader, valid_loader, criterion=None, n
             input_ids = batch['input_ids'].to(device)
             labels = batch['label'].to(device)
             
-            # --- IMPROVEMENT: Only pass input_ids (Decoder Only) ---
-            outputs = model(input_ids)
+            # --- FIX 4: Autocast context manager for AMP ---
+            with autocast():
+                # --- IMPROVEMENT: Only pass input_ids (Decoder Only) ---
+                outputs = model(input_ids)
+                
+                output_dim = outputs.shape[-1]
+                outputs = outputs.contiguous().view(-1, output_dim)
+                labels = labels.contiguous().view(-1)
+                
+                loss = criterion(outputs, labels)
+                
+                # Divide loss by accumulation steps
+                loss = loss / accumulation_steps
             
-            output_dim = outputs.shape[-1]
-            outputs = outputs.contiguous().view(-1, output_dim)
-            labels = labels.contiguous().view(-1)
-            
-            loss = criterion(outputs, labels)
-            
-            # Divide loss by accumulation steps
-            loss = loss / accumulation_steps
-            loss.backward()
+            # --- FIX 5: Scale loss and backward ---
+            scaler.scale(loss).backward()
             
             if (batch_idx + 1) % accumulation_steps == 0:
+                # Unscale before clipping
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
+                
+                # Step with scaler
+                scaler.step(optimizer)
+                scaler.update()
+                
                 # OneCycleLR steps per batch
                 scheduler.step()
                 optimizer.zero_grad()
@@ -710,14 +715,14 @@ def train_transformer_model(model, train_loader, valid_loader, criterion=None, n
                 input_ids = batch['input_ids'].to(device)
                 labels = batch['label'].to(device)
                 
-                # --- IMPROVEMENT: Only pass input_ids ---
-                outputs = model(input_ids)
+                # Cast validation to fp16 as well to save memory
+                with autocast():
+                    outputs = model(input_ids)
+                    output_dim = outputs.shape[-1]
+                    outputs = outputs.contiguous().view(-1, output_dim)
+                    labels = labels.contiguous().view(-1)
+                    loss = criterion(outputs, labels)
                 
-                output_dim = outputs.shape[-1]
-                outputs = outputs.contiguous().view(-1, output_dim)
-                labels = labels.contiguous().view(-1)
-                
-                loss = criterion(outputs, labels)
                 total_valid_loss += loss.item()
         
         avg_valid_loss = total_valid_loss / len(valid_loader)
@@ -754,6 +759,10 @@ def train_transformer_model(model, train_loader, valid_loader, criterion=None, n
             if patience_counter >= patience:
                 print(f"\n<> Auto-Exit Triggered: Validation loss has not improved for {patience} epochs.")
                 break
+        
+        # Clean memory manually
+        gc.collect()
+        torch.cuda.empty_cache()
     
     total_time = sum(epoch_times)
     
@@ -814,14 +823,17 @@ def evaluate_test_set(model, test_loader):
             input_ids = batch['input_ids'].to(device)
             labels = batch['label'].to(device)
             
-            # --- IMPROVEMENT: Only pass input_ids ---
-            outputs = model(input_ids)
+            # Use autocast for eval too (faster)
+            with autocast():
+                # --- IMPROVEMENT: Only pass input_ids ---
+                outputs = model(input_ids)
+                
+                output_dim = outputs.shape[-1]
+                outputs = outputs.contiguous().view(-1, output_dim)
+                labels = labels.contiguous().view(-1)
+                
+                loss = eval_criterion(outputs, labels)
             
-            output_dim = outputs.shape[-1]
-            outputs = outputs.contiguous().view(-1, output_dim)
-            labels = labels.contiguous().view(-1)
-            
-            loss = eval_criterion(outputs, labels)
             total_loss += loss.item()
             
     avg_loss = total_loss / len(test_loader)
