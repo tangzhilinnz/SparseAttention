@@ -185,22 +185,50 @@ class MultiHeadAttention(nn.Module):
         K = K.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
         V = V.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
         
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
+        #scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
+        #
+        #if mask is not None:
+        #    # Mask needs to be handled carefully with DataParallel
+        #    # But since mask is usually passed per-batch inside the forward, it's fine.
+        #    scores = scores.masked_fill(mask == 0, -1e9)
+        #
+        #attn_weights = F.softmax(scores, dim=-1)
+        #attn_weights = self.dropout(attn_weights)
+        #
+        #output = torch.matmul(attn_weights, V)
+        #output = output.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
+        #output = self.out_proj(output)
+        #
+        #output = F.scaled_dot_product_attention(Q, K, V, attn_mask=mask, dropout_p=0.1 if self.training else 0.0)
+        #
+        #if return_attention:
+        #    return output, attn_weights
+        #
+        #return output
+
+        # 2. Flash Attention (Optimized Kernel)
+        # Output shape: [Batch, Num_Heads, Seq_Len, Head_Dim]
+        output = F.scaled_dot_product_attention(
+            Q, K, V, 
+            attn_mask=mask, 
+            dropout_p=0.1 if self.training else 0.0
+        )
         
-        if mask is not None:
-            # Mask needs to be handled carefully with DataParallel
-            # But since mask is usually passed per-batch inside the forward, it's fine.
-            scores = scores.masked_fill(mask == 0, -1e9)
+        # 3. CRITICAL MISSING STEP: Reshape back to [Batch, Seq_Len, d_model]
+        # Transpose to [Batch, Seq_Len, Num_Heads, Head_Dim]
+        output = output.transpose(1, 2).contiguous()
         
-        attn_weights = F.softmax(scores, dim=-1)
-        attn_weights = self.dropout(attn_weights)
+        # Flatten heads: [Batch, Seq_Len, d_model]
+        output = output.view(batch_size, -1, self.d_model)
         
-        output = torch.matmul(attn_weights, V)
-        output = output.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
+        # 4. Final Projection
         output = self.out_proj(output)
         
         if return_attention:
-            return output, attn_weights
+            # Note: scaled_dot_product_attention doesn't return weights easily.
+            # If you strictly need weights, you can't use the F.scaled version without is_causal=False trickery 
+            # or returning None. For now returning None to avoid breaking loop.
+            return output, None 
         
         return output
 
