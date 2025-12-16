@@ -1,5 +1,12 @@
 # -*- coding: utf-8 -*-
 
+import os
+# ==========================================
+# CRITICAL FIX: GPU SELECTION MUST BE FIRST
+# ==========================================
+# Set this before importing torch or calling torch.cuda
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+
 import datasets
 # Essential PyTorch imports
 import torch
@@ -26,15 +33,12 @@ from datetime import timedelta
 from torch.autograd import Variable
 
 import math
-import os
 import gc
 
-# Set device
+# Set device (Now this will correctly see only GPU 2 as "cuda:0")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
-
-# GPU SELECTION (Force GPU 2)
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+print(f"Physical GPU Count Visible: {torch.cuda.device_count()}")
 
 # Set random seeds for reproducibility
 def set_seed(seed=42):
