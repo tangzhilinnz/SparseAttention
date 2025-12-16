@@ -1,3 +1,5 @@
+# -*- coding: utf-8 -*-
+
 import datasets
 # Essential PyTorch imports
 import torch
