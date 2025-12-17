@@ -137,7 +137,7 @@ vocab_builder = VocabBuilder(train_texts, max_vocab_size=35000)
 print("\n<> Creating Datasets...")
 # HYPERPARAMETER: max_len
 # Keeping at 128 (Safe Floor)
-MAX_LEN = 128
+MAX_LEN = 512
 train_dataset = WikiTextDataset(train_texts, vocab_builder, max_len=MAX_LEN)
 valid_dataset = WikiTextDataset(valid_texts, vocab_builder, max_len=MAX_LEN)
 test_dataset = WikiTextDataset(test_texts, vocab_builder, max_len=MAX_LEN)
