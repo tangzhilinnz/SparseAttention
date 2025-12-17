@@ -654,7 +654,8 @@ def train_transformer_model(model, train_loader, valid_loader, criterion=None, n
     print(f"<> Training Transformer Model")
     print(f"{'='*50}")
     
-    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
+    # OPTIMIZATION: Increased weight decay from 0.01 to 0.1 for better generalization
+    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.1)
     
     # FIX: Use new torch.amp.GradScaler syntax
     scaler = torch.amp.GradScaler('cuda')
@@ -894,14 +895,14 @@ print("\n<> Initializing Transformer Model...")
 vocab_size = len(vocab_builder.word2idx)
 print(f"Actual Vocab Size: {vocab_size}")
 
-# RESTORED HYPERPARAMETERS AS REQUESTED
+# OPTIMIZED HYPERPARAMETERS FOR PPL (Reduced from 12 layers/768 dim)
 model = TransformerLM(
     vocab_size=vocab_size,
-    d_model=768,        # RESTORED: 768
-    num_heads=12,       # RESTORED: 12
-    d_ff=3072,          # RESTORED: 3072
-    num_layers=12,      # RESTORED: 12
-    dropout=0.1         
+    d_model=512,        # OPTIMIZED: Reduced width from 768
+    num_heads=8,        # OPTIMIZED: 512 / 8 = 64
+    d_ff=2048,          # OPTIMIZED: 4 * 512
+    num_layers=6,       # OPTIMIZED: Reduced depth from 12 to 6 to prevent overfitting
+    dropout=0.2         # OPTIMIZED: Increased dropout from 0.1 to 0.2
 )
 
 # ENABLE MULTI-GPU SUPPORT (DataParallel)
@@ -935,11 +936,11 @@ checkpoint = torch.load('best_transformer_wikitext.pt')
 # My training loop logic saves model.module if available, so we load into a fresh instance
 best_model = TransformerLM(
     vocab_size=vocab_size,
-    d_model=768,        # RESTORED: 768
-    num_heads=12,       # RESTORED: 12
-    d_ff=3072,          # RESTORED: 3072
-    num_layers=12,      # RESTORED: 12
-    dropout=0.1         
+    d_model=512,        # RESTORED: 512
+    num_heads=8,        # RESTORED: 8
+    d_ff=2048,          # RESTORED: 2048
+    num_layers=6,       # RESTORED: 6
+    dropout=0.2         # RESTORED: 0.2
 )
 best_model.load_state_dict(checkpoint['model_state_dict'])
 best_model = best_model.to(device)

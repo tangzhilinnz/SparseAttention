@@ -1,4 +1,3 @@
-import datasets
 # Essential PyTorch imports
 import torch
 import torch.nn as nn
@@ -22,6 +21,7 @@ from torch.autograd import Variable
 import math
 import os
 import gc
+import re  # Added for better tokenization
 
 # FORCE GPU 3 SELECTION
 os.environ["CUDA_VISIBLE_DEVICES"] = "2"
@@ -46,6 +46,11 @@ set_seed()
 # 1. DATA PROCESSING (WikiText-2 Adapted for T4*2)
 # ==========================================
 
+# OPTIMIZATION: Basic Tokenizer to separate punctuation
+def basic_tokenizer(text):
+    # Splits words and punctuation (e.g. "hello," -> "hello", ",")
+    return re.findall(r"[\w']+|[.,!?;]", text.lower())
+
 class VocabBuilder:
     def __init__(self, texts, max_vocab_size=35000):
         # Slightly increased max_vocab_size to cover full WikiText-2 (~33k)
@@ -59,7 +64,8 @@ class VocabBuilder:
         word_counts = Counter()
         for text in texts:
             if len(text.strip()) > 0:
-                words = text.lower().split()
+                # OPTIMIZED: Use regex tokenizer instead of .split()
+                words = basic_tokenizer(text)
                 word_counts.update(words)
         
         # Take most common words (-4 for special tokens)
@@ -84,7 +90,8 @@ class WikiTextDataset(Dataset):
         token_list = []
         for text in texts:
             if len(text.strip()) > 0:
-                words = text.lower().split()
+                # OPTIMIZED: Use regex tokenizer
+                words = basic_tokenizer(text)
                 # Encode and add EOS
                 ids = [self.vocab.word2idx.get(w, self.vocab.word2idx['<UNK>']) for w in words]
                 ids.append(self.vocab.word2idx['<EOS>'])
@@ -188,7 +195,7 @@ class MultiHeadAttention(nn.Module):
         output = F.scaled_dot_product_attention(
             Q, K, V, 
             attn_mask=mask, 
-            dropout_p=0.1 if self.training else 0.0
+            dropout_p=self.dropout.p if self.training else 0.0
         )
         
         # 3. CRITICAL FIX: Reshape back to [Batch, Seq_Len, d_model]
@@ -562,14 +569,15 @@ print("\n<> Initializing Transformer Model...")
 vocab_size = len(vocab_builder.word2idx)
 print(f"Actual Vocab Size: {vocab_size}")
 
-# OPTIMIZED HYPERPARAMETERS (SCALED FOR A100)
+# OPTIMIZED HYPERPARAMETERS (SCALED DOWN FOR WIKITEXT-2)
+# Reduced layer count and d_model to prevent overfitting and improve generalization on small data
 model = TransformerLM(
     vocab_size=vocab_size,
-    d_model=768,        # GPT-2 Base size
-    num_heads=12,       # 768 / 12 = 64
-    d_ff=3072,          # 4 * 768
-    num_layers=12,        
-    dropout=0.1         # Better stability for large models
+    d_model=512,        # Scaled down from 768 for small dataset
+    num_heads=8,        # 512 / 8 = 64
+    d_ff=2048,          # 4 * 512
+    num_layers=6,       # Reduced from 12 to 6 to prevent overfitting
+    dropout=0.2         # Increased from 0.1 to 0.2 for better regularization
 )
 
 # ENABLE MULTI-GPU SUPPORT (DataParallel)
@@ -603,11 +611,11 @@ checkpoint = torch.load('best_transformer_wikitext.pt')
 # My training loop logic saves model.module if available, so we load into a fresh instance
 best_model = TransformerLM(
     vocab_size=vocab_size,
-    d_model=768,
-    num_heads=12,       
-    d_ff=3072,
-    num_layers=12,        
-    dropout=0.1
+    d_model=512,        # Match the initialized dimensions
+    num_heads=8,        
+    d_ff=2048,
+    num_layers=6,         
+    dropout=0.2
 )
 best_model.load_state_dict(checkpoint['model_state_dict'])
 best_model = best_model.to(device)
