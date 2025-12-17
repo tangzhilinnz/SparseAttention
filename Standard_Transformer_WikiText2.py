@@ -21,7 +21,7 @@ from torch.autograd import Variable
 import math
 import os
 import gc
-import re  # Added for better tokenization
+import re
 
 # FORCE GPU 3 SELECTION
 os.environ["CUDA_VISIBLE_DEVICES"] = "2"
@@ -219,7 +219,8 @@ class PositionwiseFeedForward(nn.Module):
         self.dropout = nn.Dropout(p=dropout)
         
     def forward(self, x):
-        return self.fc2(self.dropout(F.relu(self.fc1(x))))
+        # OPTIMIZATION: Switched to GELU for better Transformer convergence
+        return self.fc2(self.dropout(F.gelu(self.fc1(x))))
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, dropout, max_len=5000):
@@ -346,10 +347,12 @@ class TransformerLM(nn.Module):
 # 3. TRAINING LOOP (Added Auto-Exit / Early Stopping)
 # ==========================================
 
-def train_transformer_model(model, train_loader, valid_loader, criterion=None, num_epochs=100, learning_rate=5e-4, patience=6):
+def train_transformer_model(model, train_loader, valid_loader, criterion=None, num_epochs=100, learning_rate=3e-4, patience=8):
     if criterion is None:
-        # NOTE: Using Label Smoothing for better generalization
-        criterion = nn.CrossEntropyLoss(ignore_index=0, label_smoothing=0.1)
+        # OPTIMIZATION: REMOVED Label Smoothing. 
+        # Label smoothing artificially increases PPL (by adding entropy). 
+        # Removing it allows the model to reach lower raw PPL numbers.
+        criterion = nn.CrossEntropyLoss(ignore_index=0)
     
     device = next(model.parameters()).device
     
@@ -365,8 +368,8 @@ def train_transformer_model(model, train_loader, valid_loader, criterion=None, n
         optimizer, 
         max_lr=learning_rate, 
         total_steps=total_steps,
-        pct_start=0.3,
-        div_factor=25,
+        pct_start=0.2, # Warmup slightly faster
+        div_factor=10,
         final_div_factor=1000
     )
     
@@ -569,15 +572,14 @@ print("\n<> Initializing Transformer Model...")
 vocab_size = len(vocab_builder.word2idx)
 print(f"Actual Vocab Size: {vocab_size}")
 
-# OPTIMIZED HYPERPARAMETERS (SCALED DOWN FOR WIKITEXT-2)
-# Reduced layer count and d_model to prevent overfitting and improve generalization on small data
+# OPTIMIZED HYPERPARAMETERS (For Generalization)
 model = TransformerLM(
     vocab_size=vocab_size,
-    d_model=512,        # Scaled down from 768 for small dataset
+    d_model=512,        # Keep standard dimension
     num_heads=8,        # 512 / 8 = 64
-    d_ff=2048,          # 4 * 512
-    num_layers=6,       # Reduced from 12 to 6 to prevent overfitting
-    dropout=0.2         # Increased from 0.1 to 0.2 for better regularization
+    d_ff=1028,          # REDUCED from 2048 to 1028 to prevent memorization/overfitting
+    num_layers=8,       
+    dropout=0.3         # INCREASED from 0.2 to 0.3 to force generalization
 )
 
 # ENABLE MULTI-GPU SUPPORT (DataParallel)
@@ -590,8 +592,8 @@ model = model.to(device)
 print(f"Using device: {device}")
 
 # Training parameters
-num_epochs = 100     # SET HIGH as requested (auto-exit will stop it)
-learning_rate = 5e-4 # INCREASED for OneCycleLR
+num_epochs = 100     
+learning_rate = 3e-4 # REDUCED slightly to smooth convergence
 
 print("\n<> Starting Training...")
 results = train_transformer_model(
@@ -601,7 +603,7 @@ results = train_transformer_model(
     criterion=None, 
     num_epochs=num_epochs,
     learning_rate=learning_rate,
-    patience=6 # Auto-exit if no improvement for 6 epochs
+    patience=8 # Increased patience
 )
 
 # Run Final Evaluation on Test Set
@@ -611,11 +613,11 @@ checkpoint = torch.load('best_transformer_wikitext.pt')
 # My training loop logic saves model.module if available, so we load into a fresh instance
 best_model = TransformerLM(
     vocab_size=vocab_size,
-    d_model=512,        # Match the initialized dimensions
+    d_model=512,        
     num_heads=8,        
-    d_ff=2048,
-    num_layers=6,         
-    dropout=0.2
+    d_ff=1028,          # Match new d_ff
+    num_layers=8,         
+    dropout=0.3
 )
 best_model.load_state_dict(checkpoint['model_state_dict'])
 best_model = best_model.to(device)
