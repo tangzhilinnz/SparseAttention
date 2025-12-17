@@ -136,18 +136,18 @@ vocab_builder = VocabBuilder(train_texts, max_vocab_size=35000)
 # Create datasets
 print("\n<> Creating Datasets...")
 # HYPERPARAMETER: max_len
-# INCREASED TO 512 (Point 7: Increase context length)
-MAX_LEN = 256
+# Keeping at 128 (Safe Floor)
+MAX_LEN = 128
 train_dataset = WikiTextDataset(train_texts, vocab_builder, max_len=MAX_LEN)
 valid_dataset = WikiTextDataset(valid_texts, vocab_builder, max_len=MAX_LEN)
 test_dataset = WikiTextDataset(test_texts, vocab_builder, max_len=MAX_LEN)
 
 # Create dataloaders
 # HYPERPARAMETER: batch_size
-# INCREASED TO 128 for A100 stability
-batch_size = 4
-# CHANGED: shuffle=False (Point 3: Maintain continuity)
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, drop_last=True)
+# Keeping at 16 (High updates)
+batch_size = 16
+# CHANGED: shuffle=True 
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
 valid_loader = DataLoader(valid_dataset, batch_size=batch_size, drop_last=True)
 test_loader = DataLoader(test_dataset, batch_size=batch_size, drop_last=True)
 
@@ -347,11 +347,9 @@ class TransformerLM(nn.Module):
 # 3. TRAINING LOOP (Added Auto-Exit / Early Stopping)
 # ==========================================
 
-def train_transformer_model(model, train_loader, valid_loader, criterion=None, num_epochs=100, learning_rate=3e-4, patience=8):
+def train_transformer_model(model, train_loader, valid_loader, criterion=None, num_epochs=100, learning_rate=3e-4, patience=10):
     if criterion is None:
-        # OPTIMIZATION: REMOVED Label Smoothing. 
-        # Label smoothing artificially increases PPL (by adding entropy). 
-        # Removing it allows the model to reach lower raw PPL numbers.
+        # OPTIMIZATION: NO Label Smoothing for PPL tasks
         criterion = nn.CrossEntropyLoss(ignore_index=0)
     
     device = next(model.parameters()).device
@@ -360,9 +358,10 @@ def train_transformer_model(model, train_loader, valid_loader, criterion=None, n
     print(f"<> Training Transformer Model")
     print(f"{'='*50}")
     
-    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
+    # OPTIMIZATION: High Weight Decay to punish complexity
+    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.1)
     
-    # CHANGED: Use OneCycleLR for better convergence on large batch
+    # CHANGED: Use OneCycleLR for better convergence
     total_steps = len(train_loader) * num_epochs
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer, 
@@ -380,7 +379,8 @@ def train_transformer_model(model, train_loader, valid_loader, criterion=None, n
     # --- EARLY STOPPING VARIABLES ---
     patience_counter = 0
     
-    # Gradient Accumulation Steps (Reduced because batch size is now large)
+    # Gradient Accumulation Steps 
+    # KEPT AT 1 to ensure effective batch size remains small (16) for regularization
     accumulation_steps = 1 
 
     for epoch in range(num_epochs):
@@ -572,14 +572,15 @@ print("\n<> Initializing Transformer Model...")
 vocab_size = len(vocab_builder.word2idx)
 print(f"Actual Vocab Size: {vocab_size}")
 
-# OPTIMIZED HYPERPARAMETERS (For Generalization)
+# OPTIMIZED HYPERPARAMETERS ("TINY" MODEL FOR WIKITEXT-2)
+# Drastically reduced d_model to 256 to close the overfitting gap
 model = TransformerLM(
     vocab_size=vocab_size,
-    d_model=512,        # Keep standard dimension
-    num_heads=8,        # 512 / 8 = 64
-    d_ff=1028,          # REDUCED from 2048 to 1028 to prevent memorization/overfitting
-    num_layers=8,       
-    dropout=0.3         # INCREASED from 0.2 to 0.3 to force generalization
+    d_model=256,        # DOWN from 512. Essential for small data.
+    num_heads=4,        # 256 / 4 = 64
+    d_ff=1024,          # 4 * 256
+    num_layers=4,       # DOWN from 6. Reduces depth.
+    dropout=0.4         # UP from 0.3. High regularization.
 )
 
 # ENABLE MULTI-GPU SUPPORT (DataParallel)
@@ -593,7 +594,7 @@ print(f"Using device: {device}")
 
 # Training parameters
 num_epochs = 100     
-learning_rate = 3e-4 # REDUCED slightly to smooth convergence
+learning_rate = 3e-4 # Standard
 
 print("\n<> Starting Training...")
 results = train_transformer_model(
@@ -603,7 +604,7 @@ results = train_transformer_model(
     criterion=None, 
     num_epochs=num_epochs,
     learning_rate=learning_rate,
-    patience=8 # Increased patience
+    patience=10 # Higher patience for smaller batches
 )
 
 # Run Final Evaluation on Test Set
@@ -613,11 +614,11 @@ checkpoint = torch.load('best_transformer_wikitext.pt')
 # My training loop logic saves model.module if available, so we load into a fresh instance
 best_model = TransformerLM(
     vocab_size=vocab_size,
-    d_model=512,        
-    num_heads=8,        
-    d_ff=1028,          # Match new d_ff
-    num_layers=8,         
-    dropout=0.3
+    d_model=256,        # Match "Tiny" model
+    num_heads=4,        
+    d_ff=1024,          
+    num_layers=4,         
+    dropout=0.4
 )
 best_model.load_state_dict(checkpoint['model_state_dict'])
 best_model = best_model.to(device)
