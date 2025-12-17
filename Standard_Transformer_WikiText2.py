@@ -604,7 +604,7 @@ results = train_transformer_model(
     criterion=None, 
     num_epochs=num_epochs,
     learning_rate=learning_rate,
-    patience=10 # Higher patience for smaller batches
+    patience=5 # Higher patience for smaller batches
 )
 
 # Run Final Evaluation on Test Set
