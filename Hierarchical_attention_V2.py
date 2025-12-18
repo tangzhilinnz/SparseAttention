@@ -70,6 +70,7 @@ def build_hierarchical_index_lookup_table(seq_len, device="cuda", dtype=torch.in
 
     return idx_map, causal_mask
 
+
 class HierarchicalSparseAttention(nn.Module):
     def __init__(self, dim, num_heads, dropout=0.1):
         super().__init__()
@@ -196,7 +197,10 @@ class HierarchicalSparseAttention(nn.Module):
             # matmul handles strided tensors fine.
             attn_logits = torch.matmul(Q, K.transpose(-1, -2)) / math.sqrt(Dh)
             attn_logits += mask
-            updated = torch.matmul(attn_logits, V)
+  
+            attn_weights = F.softmax(attn_logits, dim=-1)
+            attn_weights = self.dropout(attn_weights)
+            updated = torch.matmul(attn_weights, V)
             
             # --- Inline Merge Heads ---
             # (B, H, N, Dh) -> (B, N, H, Dh) -> (B, N, D)
