@@ -163,17 +163,70 @@ hierarchical_transformer_C2P_P2C = {
     ],
 }
 
+
+hierarchical_transformer_residual_y = {
+    "train_loss": [
+        8.1709, 7.2954, 7.0913, 6.9188, 6.7823, 6.6804, 6.6005, 6.5322, 6.4701, 6.4097,
+        6.3542, 6.3008, 6.2536, 6.2029, 6.1560, 6.1131, 6.0734, 6.0317, 5.9947, 5.9614,
+        5.9304, 5.9012, 5.8745, 5.8492, 5.8232, 5.7984, 5.7767, 5.7595, 5.7373, 5.7153,
+        5.6948, 5.6746, 5.6545, 5.6373, 5.6189, 5.5987, 5.5846, 5.5701, 5.5512, 5.5371,
+        5.5245, 5.5069, 5.4939, 5.4784, 5.4629, 5.4469, 5.4342, 5.4228, 5.4118, 5.3999,
+        5.3892, 5.3791, 5.3693, 5.3592, 5.3509, 5.3401, 5.3299, 5.3218, 5.3120, 5.3027,
+        5.2962, 5.2878, 5.2799, 5.2742, 5.2677, 5.2624, 5.2556, 5.2490, 5.2440, 5.2389,
+        5.2349, 5.2294, 5.2252, 5.2203, 5.2169, 5.2129, 5.2097, 5.2063, 5.2022, 5.2008,
+        5.1984, 5.1960, 5.1940, 5.1921, 5.1902, 5.1887, 5.1872, 5.1869, 5.1852, 5.1851,
+        5.1838, 5.1827, 5.1823, 5.1816, 5.1811, 5.1809, 5.1806, 5.1808, 5.1803, 5.1806
+    ],
+    "train_ppl": [
+        3536.35, 1473.56, 1201.45, 1011.12, 882.11, 796.60, 735.43, 686.91, 645.55, 607.74,
+        574.91, 544.99, 519.87, 494.16, 471.52, 451.73, 434.15, 416.44, 401.28, 388.14,
+        376.32, 365.47, 355.85, 346.97, 338.04, 329.76, 322.70, 317.20, 310.24, 303.47,
+        297.31, 291.36, 285.58, 280.71, 275.59, 270.08, 266.30, 262.45, 257.55, 253.94,
+        250.77, 246.39, 243.20, 239.45, 235.77, 232.04, 229.11, 226.51, 224.03, 221.39,
+        219.03, 216.83, 214.71, 212.55, 210.80, 208.54, 206.42, 204.76, 202.75, 200.87,
+        199.58, 197.90, 196.36, 195.24, 193.97, 192.94, 191.65, 190.37, 189.42, 188.46,
+        187.72, 186.69, 185.89, 185.00, 184.37, 183.62, 183.03, 182.42, 181.66, 181.41,
+        180.98, 180.54, 180.18, 179.85, 179.51, 179.24, 178.97, 178.91, 178.61, 178.59,
+        178.36, 178.17, 178.09, 177.98, 177.89, 177.84, 177.78, 177.83, 177.74, 177.79
+    ],
+    "valid_loss": [
+        7.1351, 6.9281, 6.7544, 6.6108, 6.5169, 6.4511, 6.4039, 6.3519, 6.3089, 6.2665,
+        6.2364, 6.1971, 6.1661, 6.1294, 6.1102, 6.0868, 6.0575, 6.0310, 6.0115, 5.9920,
+        5.9810, 5.9644, 5.9491, 5.9379, 5.9287, 5.9242, 5.9069, 5.9024, 5.8887, 5.8805,
+        5.8706, 5.8682, 5.8732, 5.8561, 5.8535, 5.8393, 5.8274, 5.8294, 5.8157, 5.8100,
+        5.8051, 5.7979, 5.7953, 5.7906, 5.7847, 5.7758, 5.7680, 5.7721, 5.7739, 5.7672,
+        5.7640, 5.7648, 5.7672, 5.7609, 5.7572, 5.7526, 5.7496, 5.7458, 5.7410, 5.7415,
+        5.7393, 5.7347, 5.7341, 5.7328, 5.7302, 5.7266, 5.7246, 5.7268, 5.7275, 5.7312,
+        5.7268, 5.7267, 5.7261, 5.7241, 5.7229, 5.7214, 5.7195, 5.7187, 5.7189, 5.7188,
+        5.7185, 5.7183, 5.7170, 5.7160, 5.7153, 5.7153, 5.7148, 5.7142, 5.7133, 5.7126,
+        5.7117, 5.7110, 5.7107, 5.7107, 5.7107, 5.7107, 5.7107, 5.7107, 5.7107, 5.7107
+    ],
+    "valid_ppl": [
+        1255.31, 1020.50, 857.79, 743.08, 676.46, 633.40, 604.21, 573.56, 549.46, 526.61,
+        511.01, 491.33, 476.30, 459.17, 450.44, 440.00, 427.32, 416.12, 408.11, 400.20,
+        395.85, 389.31, 383.40, 379.14, 375.68, 374.00, 367.56, 365.92, 360.92, 357.97,
+        354.45, 353.63, 355.40, 349.34, 348.46, 343.53, 339.47, 340.17, 335.52, 333.61,
+        332.00, 329.60, 328.74, 327.21, 325.27, 322.40, 319.90, 321.21, 321.79, 319.64,
+        318.61, 318.87, 319.63, 317.62, 316.46, 315.02, 314.07, 312.87, 311.37, 311.52,
+        310.85, 309.43, 309.22, 308.84, 308.03, 306.92, 306.30, 306.97, 307.20, 308.33,
+        306.98, 306.96, 306.77, 306.16, 305.80, 305.34, 304.76, 304.51, 304.57, 304.53,
+        304.46, 304.39, 303.98, 303.68, 303.47, 303.47, 303.33, 303.15, 302.86, 302.65,
+        302.38, 302.18, 302.08, 302.10, 302.07, 302.07, 302.09, 302.09, 302.09, 302.09
+    ]
+}
+
+
 # ==========================================
 # 2. Plotting Function
 # ==========================================
 
 # ==========================================
-# 2. Filtering Function (Extract epochs 10-90)
+# 2. Filtering Function (Extract epochs 10-100)
 # ==========================================
 
-# Indices 9 to 90 correspond to Epochs 10 to 90
+# Indices 9 to 100 correspond to Epochs 10 to 100
 START_IDX = 9 
-END_IDX = 90  
+END_IDX = 100  
 
 # Create the specific epoch range for the X-axis
 epochs_slice = full_epochs[START_IDX:END_IDX]
@@ -185,17 +238,18 @@ def get_sliced_data(data_dict, key):
 # 3. Plotting Function
 # ==========================================
 
-def plot_metric(metric_name, std_data, hier_data, weighted_data):
+def plot_metric(metric_name, std_data, hier_data, weighted_data, residual_y_data):
     plt.figure(figsize=(10, 6))
     
     # Plotting lines using the SLICED data and SLICED epochs
     plt.plot(epochs_slice, std_data, label="Standard Transformer", color='blue', linestyle='-', linewidth=1.5)
     plt.plot(epochs_slice, hier_data, label="Hierarchical Transformer (C2P-P2C)", color='green', linestyle='--', linewidth=1.5)
     plt.plot(epochs_slice, weighted_data, label="Hierarchical Transformer (Weighted Sum)", color='orange', linestyle='-.', linewidth=1.5)
+    plt.plot(epochs_slice, residual_y_data, label="Hierarchical Transformer (C2P-P2C with Residual Y)", color='red', linestyle=':', linewidth=2.0)
     
     plt.xlabel("Epoch")
     plt.ylabel(metric_name)
-    plt.title(f"{metric_name} vs Epoch (Epochs 10-90)")
+    plt.title(f"{metric_name} vs Epoch (Epochs 10-100)")
     plt.legend()
     plt.grid(True, linestyle='--', alpha=0.7)
     
@@ -203,8 +257,8 @@ def plot_metric(metric_name, std_data, hier_data, weighted_data):
     # but let's keep it optional or just linear if the values are close.
     # For 10-90 range, values are much closer, so linear scale often works better to see small differences.
     # However, if you still want log scale for PPL, uncomment the next two lines:
-    # if "PPL" in metric_name:
-    #     plt.yscale('log')
+    if "PPL" in metric_name:
+        plt.yscale('log')
         
     plt.tight_layout()
     plt.show()
@@ -217,22 +271,26 @@ def plot_metric(metric_name, std_data, hier_data, weighted_data):
 plot_metric("Train Loss",
             get_sliced_data(standard_transformer, "train_loss"),
             get_sliced_data(hierarchical_transformer_C2P_P2C, "train_loss"),
-            get_sliced_data(hierarchical_transformer_weighted_sum, "train_loss"))
+            get_sliced_data(hierarchical_transformer_weighted_sum, "train_loss"),
+            get_sliced_data(hierarchical_transformer_residual_y, "train_loss"))
 
 # 2. Train PPL 
 plot_metric("Train PPL",
             get_sliced_data(standard_transformer, "train_ppl"),
             get_sliced_data(hierarchical_transformer_C2P_P2C, "train_ppl"),
-            get_sliced_data(hierarchical_transformer_weighted_sum, "train_ppl"))
+            get_sliced_data(hierarchical_transformer_weighted_sum, "train_ppl"),
+            get_sliced_data(hierarchical_transformer_residual_y, "train_ppl"))
 
 # 3. Valid Loss
 plot_metric("Valid Loss",
             get_sliced_data(standard_transformer, "valid_loss"),
             get_sliced_data(hierarchical_transformer_C2P_P2C, "valid_loss"),
-            get_sliced_data(hierarchical_transformer_weighted_sum, "valid_loss"))
+            get_sliced_data(hierarchical_transformer_weighted_sum, "valid_loss"),
+            get_sliced_data(hierarchical_transformer_residual_y, "valid_loss"))
 
 # 4. Valid PPL 
 plot_metric("Valid PPL",
             get_sliced_data(standard_transformer, "valid_ppl"),
             get_sliced_data(hierarchical_transformer_C2P_P2C, "valid_ppl"),
-            get_sliced_data(hierarchical_transformer_weighted_sum, "valid_ppl"))
+            get_sliced_data(hierarchical_transformer_weighted_sum, "valid_ppl"),
+            get_sliced_data(hierarchical_transformer_residual_y, "valid_ppl"))
