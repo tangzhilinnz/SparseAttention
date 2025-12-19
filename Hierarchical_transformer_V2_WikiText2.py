@@ -901,7 +901,7 @@ results = train_transformer_model(
     criterion=None, 
     num_epochs=num_epochs,
     learning_rate=learning_rate,
-    patience=6 # Auto-exit if no improvement for 6 epochs
+    patience=10 # Auto-exit if no improvement for 6 epochs
 )
 
 # Run Final Evaluation on Test Set
