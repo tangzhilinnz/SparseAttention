@@ -135,7 +135,7 @@ vocab_builder = VocabBuilder(train_texts, max_vocab_size=35000)
 print("\n<> Creating Datasets...")
 # HYPERPARAMETER: max_len
 # INCREASED TO 512 (Point 7: Increase context length)
-MAX_LEN = 512
+MAX_LEN = 256
 train_dataset = WikiTextDataset(train_texts, vocab_builder, max_len=MAX_LEN)
 valid_dataset = WikiTextDataset(valid_texts, vocab_builder, max_len=MAX_LEN)
 test_dataset = WikiTextDataset(test_texts, vocab_builder, max_len=MAX_LEN)
@@ -357,6 +357,8 @@ class HierarchicalSparseAttention(nn.Module):
             Q = self.Wq_y(Y_slice).view(B, -1, H, Dh).transpose(1, 2)
             K = self.Wk_y(prev_sources).view(B, -1, H, Dh).transpose(1, 2)
             V = self.Wv_y(prev_sources).view(B, -1, H, Dh).transpose(1, 2)
+
+            V = self.dropout(V) # Apply dropout to the projected values
 
             mask = self.build_parent_child_mask(parent_count, prev_sources.size(1), x.device)
             mask = mask.unsqueeze(0).unsqueeze(0)

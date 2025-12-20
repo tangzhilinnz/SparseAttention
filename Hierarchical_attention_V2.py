@@ -70,7 +70,6 @@ def build_hierarchical_index_lookup_table(seq_len, device="cuda", dtype=torch.in
 
     return idx_map, causal_mask
 
-
 class HierarchicalSparseAttention(nn.Module):
     def __init__(self, dim, num_heads, dropout=0.1):
         super().__init__()
@@ -190,6 +189,8 @@ class HierarchicalSparseAttention(nn.Module):
             K = self.Wk_y(prev_sources).view(B, -1, H, Dh).transpose(1, 2)
             V = self.Wv_y(prev_sources).view(B, -1, H, Dh).transpose(1, 2)
 
+            V = self.dropout(V) # Apply dropout to the projected values
+
             mask = self.build_parent_child_mask(parent_count, prev_sources.size(1), x.device)
             mask = mask.unsqueeze(0).unsqueeze(0)
 
@@ -199,7 +200,7 @@ class HierarchicalSparseAttention(nn.Module):
             attn_logits += mask
   
             attn_weights = F.softmax(attn_logits, dim=-1)
-            attn_weights = self.dropout(attn_weights)
+            #attn_weights = self.dropout(attn_weights)
             updated = torch.matmul(attn_weights, V)
             
             # --- Inline Merge Heads ---
