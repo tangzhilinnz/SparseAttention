@@ -347,7 +347,7 @@ class TransformerLM(nn.Module):
 # 3. TRAINING LOOP (Added Auto-Exit / Early Stopping)
 # ==========================================
 
-def train_transformer_model(model, train_loader, valid_loader, criterion=None, num_epochs=100, learning_rate=3e-4, patience=6):
+def train_transformer_model(model, train_loader, valid_loader, criterion=None, num_epochs=100, learning_rate=3e-4, patience=10):
     if criterion is None:
         # NOTE: Using Label Smoothing for better generalization
         criterion = nn.CrossEntropyLoss(ignore_index=0, label_smoothing=0.1)
@@ -594,7 +594,7 @@ results = train_transformer_model(
     criterion=None, 
     num_epochs=num_epochs,
     learning_rate=learning_rate,
-    patience=6 # Auto-exit if no improvement for 6 epochs
+    patience=10 # Auto-exit if no improvement for 6 epochs
 )
 
 # Run Final Evaluation on Test Set
