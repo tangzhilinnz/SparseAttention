@@ -367,7 +367,7 @@ class HierarchicalSparseAttention(nn.Module):
             attn_logits += mask
   
             attn_weights = F.softmax(attn_logits, dim=-1)
-            attn_weights = self.dropout(attn_weights)
+            #attn_weights = self.dropout(attn_weights)
             updated = torch.matmul(attn_weights, V)
             
             # --- Inline Merge Heads ---
