@@ -134,7 +134,7 @@ vocab_builder = VocabBuilder(train_texts, max_vocab_size=35000)
 # Create datasets
 print("\n<> Creating Datasets...")
 # HYPERPARAMETER: max_len
-MAX_LEN = 128
+MAX_LEN = 2048
 train_dataset = WikiTextDataset(train_texts, vocab_builder, max_len=MAX_LEN)
 valid_dataset = WikiTextDataset(valid_texts, vocab_builder, max_len=MAX_LEN)
 test_dataset = WikiTextDataset(test_texts, vocab_builder, max_len=MAX_LEN)
@@ -870,7 +870,6 @@ vocab_size = len(vocab_builder.word2idx)
 print(f"Actual Vocab Size: {vocab_size}")
 
 # OPTIMIZED HYPERPARAMETERS
-# Using TransformerLM instead of Seq2Seq
 model = TransformerLM(
     vocab_size=vocab_size,
     d_model=512,        # INCREASED from 256
