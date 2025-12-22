@@ -355,7 +355,7 @@ def train_transformer_model(model, train_loader, valid_loader, criterion=None, n
     device = next(model.parameters()).device
     
     print(f"\n{'='*50}")
-    print(f"<> Training Transformer Model")
+    print(f"<> Training Transformer Model (AMP Enabled)")
     print(f"{'='*50}")
     
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
@@ -363,6 +363,10 @@ def train_transformer_model(model, train_loader, valid_loader, criterion=None, n
     # CHANGED: Use Cosine Annealing (Point 7: Better scheduler)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, verbose=False)
     
+    # --- AMP CHANGE 1: Initialize GradScaler ---
+    # This manages the dynamic loss scaling (critical for FP16 stability)
+    scaler = torch.cuda.amp.GradScaler() 
+
     best_valid_loss = float('inf')
     train_losses, valid_losses = [], []
     epoch_times = []
@@ -391,25 +395,39 @@ def train_transformer_model(model, train_loader, valid_loader, criterion=None, n
             input_ids = batch['input_ids'].to(device)
             labels = batch['label'].to(device)
             
-            # --- IMPROVEMENT: Only pass input_ids (Decoder Only) ---
-            outputs = model(input_ids)
+            # --- AMP CHANGE 2: Run forward pass in autocast context ---
+            # Operations here will automatically choose FP16 or FP32
+            with torch.cuda.amp.autocast():
+                outputs = model(input_ids)
+                
+                output_dim = outputs.shape[-1]
+                outputs = outputs.contiguous().view(-1, output_dim)
+                labels = labels.contiguous().view(-1)
+                
+                loss = criterion(outputs, labels)
+                
+                # Divide loss by accumulation steps
+                loss = loss / accumulation_steps
             
-            output_dim = outputs.shape[-1]
-            outputs = outputs.contiguous().view(-1, output_dim)
-            labels = labels.contiguous().view(-1)
-            
-            loss = criterion(outputs, labels)
-            
-            # Divide loss by accumulation steps
-            loss = loss / accumulation_steps
-            loss.backward()
+            # --- AMP CHANGE 3: Scale loss and backward ---
+            # Instead of loss.backward(), we scale it first to prevent underflow
+            scaler.scale(loss).backward()
             
             if (batch_idx + 1) % accumulation_steps == 0:
+                # Unscale gradients before clipping (required for correct clipping)
+                scaler.unscale_(optimizer)
+                
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
+                
+                # Step with scaler (it will skip update if NaNs found)
+                scaler.step(optimizer)
+                
+                # Update scaler factor for next iteration
+                scaler.update()
+                
                 optimizer.zero_grad()
             
-            # Multiply back for reporting
+            # Multiply back for reporting (use .item() to detach from graph)
             total_train_loss += loss.item() * accumulation_steps
             
             progress_bar.set_postfix({
@@ -429,14 +447,16 @@ def train_transformer_model(model, train_loader, valid_loader, criterion=None, n
                 input_ids = batch['input_ids'].to(device)
                 labels = batch['label'].to(device)
                 
-                # --- IMPROVEMENT: Only pass input_ids ---
-                outputs = model(input_ids)
+                # --- AMP CHANGE 4: Validation also benefits from AMP speedup ---
+                with torch.cuda.amp.autocast():
+                    outputs = model(input_ids)
+                    
+                    output_dim = outputs.shape[-1]
+                    outputs = outputs.contiguous().view(-1, output_dim)
+                    labels = labels.contiguous().view(-1)
+                    
+                    loss = criterion(outputs, labels)
                 
-                output_dim = outputs.shape[-1]
-                outputs = outputs.contiguous().view(-1, output_dim)
-                labels = labels.contiguous().view(-1)
-                
-                loss = criterion(outputs, labels)
                 total_valid_loss += loss.item()
         
         avg_valid_loss = total_valid_loss / len(valid_loader)
@@ -468,6 +488,8 @@ def train_transformer_model(model, train_loader, valid_loader, criterion=None, n
                 'model_state_dict': model_to_save.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'loss': best_valid_loss,
+                # Good practice: Save scaler state too
+                'scaler_state_dict': scaler.state_dict()
             }, 'best_transformer_wikitext.pt')
             print(f'<> Saved new best model with validation loss: {best_valid_loss:.4f}')
         else:
