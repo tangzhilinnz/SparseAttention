@@ -197,7 +197,8 @@ class MultiHeadAttention(nn.Module):
         if mask is not None:
             # Mask needs to be handled carefully with DataParallel
             # But since mask is usually passed per-batch inside the forward, it's fine.
-            scores = scores.masked_fill(mask == 0, -1e9)
+            min_value = torch.finfo(scores.dtype).min
+            scores = scores.masked_fill(mask == 0, min_value)
         
         attn_weights = F.softmax(scores, dim=-1)
         attn_weights = self.dropout(attn_weights)

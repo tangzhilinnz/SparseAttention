@@ -1,0 +1,856 @@
+Using device: cuda
+
+<> Loading WikiText-2 Dataset...
+
+<> Building Vocabulary...
+Counting words...
+
+ Vocabulary Statistics:
+Total unique words found: 28911
+Vocabulary size: 28915
+Sample words: ['<PAD>', '<UNK>', '<SOS>', '<EOS>', 'the', ',', '.', 'of', '<unk>', 'and']
+
+<> Creating Datasets...
+
+<> Dataset Statistics:
+Train samples: 1013
+Validation samples: 105
+Test samples: 119
+
+<> Sample Batch Information:
+Input shape: torch.Size([16, 2048])
+Label shape: torch.Size([16, 2048])
+
+<> Initializing Transformer Model...
+Actual Vocab Size: 28915
+Using device: cuda
+
+<> Starting Training...
+
+==================================================
+<> Training Transformer Model (AMP Enabled)
+==================================================
+/home/ztang13/workspace/SparseAttention/myenv/lib/python3.12/site-packages/torch/optim/lr_scheduler.py:62: UserWarning: The verbose parameter is deprecated. Please use get_last_lr() to access the learning rate.
+  warnings.warn(
+/home/ztang13/workspace/SparseAttention/Hierarchical_transformer_V2_WikiText2.py:675: FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
+  scaler = torch.cuda.amp.GradScaler()
+Epoch 1/100:   0%|                                                                                                               | 0/63 [00:00<?, ?it/s]/home/ztang13/workspace/SparseAttention/Hierarchical_transformer_V2_WikiText2.py:707: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with torch.cuda.amp.autocast():
+Epoch 1/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:35<00:00,  1.51s/it, loss=8.6255, ppl=5571.80]
+<> Validating...
+/home/ztang13/workspace/SparseAttention/Hierarchical_transformer_V2_WikiText2.py:758: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with torch.cuda.amp.autocast():
+
+<> Epoch 1 Results:
+<>  Time: 0:01:40
+Train Loss: 9.2603 | Train PPL: 10512.48
+Valid Loss: 8.2972 | Valid PPL: 4012.73
+<> Saved new best model with validation loss: 8.2972
+Epoch 2/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:29<00:00,  1.42s/it, loss=7.9749, ppl=2907.03]
+<> Validating...
+
+<> Epoch 2 Results:
+<>  Time: 0:01:34
+Train Loss: 8.2079 | Train PPL: 3669.90
+Valid Loss: 7.5997 | Valid PPL: 1997.53
+<> Saved new best model with validation loss: 7.5997
+Epoch 3/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:28<00:00,  1.41s/it, loss=7.6536, ppl=2108.26]
+<> Validating...
+
+<> Epoch 3 Results:
+<>  Time: 0:01:34
+Train Loss: 7.7044 | Train PPL: 2218.04
+Valid Loss: 7.2750 | Valid PPL: 1443.79
+<> Saved new best model with validation loss: 7.2750
+Epoch 4/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:29<00:00,  1.42s/it, loss=7.5233, ppl=1850.72]
+<> Validating...
+
+<> Epoch 4 Results:
+<>  Time: 0:01:34
+Train Loss: 7.4711 | Train PPL: 1756.52
+Valid Loss: 7.1401 | Valid PPL: 1261.49
+<> Saved new best model with validation loss: 7.1401
+Epoch 5/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:29<00:00,  1.41s/it, loss=7.4575, ppl=1732.79]
+<> Validating...
+
+<> Epoch 5 Results:
+<>  Time: 0:01:34
+Train Loss: 7.3673 | Train PPL: 1583.43
+Valid Loss: 7.0881 | Valid PPL: 1197.66
+<> Saved new best model with validation loss: 7.0881
+Epoch 6/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:29<00:00,  1.42s/it, loss=7.3969, ppl=1630.86]
+<> Validating...
+
+<> Epoch 6 Results:
+<>  Time: 0:01:34
+Train Loss: 7.2979 | Train PPL: 1477.14
+Valid Loss: 7.0389 | Valid PPL: 1140.17
+<> Saved new best model with validation loss: 7.0389
+Epoch 7/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:29<00:00,  1.42s/it, loss=7.3470, ppl=1551.60]
+<> Validating...
+
+<> Epoch 7 Results:
+<>  Time: 0:01:34
+Train Loss: 7.2376 | Train PPL: 1390.80
+Valid Loss: 6.9882 | Valid PPL: 1083.72
+<> Saved new best model with validation loss: 6.9882
+Epoch 8/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:29<00:00,  1.42s/it, loss=7.3068, ppl=1490.45]
+<> Validating...
+
+<> Epoch 8 Results:
+<>  Time: 0:01:35
+Train Loss: 7.1904 | Train PPL: 1326.66
+Valid Loss: 6.9649 | Valid PPL: 1058.84
+<> Saved new best model with validation loss: 6.9649
+Epoch 9/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:29<00:00,  1.42s/it, loss=7.2703, ppl=1437.01]
+<> Validating...
+
+<> Epoch 9 Results:
+<>  Time: 0:01:35
+Train Loss: 7.1398 | Train PPL: 1261.16
+Valid Loss: 6.8979 | Valid PPL: 990.21
+<> Saved new best model with validation loss: 6.8979
+Epoch 10/100: 100%|███████████████████████████████████████████████████████████████████████████| 63/63 [01:29<00:00,  1.42s/it, loss=7.2227, ppl=1370.17]
+<> Validating...
+
+<> Epoch 10 Results:
+<>  Time: 0:01:35
+Train Loss: 7.0881 | Train PPL: 1197.61
+Valid Loss: 6.8383 | Valid PPL: 932.87
+<> Saved new best model with validation loss: 6.8383
+Epoch 11/100: 100%|███████████████████████████████████████████████████████████████████████████| 63/63 [01:29<00:00,  1.43s/it, loss=7.1810, ppl=1314.27]
+<> Validating...
+
+<> Epoch 11 Results:
+<>  Time: 0:01:35
+Train Loss: 7.0365 | Train PPL: 1137.42
+Valid Loss: 6.7821 | Valid PPL: 881.93
+<> Saved new best model with validation loss: 6.7821
+Epoch 12/100: 100%|███████████████████████████████████████████████████████████████████████████| 63/63 [01:29<00:00,  1.42s/it, loss=7.1416, ppl=1263.46]
+<> Validating...
+
+<> Epoch 12 Results:
+<>  Time: 0:01:35
+Train Loss: 6.9836 | Train PPL: 1078.80
+Valid Loss: 6.7337 | Valid PPL: 840.29
+<> Saved new best model with validation loss: 6.7337
+Epoch 13/100: 100%|███████████████████████████████████████████████████████████████████████████| 63/63 [01:29<00:00,  1.42s/it, loss=7.1019, ppl=1214.32]
+<> Validating...
+
+<> Epoch 13 Results:
+<>  Time: 0:01:35
+Train Loss: 6.9317 | Train PPL: 1024.19
+Valid Loss: 6.6883 | Valid PPL: 802.95
+<> Saved new best model with validation loss: 6.6883
+Epoch 14/100: 100%|███████████████████████████████████████████████████████████████████████████| 63/63 [01:29<00:00,  1.43s/it, loss=7.0601, ppl=1164.57]
+<> Validating...
+
+<> Epoch 14 Results:
+<>  Time: 0:01:35
+Train Loss: 6.8828 | Train PPL: 975.33
+Valid Loss: 6.6497 | Valid PPL: 772.56
+<> Saved new best model with validation loss: 6.6497
+Epoch 15/100: 100%|███████████████████████████████████████████████████████████████████████████| 63/63 [01:29<00:00,  1.43s/it, loss=7.0263, ppl=1125.81]
+<> Validating...
+
+<> Epoch 15 Results:
+<>  Time: 0:01:35
+Train Loss: 6.8368 | Train PPL: 931.54
+Valid Loss: 6.6188 | Valid PPL: 749.02
+<> Saved new best model with validation loss: 6.6188
+Epoch 16/100: 100%|███████████████████████████████████████████████████████████████████████████| 63/63 [01:29<00:00,  1.43s/it, loss=6.9957, ppl=1091.90]
+<> Validating...
+
+<> Epoch 16 Results:
+<>  Time: 0:01:35
+Train Loss: 6.7946 | Train PPL: 892.98
+Valid Loss: 6.5837 | Valid PPL: 723.18
+<> Saved new best model with validation loss: 6.5837
+Epoch 17/100: 100%|███████████████████████████████████████████████████████████████████████████| 63/63 [01:29<00:00,  1.43s/it, loss=6.9638, ppl=1057.68]
+<> Validating...
+
+<> Epoch 17 Results:
+<>  Time: 0:01:35
+Train Loss: 6.7533 | Train PPL: 856.90
+Valid Loss: 6.5450 | Valid PPL: 695.79
+<> Saved new best model with validation loss: 6.5450
+Epoch 18/100: 100%|███████████████████████████████████████████████████████████████████████████| 63/63 [01:29<00:00,  1.42s/it, loss=6.9352, ppl=1027.83]
+<> Validating...
+
+<> Epoch 18 Results:
+<>  Time: 0:01:35
+Train Loss: 6.7162 | Train PPL: 825.69
+Valid Loss: 6.5153 | Valid PPL: 675.40
+<> Saved new best model with validation loss: 6.5153
+Epoch 19/100: 100%|███████████████████████████████████████████████████████████████████████████| 63/63 [01:29<00:00,  1.42s/it, loss=6.9200, ppl=1012.29]
+<> Validating...
+
+<> Epoch 19 Results:
+<>  Time: 0:01:34
+Train Loss: 6.6824 | Train PPL: 798.26
+Valid Loss: 6.4906 | Valid PPL: 658.93
+<> Saved new best model with validation loss: 6.4906
+Epoch 20/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:29<00:00,  1.42s/it, loss=6.8970, ppl=989.28]
+<> Validating...
+
+<> Epoch 20 Results:
+<>  Time: 0:01:35
+Train Loss: 6.6527 | Train PPL: 774.87
+Valid Loss: 6.4683 | Valid PPL: 644.41
+<> Saved new best model with validation loss: 6.4683
+Epoch 21/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:29<00:00,  1.43s/it, loss=6.8895, ppl=981.92]
+<> Validating...
+
+<> Epoch 21 Results:
+<>  Time: 0:01:35
+Train Loss: 6.6249 | Train PPL: 753.60
+Valid Loss: 6.4486 | Valid PPL: 631.84
+<> Saved new best model with validation loss: 6.4486
+Epoch 22/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:30<00:00,  1.43s/it, loss=6.8702, ppl=963.18]
+<> Validating...
+
+<> Epoch 22 Results:
+<>  Time: 0:01:35
+Train Loss: 6.5984 | Train PPL: 733.92
+Valid Loss: 6.4267 | Valid PPL: 618.10
+<> Saved new best model with validation loss: 6.4267
+Epoch 23/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:29<00:00,  1.43s/it, loss=6.8573, ppl=950.79]
+<> Validating...
+
+<> Epoch 23 Results:
+<>  Time: 0:01:35
+Train Loss: 6.5731 | Train PPL: 715.60
+Valid Loss: 6.4120 | Valid PPL: 609.09
+<> Saved new best model with validation loss: 6.4120
+Epoch 24/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:29<00:00,  1.43s/it, loss=6.8501, ppl=943.97]
+<> Validating...
+
+<> Epoch 24 Results:
+<>  Time: 0:01:35
+Train Loss: 6.5537 | Train PPL: 701.82
+Valid Loss: 6.3941 | Valid PPL: 598.32
+<> Saved new best model with validation loss: 6.3941
+Epoch 25/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:29<00:00,  1.43s/it, loss=6.8324, ppl=927.43]
+<> Validating...
+
+<> Epoch 25 Results:
+<>  Time: 0:01:35
+Train Loss: 6.5290 | Train PPL: 684.74
+Valid Loss: 6.3797 | Valid PPL: 589.76
+<> Saved new best model with validation loss: 6.3797
+Epoch 26/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:29<00:00,  1.42s/it, loss=6.8128, ppl=909.37]
+<> Validating...
+
+<> Epoch 26 Results:
+<>  Time: 0:01:35
+Train Loss: 6.5068 | Train PPL: 669.66
+Valid Loss: 6.3700 | Valid PPL: 584.07
+<> Saved new best model with validation loss: 6.3700
+Epoch 27/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:29<00:00,  1.43s/it, loss=6.8084, ppl=905.39]
+<> Validating...
+
+<> Epoch 27 Results:
+<>  Time: 0:01:35
+Train Loss: 6.4907 | Train PPL: 659.02
+Valid Loss: 6.3498 | Valid PPL: 572.37
+<> Saved new best model with validation loss: 6.3498
+Epoch 28/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:30<00:00,  1.43s/it, loss=6.7916, ppl=890.32]
+<> Validating...
+
+<> Epoch 28 Results:
+<>  Time: 0:01:35
+Train Loss: 6.4673 | Train PPL: 643.71
+Valid Loss: 6.3400 | Valid PPL: 566.80
+<> Saved new best model with validation loss: 6.3400
+Epoch 29/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:30<00:00,  1.44s/it, loss=6.7800, ppl=880.07]
+<> Validating...
+
+<> Epoch 29 Results:
+<>  Time: 0:01:36
+Train Loss: 6.4480 | Train PPL: 631.46
+Valid Loss: 6.3267 | Valid PPL: 559.30
+<> Saved new best model with validation loss: 6.3267
+Epoch 30/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:31<00:00,  1.46s/it, loss=6.7790, ppl=879.23]
+<> Validating...
+
+<> Epoch 30 Results:
+<>  Time: 0:01:37
+Train Loss: 6.4324 | Train PPL: 621.69
+Valid Loss: 6.3392 | Valid PPL: 566.33
+<> No improvement for 1 epoch(s).
+Epoch 31/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:30<00:00,  1.44s/it, loss=6.7637, ppl=865.82]
+<> Validating...
+
+<> Epoch 31 Results:
+<>  Time: 0:01:36
+Train Loss: 6.4180 | Train PPL: 612.75
+Valid Loss: 6.3091 | Valid PPL: 549.57
+<> Saved new best model with validation loss: 6.3091
+Epoch 32/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:33<00:00,  1.49s/it, loss=6.7587, ppl=861.54]
+<> Validating...
+
+<> Epoch 32 Results:
+<>  Time: 0:01:39
+Train Loss: 6.3981 | Train PPL: 600.70
+Valid Loss: 6.2963 | Valid PPL: 542.54
+<> Saved new best model with validation loss: 6.2963
+Epoch 33/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:33<00:00,  1.48s/it, loss=6.7499, ppl=853.97]
+<> Validating...
+
+<> Epoch 33 Results:
+<>  Time: 0:01:39
+Train Loss: 6.3830 | Train PPL: 591.70
+Valid Loss: 6.2853 | Valid PPL: 536.61
+<> Saved new best model with validation loss: 6.2853
+Epoch 34/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:34<00:00,  1.51s/it, loss=6.7506, ppl=854.55]
+<> Validating...
+
+<> Epoch 34 Results:
+<>  Time: 0:01:40
+Train Loss: 6.3690 | Train PPL: 583.47
+Valid Loss: 6.2788 | Valid PPL: 533.13
+<> Saved new best model with validation loss: 6.2788
+Epoch 35/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:33<00:00,  1.49s/it, loss=6.7393, ppl=845.00]
+<> Validating...
+
+<> Epoch 35 Results:
+<>  Time: 0:01:39
+Train Loss: 6.3537 | Train PPL: 574.63
+Valid Loss: 6.2706 | Valid PPL: 528.78
+<> Saved new best model with validation loss: 6.2706
+Epoch 36/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:34<00:00,  1.50s/it, loss=6.7437, ppl=848.74]
+<> Validating...
+
+<> Epoch 36 Results:
+<>  Time: 0:01:40
+Train Loss: 6.3409 | Train PPL: 567.28
+Valid Loss: 6.2721 | Valid PPL: 529.58
+<> No improvement for 1 epoch(s).
+Epoch 37/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:30<00:00,  1.44s/it, loss=6.7143, ppl=824.14]
+<> Validating...
+
+<> Epoch 37 Results:
+<>  Time: 0:01:36
+Train Loss: 6.3260 | Train PPL: 558.89
+Valid Loss: 6.2475 | Valid PPL: 516.74
+<> Saved new best model with validation loss: 6.2475
+Epoch 38/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:32<00:00,  1.47s/it, loss=6.7160, ppl=825.55]
+<> Validating...
+
+<> Epoch 38 Results:
+<>  Time: 0:01:38
+Train Loss: 6.3060 | Train PPL: 547.86
+Valid Loss: 6.2435 | Valid PPL: 514.65
+<> Saved new best model with validation loss: 6.2435
+Epoch 39/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:30<00:00,  1.43s/it, loss=6.7068, ppl=817.96]
+<> Validating...
+
+<> Epoch 39 Results:
+<>  Time: 0:01:35
+Train Loss: 6.2919 | Train PPL: 540.16
+Valid Loss: 6.2321 | Valid PPL: 508.82
+<> Saved new best model with validation loss: 6.2321
+Epoch 40/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:34<00:00,  1.50s/it, loss=6.6981, ppl=810.87]
+<> Validating...
+
+<> Epoch 40 Results:
+<>  Time: 0:01:40
+Train Loss: 6.2792 | Train PPL: 533.36
+Valid Loss: 6.2263 | Valid PPL: 505.88
+<> Saved new best model with validation loss: 6.2263
+Epoch 41/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:35<00:00,  1.51s/it, loss=6.6869, ppl=801.86]
+<> Validating...
+
+<> Epoch 41 Results:
+<>  Time: 0:01:40
+Train Loss: 6.2659 | Train PPL: 526.29
+Valid Loss: 6.2119 | Valid PPL: 498.62
+<> Saved new best model with validation loss: 6.2119
+Epoch 42/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:34<00:00,  1.50s/it, loss=6.6807, ppl=796.91]
+<> Validating...
+
+<> Epoch 42 Results:
+<>  Time: 0:01:39
+Train Loss: 6.2498 | Train PPL: 517.89
+Valid Loss: 6.2098 | Valid PPL: 497.58
+<> Saved new best model with validation loss: 6.2098
+Epoch 43/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:32<00:00,  1.47s/it, loss=6.6770, ppl=793.95]
+<> Validating...
+
+<> Epoch 43 Results:
+<>  Time: 0:01:38
+Train Loss: 6.2363 | Train PPL: 510.99
+Valid Loss: 6.1995 | Valid PPL: 492.52
+<> Saved new best model with validation loss: 6.1995
+Epoch 44/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:32<00:00,  1.47s/it, loss=6.6731, ppl=790.83]
+<> Validating...
+
+<> Epoch 44 Results:
+<>  Time: 0:01:38
+Train Loss: 6.2243 | Train PPL: 504.85
+Valid Loss: 6.1901 | Valid PPL: 487.88
+<> Saved new best model with validation loss: 6.1901
+Epoch 45/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:32<00:00,  1.47s/it, loss=6.6572, ppl=778.39]
+<> Validating...
+
+<> Epoch 45 Results:
+<>  Time: 0:01:38
+Train Loss: 6.2128 | Train PPL: 499.08
+Valid Loss: 6.1790 | Valid PPL: 482.53
+<> Saved new best model with validation loss: 6.1790
+Epoch 46/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:32<00:00,  1.47s/it, loss=6.6529, ppl=775.05]
+<> Validating...
+
+<> Epoch 46 Results:
+<>  Time: 0:01:38
+Train Loss: 6.2021 | Train PPL: 493.78
+Valid Loss: 6.1715 | Valid PPL: 478.91
+<> Saved new best model with validation loss: 6.1715
+Epoch 47/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:32<00:00,  1.47s/it, loss=6.6468, ppl=770.29]
+<> Validating...
+
+<> Epoch 47 Results:
+<>  Time: 0:01:38
+Train Loss: 6.1915 | Train PPL: 488.58
+Valid Loss: 6.1649 | Valid PPL: 475.76
+<> Saved new best model with validation loss: 6.1649
+Epoch 48/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:32<00:00,  1.47s/it, loss=6.6440, ppl=768.15]
+<> Validating...
+
+<> Epoch 48 Results:
+<>  Time: 0:01:38
+Train Loss: 6.1792 | Train PPL: 482.62
+Valid Loss: 6.1557 | Valid PPL: 471.42
+<> Saved new best model with validation loss: 6.1557
+Epoch 49/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:32<00:00,  1.47s/it, loss=6.6391, ppl=764.40]
+<> Validating...
+
+<> Epoch 49 Results:
+<>  Time: 0:01:38
+Train Loss: 6.1677 | Train PPL: 477.08
+Valid Loss: 6.1492 | Valid PPL: 468.34
+<> Saved new best model with validation loss: 6.1492
+Epoch 50/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:32<00:00,  1.47s/it, loss=6.6355, ppl=761.66]
+<> Validating...
+
+<> Epoch 50 Results:
+<>  Time: 0:01:38
+Train Loss: 6.1577 | Train PPL: 472.34
+Valid Loss: 6.1443 | Valid PPL: 466.06
+<> Saved new best model with validation loss: 6.1443
+Epoch 51/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:32<00:00,  1.47s/it, loss=6.6260, ppl=754.48]
+<> Validating...
+
+<> Epoch 51 Results:
+<>  Time: 0:01:38
+Train Loss: 6.1483 | Train PPL: 467.92
+Valid Loss: 6.1363 | Valid PPL: 462.36
+<> Saved new best model with validation loss: 6.1363
+Epoch 52/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:32<00:00,  1.47s/it, loss=6.6191, ppl=749.29]
+<> Validating...
+
+<> Epoch 52 Results:
+<>  Time: 0:01:38
+Train Loss: 6.1389 | Train PPL: 463.55
+Valid Loss: 6.1318 | Valid PPL: 460.29
+<> Saved new best model with validation loss: 6.1318
+Epoch 53/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:32<00:00,  1.47s/it, loss=6.6193, ppl=749.40]
+<> Validating...
+
+<> Epoch 53 Results:
+<>  Time: 0:01:38
+Train Loss: 6.1302 | Train PPL: 459.55
+Valid Loss: 6.1297 | Valid PPL: 459.30
+<> Saved new best model with validation loss: 6.1297
+Epoch 54/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:32<00:00,  1.47s/it, loss=6.6136, ppl=745.18]
+<> Validating...
+
+<> Epoch 54 Results:
+<>  Time: 0:01:38
+Train Loss: 6.1223 | Train PPL: 455.89
+Valid Loss: 6.1232 | Valid PPL: 456.32
+<> Saved new best model with validation loss: 6.1232
+Epoch 55/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:32<00:00,  1.47s/it, loss=6.6051, ppl=738.87]
+<> Validating...
+
+<> Epoch 55 Results:
+<>  Time: 0:01:38
+Train Loss: 6.1145 | Train PPL: 452.35
+Valid Loss: 6.1185 | Valid PPL: 454.17
+<> Saved new best model with validation loss: 6.1185
+Epoch 56/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:32<00:00,  1.47s/it, loss=6.6084, ppl=741.31]
+<> Validating...
+
+<> Epoch 56 Results:
+<>  Time: 0:01:38
+Train Loss: 6.1068 | Train PPL: 448.90
+Valid Loss: 6.1169 | Valid PPL: 453.47
+<> Saved new best model with validation loss: 6.1169
+Epoch 57/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:32<00:00,  1.47s/it, loss=6.5976, ppl=733.35]
+<> Validating...
+
+<> Epoch 57 Results:
+<>  Time: 0:01:38
+Train Loss: 6.0986 | Train PPL: 445.25
+Valid Loss: 6.1104 | Valid PPL: 450.54
+<> Saved new best model with validation loss: 6.1104
+Epoch 58/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:32<00:00,  1.47s/it, loss=6.5972, ppl=733.01]
+<> Validating...
+
+<> Epoch 58 Results:
+<>  Time: 0:01:38
+Train Loss: 6.0919 | Train PPL: 442.27
+Valid Loss: 6.1078 | Valid PPL: 449.35
+<> Saved new best model with validation loss: 6.1078
+Epoch 59/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:32<00:00,  1.47s/it, loss=6.5946, ppl=731.16]
+<> Validating...
+
+<> Epoch 59 Results:
+<>  Time: 0:01:38
+Train Loss: 6.0851 | Train PPL: 439.26
+Valid Loss: 6.1042 | Valid PPL: 447.72
+<> Saved new best model with validation loss: 6.1042
+Epoch 60/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:32<00:00,  1.47s/it, loss=6.5954, ppl=731.70]
+<> Validating...
+
+<> Epoch 60 Results:
+<>  Time: 0:01:38
+Train Loss: 6.0791 | Train PPL: 436.63
+Valid Loss: 6.1009 | Valid PPL: 446.25
+<> Saved new best model with validation loss: 6.1009
+Epoch 61/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:32<00:00,  1.47s/it, loss=6.5952, ppl=731.57]
+<> Validating...
+
+<> Epoch 61 Results:
+<>  Time: 0:01:38
+Train Loss: 6.0743 | Train PPL: 434.55
+Valid Loss: 6.0981 | Valid PPL: 445.01
+<> Saved new best model with validation loss: 6.0981
+Epoch 62/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:32<00:00,  1.47s/it, loss=6.5931, ppl=730.03]
+<> Validating...
+
+<> Epoch 62 Results:
+<>  Time: 0:01:38
+Train Loss: 6.0683 | Train PPL: 431.95
+Valid Loss: 6.1008 | Valid PPL: 446.20
+<> No improvement for 1 epoch(s).
+Epoch 63/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:32<00:00,  1.47s/it, loss=6.6021, ppl=736.67]
+<> Validating...
+
+<> Epoch 63 Results:
+<>  Time: 0:01:38
+Train Loss: 6.0654 | Train PPL: 430.69
+Valid Loss: 6.1093 | Valid PPL: 450.00
+<> No improvement for 2 epoch(s).
+Epoch 64/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:32<00:00,  1.47s/it, loss=6.5858, ppl=724.74]
+<> Validating...
+
+<> Epoch 64 Results:
+<>  Time: 0:01:38
+Train Loss: 6.0613 | Train PPL: 428.94
+Valid Loss: 6.0842 | Valid PPL: 438.86
+<> Saved new best model with validation loss: 6.0842
+Epoch 65/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:32<00:00,  1.47s/it, loss=6.5895, ppl=727.39]
+<> Validating...
+
+<> Epoch 65 Results:
+<>  Time: 0:01:38
+Train Loss: 6.0542 | Train PPL: 425.90
+Valid Loss: 6.0907 | Valid PPL: 441.73
+<> No improvement for 1 epoch(s).
+Epoch 66/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:32<00:00,  1.47s/it, loss=6.5796, ppl=720.24]
+<> Validating...
+
+<> Epoch 66 Results:
+<>  Time: 0:01:38
+Train Loss: 6.0488 | Train PPL: 423.62
+Valid Loss: 6.0797 | Valid PPL: 436.88
+<> Saved new best model with validation loss: 6.0797
+Epoch 67/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:32<00:00,  1.47s/it, loss=6.5808, ppl=721.12]
+<> Validating...
+
+<> Epoch 67 Results:
+<>  Time: 0:01:38
+Train Loss: 6.0443 | Train PPL: 421.68
+Valid Loss: 6.0851 | Valid PPL: 439.27
+<> No improvement for 1 epoch(s).
+Epoch 68/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:32<00:00,  1.47s/it, loss=6.5775, ppl=718.73]
+<> Validating...
+
+<> Epoch 68 Results:
+<>  Time: 0:01:37
+Train Loss: 6.0398 | Train PPL: 419.80
+Valid Loss: 6.0765 | Valid PPL: 435.50
+<> Saved new best model with validation loss: 6.0765
+Epoch 69/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:32<00:00,  1.46s/it, loss=6.5802, ppl=720.67]
+<> Validating...
+
+<> Epoch 69 Results:
+<>  Time: 0:01:37
+Train Loss: 6.0363 | Train PPL: 418.33
+Valid Loss: 6.0803 | Valid PPL: 437.16
+<> No improvement for 1 epoch(s).
+Epoch 70/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:32<00:00,  1.46s/it, loss=6.5801, ppl=720.58]
+<> Validating...
+
+<> Epoch 70 Results:
+<>  Time: 0:01:37
+Train Loss: 6.0323 | Train PPL: 416.67
+Valid Loss: 6.0729 | Valid PPL: 433.93
+<> Saved new best model with validation loss: 6.0729
+Epoch 71/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:32<00:00,  1.47s/it, loss=6.5743, ppl=716.45]
+<> Validating...
+
+<> Epoch 71 Results:
+<>  Time: 0:01:38
+Train Loss: 6.0291 | Train PPL: 415.36
+Valid Loss: 6.0759 | Valid PPL: 435.25
+<> No improvement for 1 epoch(s).
+Epoch 72/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:32<00:00,  1.46s/it, loss=6.5733, ppl=715.76]
+<> Validating...
+
+<> Epoch 72 Results:
+<>  Time: 0:01:37
+Train Loss: 6.0264 | Train PPL: 414.23
+Valid Loss: 6.0701 | Valid PPL: 432.72
+<> Saved new best model with validation loss: 6.0701
+Epoch 73/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:36<00:00,  1.54s/it, loss=6.5713, ppl=714.27]
+<> Validating...
+
+<> Epoch 73 Results:
+<>  Time: 0:01:43
+Train Loss: 6.0232 | Train PPL: 412.91
+Valid Loss: 6.0703 | Valid PPL: 432.79
+<> No improvement for 1 epoch(s).
+Epoch 74/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:33<00:00,  1.48s/it, loss=6.5678, ppl=711.78]
+<> Validating...
+
+<> Epoch 74 Results:
+<>  Time: 0:01:39
+Train Loss: 6.0207 | Train PPL: 411.88
+Valid Loss: 6.0689 | Valid PPL: 432.22
+<> Saved new best model with validation loss: 6.0689
+Epoch 75/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:32<00:00,  1.47s/it, loss=6.5706, ppl=713.78]
+<> Validating...
+
+<> Epoch 75 Results:
+<>  Time: 0:01:38
+Train Loss: 6.0186 | Train PPL: 411.00
+Valid Loss: 6.0695 | Valid PPL: 432.48
+<> No improvement for 1 epoch(s).
+Epoch 76/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:32<00:00,  1.47s/it, loss=6.5735, ppl=715.87]
+<> Validating...
+
+<> Epoch 76 Results:
+<>  Time: 0:01:38
+Train Loss: 6.0163 | Train PPL: 410.07
+Valid Loss: 6.0684 | Valid PPL: 432.01
+<> Saved new best model with validation loss: 6.0684
+Epoch 77/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:32<00:00,  1.47s/it, loss=6.5691, ppl=712.74]
+<> Validating...
+
+<> Epoch 77 Results:
+<>  Time: 0:01:38
+Train Loss: 6.0132 | Train PPL: 408.79
+Valid Loss: 6.0665 | Valid PPL: 431.17
+<> Saved new best model with validation loss: 6.0665
+Epoch 78/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:32<00:00,  1.47s/it, loss=6.5732, ppl=715.68]
+<> Validating...
+
+<> Epoch 78 Results:
+<>  Time: 0:01:38
+Train Loss: 6.0119 | Train PPL: 408.26
+Valid Loss: 6.0646 | Valid PPL: 430.34
+<> Saved new best model with validation loss: 6.0646
+Epoch 79/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:32<00:00,  1.47s/it, loss=6.5700, ppl=713.37]
+<> Validating...
+
+<> Epoch 79 Results:
+<>  Time: 0:01:38
+Train Loss: 6.0086 | Train PPL: 406.92
+Valid Loss: 6.0632 | Valid PPL: 429.74
+<> Saved new best model with validation loss: 6.0632
+Epoch 80/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:39<00:00,  1.59s/it, loss=6.5661, ppl=710.61]
+<> Validating...
+
+<> Epoch 80 Results:
+<>  Time: 0:01:46
+Train Loss: 6.0075 | Train PPL: 406.47
+Valid Loss: 6.0617 | Valid PPL: 429.11
+<> Saved new best model with validation loss: 6.0617
+Epoch 81/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:41<00:00,  1.61s/it, loss=6.5696, ppl=713.08]
+<> Validating...
+
+<> Epoch 81 Results:
+<>  Time: 0:01:47
+Train Loss: 6.0064 | Train PPL: 406.02
+Valid Loss: 6.0606 | Valid PPL: 428.61
+<> Saved new best model with validation loss: 6.0606
+Epoch 82/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:42<00:00,  1.63s/it, loss=6.5689, ppl=712.57]
+<> Validating...
+
+<> Epoch 82 Results:
+<>  Time: 0:01:49
+Train Loss: 6.0047 | Train PPL: 405.33
+Valid Loss: 6.0593 | Valid PPL: 428.08
+<> Saved new best model with validation loss: 6.0593
+Epoch 83/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:44<00:00,  1.66s/it, loss=6.5646, ppl=709.54]
+<> Validating...
+
+<> Epoch 83 Results:
+<>  Time: 0:01:50
+Train Loss: 6.0033 | Train PPL: 404.78
+Valid Loss: 6.0586 | Valid PPL: 427.78
+<> Saved new best model with validation loss: 6.0586
+Epoch 84/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:45<00:00,  1.68s/it, loss=6.5605, ppl=706.64]
+<> Validating...
+
+<> Epoch 84 Results:
+<>  Time: 0:01:52
+Train Loss: 6.0020 | Train PPL: 404.24
+Valid Loss: 6.0583 | Valid PPL: 427.65
+<> Saved new best model with validation loss: 6.0583
+Epoch 85/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:43<00:00,  1.65s/it, loss=6.5649, ppl=709.74]
+<> Validating...
+
+<> Epoch 85 Results:
+<>  Time: 0:01:50
+Train Loss: 6.0012 | Train PPL: 403.93
+Valid Loss: 6.0594 | Valid PPL: 428.10
+<> No improvement for 1 epoch(s).
+Epoch 86/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:45<00:00,  1.67s/it, loss=6.5642, ppl=709.22]
+<> Validating...
+
+<> Epoch 86 Results:
+<>  Time: 0:01:52
+Train Loss: 6.0000 | Train PPL: 403.44
+Valid Loss: 6.0590 | Valid PPL: 427.96
+<> No improvement for 2 epoch(s).
+Epoch 87/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:45<00:00,  1.67s/it, loss=6.5671, ppl=711.32]
+<> Validating...
+
+<> Epoch 87 Results:
+<>  Time: 0:01:52
+Train Loss: 5.9990 | Train PPL: 403.04
+Valid Loss: 6.0573 | Valid PPL: 427.22
+<> Saved new best model with validation loss: 6.0573
+Epoch 88/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:46<00:00,  1.69s/it, loss=6.5666, ppl=710.95]
+<> Validating...
+
+<> Epoch 88 Results:
+<>  Time: 0:01:53
+Train Loss: 5.9985 | Train PPL: 402.81
+Valid Loss: 6.0572 | Valid PPL: 427.16
+<> Saved new best model with validation loss: 6.0572
+Epoch 89/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:48<00:00,  1.72s/it, loss=6.5618, ppl=707.56]
+<> Validating...
+
+<> Epoch 89 Results:
+<>  Time: 0:01:55
+Train Loss: 5.9977 | Train PPL: 402.50
+Valid Loss: 6.0571 | Valid PPL: 427.12
+<> Saved new best model with validation loss: 6.0571
+Epoch 90/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:48<00:00,  1.73s/it, loss=6.5657, ppl=710.32]
+<> Validating...
+
+<> Epoch 90 Results:
+<>  Time: 0:01:55
+Train Loss: 5.9975 | Train PPL: 402.41
+Valid Loss: 6.0568 | Valid PPL: 427.02
+<> Saved new best model with validation loss: 6.0568
+Epoch 91/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:47<00:00,  1.71s/it, loss=6.5665, ppl=710.84]
+<> Validating...
+
+<> Epoch 91 Results:
+<>  Time: 0:01:54
+Train Loss: 5.9965 | Train PPL: 402.03
+Valid Loss: 6.0567 | Valid PPL: 426.95
+<> Saved new best model with validation loss: 6.0567
+Epoch 92/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:48<00:00,  1.72s/it, loss=6.5676, ppl=711.69]
+<> Validating...
+
+<> Epoch 92 Results:
+<>  Time: 0:01:55
+Train Loss: 5.9960 | Train PPL: 401.84
+Valid Loss: 6.0566 | Valid PPL: 426.91
+<> Saved new best model with validation loss: 6.0566
+Epoch 93/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:48<00:00,  1.72s/it, loss=6.5651, ppl=709.91]
+<> Validating...
+
+<> Epoch 93 Results:
+<>  Time: 0:01:55
+Train Loss: 5.9961 | Train PPL: 401.84
+Valid Loss: 6.0562 | Valid PPL: 426.76
+<> Saved new best model with validation loss: 6.0562
+Epoch 94/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:47<00:00,  1.71s/it, loss=6.5644, ppl=709.39]
+<> Validating...
+
+<> Epoch 94 Results:
+<>  Time: 0:01:54
+Train Loss: 5.9958 | Train PPL: 401.72
+Valid Loss: 6.0561 | Valid PPL: 426.72
+<> Saved new best model with validation loss: 6.0561
+Epoch 95/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:46<00:00,  1.70s/it, loss=6.5659, ppl=710.47]
+<> Validating...
+
+<> Epoch 95 Results:
+<>  Time: 0:01:53
+Train Loss: 5.9956 | Train PPL: 401.67
+Valid Loss: 6.0559 | Valid PPL: 426.62
+<> Saved new best model with validation loss: 6.0559
+Epoch 96/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:46<00:00,  1.69s/it, loss=6.5624, ppl=707.94]
+<> Validating...
+
+<> Epoch 96 Results:
+<>  Time: 0:01:53
+Train Loss: 5.9953 | Train PPL: 401.56
+Valid Loss: 6.0560 | Valid PPL: 426.65
+<> No improvement for 1 epoch(s).
+Epoch 97/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:48<00:00,  1.72s/it, loss=6.5645, ppl=709.42]
+<> Validating...
+
+<> Epoch 97 Results:
+<>  Time: 0:01:55
+Train Loss: 5.9952 | Train PPL: 401.50
+Valid Loss: 6.0561 | Valid PPL: 426.69
+<> No improvement for 2 epoch(s).
+Epoch 98/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:47<00:00,  1.71s/it, loss=6.5596, ppl=705.98]
+<> Validating...
+
+<> Epoch 98 Results:
+<>  Time: 0:01:54
+Train Loss: 5.9957 | Train PPL: 401.69
+Valid Loss: 6.0561 | Valid PPL: 426.72
+<> No improvement for 3 epoch(s).
+Epoch 99/100: 100%|████████████████████████████████████████████████████████████████████████████| 63/63 [01:44<00:00,  1.66s/it, loss=6.5632, ppl=708.52]
+<> Validating...
+
+<> Epoch 99 Results:
+<>  Time: 0:01:51
+Train Loss: 5.9959 | Train PPL: 401.79
+Valid Loss: 6.0561 | Valid PPL: 426.72
+<> No improvement for 4 epoch(s).
+Epoch 100/100: 100%|███████████████████████████████████████████████████████████████████████████| 63/63 [01:46<00:00,  1.69s/it, loss=6.5664, ppl=710.82]
+<> Validating...
+
+<> Epoch 100 Results:
+<>  Time: 0:01:53
+Train Loss: 5.9962 | Train PPL: 401.90
+Valid Loss: 6.0561 | Valid PPL: 426.71
+<> No improvement for 5 epoch(s).
+
+==================================================
+<> Training Complete!
+==================================================
+Best validation loss: 6.0559
+Total time: 2:47:34
+
+<> Loading Best Model for Evaluation...
+
+==================================================
+<> FINAL TEST EVALUATION
+==================================================
+Testing: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████████████| 7/7 [00:17<00:00,  2.47s/it]
+>> Final Test Loss: 5.2422
+>> Final Test Perplexity: 189.08
+==================================================
