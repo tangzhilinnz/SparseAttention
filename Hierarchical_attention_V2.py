@@ -151,61 +151,73 @@ class HierarchicalSparseAttention(nn.Module):
             offsets.append(offsets[-1] + s)
         return sizes, offsets
 
-    @staticmethod
-    def build_parent_child_mask(parent_count, child_count, device):
-        mask = torch.full((parent_count, child_count), float('-inf'), device=device)
-        for i in range(parent_count):
-            if 2*i < child_count: mask[i, 2*i] = 0.0
-            if 2*i+1 < child_count: mask[i, 2*i+1] = 0.0
-        return mask
-
     def cross_update_Y(self, x, y_in):
         """
-        Updates y using x bottom-up.
-        Strictly enforces that y_in exists.
+        Optimized bottom-up update.
+        1. Projects all Queries at once.
+        2. Replaces O(N^2) masked attention with O(N) pair-wise reduction.
         """
         B, N, D = x.shape
         H, Dh = self.num_heads, self.head_dim
         
-        assert y_in is not None, "y_in cannot be None in cross_update_Y"
+        assert y_in is not None, "y_in cannot be None"
         assert y_in.size(1) > 0, "y_in must have valid tokens"
-        
-        y_source = y_in
 
         if self.sizes is None: self.sizes, self.offsets = self.build_level_info(N)
+
+        # OPTIMIZATION 1: Global Query Projection
+        # Project all Y tokens at once to avoid small GEMMs inside the loop
+        # y_in: [B, Total_Nodes, D] -> Q_all: [B, H, Total_Nodes, Dh]
+        Q_all = self.Wq_y(y_in).view(B, -1, H, Dh).transpose(1, 2)
         
         new_Y_levels = []
-        prev_sources = x
+        prev_sources = x # Starts as the leaves
         
         for level, parent_count in enumerate(self.sizes):
             offset = self.offsets[level]
+
+            # 1. Get Queries for this level (Slicing is free)
+            # [B, H, Parent_Count, Dh]
+            Q = Q_all[:, :, offset : offset + parent_count, :]
             
-            # Read from provided y_source
-            Y_slice = y_source[:, offset:offset + parent_count, :]
-
-            # --- Inline Split Heads ---
-            # Projects (B, N, D) -> (B, N, H, Dh) -> (B, H, N, Dh)
-            Q = self.Wq_y(Y_slice).view(B, -1, H, Dh).transpose(1, 2)
-            K = self.Wk_y(prev_sources).view(B, -1, H, Dh).transpose(1, 2)
-            V = self.Wv_y(prev_sources).view(B, -1, H, Dh).transpose(1, 2)
-
-            V = self.dropout(V) # Apply dropout to the projected values
-
-            mask = self.build_parent_child_mask(parent_count, prev_sources.size(1), x.device)
-            mask = mask.unsqueeze(0).unsqueeze(0)
-
-            # Optimization: Removed explicit .contiguous() calls here.
-            # matmul handles strided tensors fine.
-            attn_logits = torch.matmul(Q, K.transpose(-1, -2)) / math.sqrt(Dh)
-            attn_logits += mask
-  
-            attn_weights = F.softmax(attn_logits, dim=-1)
-            #attn_weights = self.dropout(attn_weights)
-            updated = torch.matmul(attn_weights, V)
+            # 2. Prepare Children (Keys/Values)
+            # The topology is strictly binary: Parent i connects to Child 2i and 2i+1.
+            # If prev_sources has odd length, the last token is ignored (per your original mask logic).
+            # We truncate to ensure strictly even pairs.
+            useful_len = parent_count * 2
+            children_in = prev_sources[:, :useful_len, :]
             
-            # --- Inline Merge Heads ---
-            # (B, H, N, Dh) -> (B, N, H, Dh) -> (B, N, D)
-            updated_merged = updated.transpose(1, 2).reshape(B, -1, D)
+            # Project K and V
+            # Note: We must project here because prev_sources changes every iteration
+            # [B, Useful_Len, H, Dh] -> [B, H, Useful_Len, Dh]
+            K = self.Wk_y(children_in).view(B, -1, H, Dh).transpose(1, 2)
+            V = self.Wv_y(children_in).view(B, -1, H, Dh).transpose(1, 2)
+            V = self.dropout(V)
+
+            # OPTIMIZATION 2: Reshape & Reduce (The "Tree Attention")
+            # Instead of Attn(Parent, Child) with a mask, we reshape Child to (Parent, 2)
+            # Shape changes: [B, H, 2*P, D] -> [B, H, P, 2, D]
+            K_pairs = K.view(B, H, parent_count, 2, Dh)
+            V_pairs = V.view(B, H, parent_count, 2, Dh)
+            
+            # Q shape: [B, H, P, D] -> [B, H, P, 1, D] for broadcast
+            Q_expanded = Q.unsqueeze(3)
+
+            # Compute Scores: Dot product between Parent and its 2 Children
+            # [B, H, P, 1, D] * [B, H, P, 2, D] -> sum(D) -> [B, H, P, 2]
+            attn_logits = torch.sum(Q_expanded * K_pairs, dim=-1) / math.sqrt(Dh)
+            
+            # Softmax over the 2 children
+            attn_weights = F.softmax(attn_logits, dim=-1) # [B, H, P, 2]
+            
+            # Weighted Sum
+            # Weights: [B, H, P, 2, 1] (unsqueeze for broadcast)
+            # V_pairs: [B, H, P, 2, D]
+            # Result:  sum(dim 2) -> [B, H, P, D]
+            updated = torch.sum(attn_weights.unsqueeze(-1) * V_pairs, dim=3)
+
+            # Merge Heads
+            updated_merged = updated.transpose(1, 2).reshape(B, parent_count, D)
             
             new_Y_levels.append(updated_merged)
             prev_sources = updated_merged
