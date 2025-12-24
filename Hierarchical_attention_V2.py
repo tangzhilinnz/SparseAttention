@@ -208,8 +208,14 @@ class HierarchicalSparseAttention(nn.Module):
             attn_logits = torch.sum(Q_expanded * K_pairs, dim=-1) / math.sqrt(Dh)
             
             # Softmax over the 2 children
-            attn_weights = F.softmax(attn_logits, dim=-1) # [B, H, P, 2]
-            
+            # attn_weights = F.softmax(attn_logits, dim=-1) # [B, H, P, 2]
+
+            # ---- SAFE SOFTMAX (size=2) ----
+            max_logits = attn_logits.max(dim=-1, keepdim=True).values
+            exp_logits = torch.exp(attn_logits - max_logits)
+            denom = exp_logits.sum(dim=-1, keepdim=True) + 1e-9
+            attn_weights = exp_logits / denom  # [B, H, P, 2]
+     
             # Weighted Sum
             # Weights: [B, H, P, 2, 1] (unsqueeze for broadcast)
             # V_pairs: [B, H, P, 2, D]
