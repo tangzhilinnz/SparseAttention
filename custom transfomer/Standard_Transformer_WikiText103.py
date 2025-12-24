@@ -3,7 +3,7 @@ import os
 # CRITICAL FIX: GPU SELECTION MUST BE FIRST
 # ==========================================
 # Set this before importing torch or calling torch.cuda to avoid OOM
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 
 import datasets
 # Essential PyTorch imports
@@ -180,6 +180,9 @@ test_loader = DataLoader(test_dataset, batch_size=batch_size, drop_last=True, nu
 # 2. MODEL ARCHITECTURE
 # ==========================================
 
+# ==========================================
+# REPLACED: MultiHeadAttention with FlashAttention
+# ==========================================
 class MultiHeadAttention(nn.Module):
     def __init__(self, d_model, num_heads, dropout=0.1):
         super().__init__()
@@ -194,31 +197,47 @@ class MultiHeadAttention(nn.Module):
         self.out_proj = nn.Linear(d_model, d_model)
         
         self.dropout = nn.Dropout(dropout)
-        self.scale = math.sqrt(self.head_dim)
         
     def forward(self, query, key, value, mask=None, return_attention=False):
         batch_size = query.shape[0]
         
-        Q = self.q_proj(query)
-        K = self.k_proj(key)
-        V = self.v_proj(value)
-        
-        Q = Q.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
-        K = K.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
-        V = V.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
-        
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
-        
-        if mask is not None:
-            # Mask needs to be handled carefully with DataParallel
-            # But since mask is usually passed per-batch inside the forward, it's fine.
-            min_value = torch.finfo(scores.dtype).min
-            scores = scores.masked_fill(mask == 0, min_value)
-        
-        attn_weights = F.softmax(scores, dim=-1)
-        attn_weights = self.dropout(attn_weights)
-        
-        output = torch.matmul(attn_weights, V)
+        # 1. Project and Reshape
+        # Resulting shape: [Batch, Heads, SeqLen, HeadDim]
+        Q = self.q_proj(query).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        K = self.k_proj(key).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        V = self.v_proj(value).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # 2. FlashAttention Implementation
+        if not return_attention:
+            # F.scaled_dot_product_attention automatically selects FlashAttention-2 on A100
+            # It handles scaling (1/sqrt(dim)), softmax, and dropout internally.
+            
+            # Ensure mask is broadcastable if provided. 
+            # Your make_causal_mask returns [1, 1, Seq, Seq], which works perfectly here.
+            output = F.scaled_dot_product_attention(
+                Q, K, V,
+                attn_mask=mask, 
+                dropout_p=self.dropout.p if self.training else 0.0,
+                is_causal=False # We use explicit mask, so is_causal=False
+            )
+            attn_weights = None # FlashAttention does not produce materialized weights
+            
+        else:
+            # 3. Fallback for Visualization (Standard Implementation)
+            # FlashAttention cannot return weights because it never calculates the full NxN matrix.
+            # We revert to standard logic only if weights are explicitly requested.
+            scale = math.sqrt(self.head_dim)
+            scores = torch.matmul(Q, K.transpose(-2, -1)) / scale
+            
+            if mask is not None:
+                min_value = torch.finfo(scores.dtype).min
+                scores = scores.masked_fill(mask == 0, min_value)
+            
+            attn_weights = F.softmax(scores, dim=-1)
+            attn_weights = self.dropout(attn_weights)
+            output = torch.matmul(attn_weights, V)
+
+        # 4. Reassemble Heads
         output = output.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
         output = self.out_proj(output)
         
