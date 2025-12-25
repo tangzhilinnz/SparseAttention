@@ -384,6 +384,7 @@ def build_hierarchical_index_lookup_table(seq_len, device="cuda", dtype=torch.in
             # --- 2. Boundary Check ---
             # If the neighbor is the Root or out of bounds
             if n_next > max_valid:
+                assert False, "Should not be here!!!"
                 break
 
             # --- 3. Causal Masking Logic ---
