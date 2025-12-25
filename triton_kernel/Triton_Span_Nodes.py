@@ -160,80 +160,6 @@ def build_parent_nodes(Q, K, V):
     return Out
 
 
-def cross_update_Y(self, x, y_in):
-    """
-    Optimized bottom-up update using Triton Kernel.
-        
-    Key Optimization:
-    - Uses [Batch, Node, Head, Dim] layout to avoid transposes.
-    - Replaces the O(N) loop of reshaping/masking with a single fused kernel.
-    """
-    B, N, D = x.shape
-    H, Dh = self.num_heads, self.head_dim
-        
-    assert y_in is not None, "y_in cannot be None"
-    assert y_in.size(1) > 0, "y_in must have valid tokens"
-
-    if self.sizes is None: self.sizes, self.offsets = self.build_level_info(N)
-
-    # -------------------------------------------------------
-    # OPTIMIZATION 1: Global Query Projection (Layout Adjusted)
-    # -------------------------------------------------------
-    # We project all Y tokens at once. 
-    # CRITICAL: We DO NOT transpose to [B, H, N, D]. 
-    # We keep it as [B, N, H, D] which is the native Linear output.
-    # This matches the stride logic of our new Triton kernel perfectly.
-    Q_all = self.Wq_y(y_in).view(B, -1, H, Dh) 
-        
-    new_Y_levels = []
-    prev_sources = x # Starts as the leaves
-        
-    for level, parent_count in enumerate(self.sizes):
-        offset = self.offsets[level]
-
-        # ---------------------------------------------------
-        # 1. Prepare Inputs (Zero-Copy Slicing)
-        # ---------------------------------------------------
-        # Slice Q for this level. Shape: [B, Parent_Count, H, Dh]
-        Q = Q_all[:, offset : offset + parent_count, :, :]
-            
-        # Prepare Children (Keys/Values)
-        useful_len = parent_count * 2
-        # Slice strictly to useful length to ensure even pairs
-        children_in = prev_sources[:, :useful_len, :]
-            
-        # Project K and V
-        # Shape: [B, Child_Count, H, Dh]
-        # Again, NO transpose. We keep the native [B, N, H, D] layout.
-        K = self.Wk_y(children_in).view(B, -1, H, Dh)
-        V = self.Wv_y(children_in).view(B, -1, H, Dh)
-        V = self.dropout(V)
-
-        # ---------------------------------------------------
-        # 2. Triton Kernel (Fused Reduction)
-        # ---------------------------------------------------
-        # Replaces: Reshape -> Dot -> Softmax -> Weighted Sum -> Reshape
-        # The kernel natively handles the tree structure (2 children -> 1 parent)
-        # Input:  [B, 2*P, H, D] (Children)
-        # Output: [B, P, H, D]   (Parents)
-        updated_heads = build_parent_nodes(Q, K, V)
-
-        # ---------------------------------------------------
-        # 3. Merge Heads
-        # ---------------------------------------------------
-        # [B, P, H, Dh] -> [B, P, H*Dh] (i.e., [B, P, D])
-        updated_merged = updated_heads.reshape(B, parent_count, D)
-            
-        new_Y_levels.append(updated_merged)
-        prev_sources = updated_merged
-
-    # Concatenate and Project
-    Y_new = torch.cat(new_Y_levels, dim=1)
-    Y_new = self.out_proj_y(Y_new)
-        
-    return Y_new
-
-
 
 import torch
 import torch.nn as nn
@@ -676,7 +602,7 @@ if __name__ == "__main__":
     B = 16          # Batch size
     N = 2048        # Sequence length (Leaf nodes)
     D = 768         # Model dimension
-    H = 12           # Number of heads
+    H = 8           # Number of heads
     dropout = 0.0   # Disable dropout for deterministic validation checking
     
     device = "cuda"
