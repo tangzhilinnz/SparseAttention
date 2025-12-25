@@ -733,3 +733,30 @@ if __name__ == "__main__":
     print(f"{'='*40}")
     
     print(f"\n>>> Speedup: {ref_avg_ms / triton_avg_ms:.2f}x faster")
+
+
+
+    from torch.profiler import profile, record_function, ProfilerActivity
+
+    # ... setup your model and inputs ...
+
+    print("Profiling...")
+    # Warmup to ensure we don't profile compilation time
+    for _ in range(5):
+        model.cross_update_Y_Triton(x, y_in)
+
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler('./log/hierarchical_opt'),
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True
+    ) as prof:
+        for i in range(5): # run enough iterations for the schedule
+            # Optional: Add labels to specific parts of your code
+            with record_function("Top_Level_Step"):
+                model.cross_update_Y_Triton(x, y_in)
+            prof.step()
+
+print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
