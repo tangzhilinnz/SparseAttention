@@ -1037,7 +1037,7 @@ if __name__ == "__main__":
         for _ in range(5):
              with record_function("Bottom_Up_Triton"):
                 model.cross_update_Y_Triton(x, y_in)
-    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
 
     # --------------------------------------------------------------------------
     # 2. TOP-DOWN BENCHMARK
@@ -1079,4 +1079,4 @@ if __name__ == "__main__":
         for _ in range(5):
              with record_function("Top_Down_Triton"):
                 model.update_X_from_Y_Triton(x, y_full, mask=None)
-    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
