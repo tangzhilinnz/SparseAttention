@@ -165,12 +165,11 @@ def build_parent_nodes(Q, K, V):
 
 
 
-
 @triton.jit
 def hierarchical_fused_attention_kernel(
     # Pointers
     Q_ptr, K_ptr, V_ptr, 
-    Lookup_ptr, Mask_ptr,  # Mask_ptr can now be ignored if HAS_MASK=False
+    Lookup_ptr, Mask_ptr, 
     Out_ptr,
     
     # Strides
@@ -185,8 +184,7 @@ def hierarchical_fused_attention_kernel(
     D: tl.constexpr,
     LEVELS: tl.constexpr,
     BLOCK_D: tl.constexpr,
-    
-    # --- NEW FLAG ---
+    BLOCK_LEVELS: tl.constexpr, # <--- NEW CONSTANT (Power of 2)
     HAS_MASK: tl.constexpr 
 ):
     node_idx = tl.program_id(0)
@@ -196,61 +194,67 @@ def hierarchical_fused_attention_kernel(
     h_idx = tl.arange(0, H)
     offs_d = tl.arange(0, BLOCK_D)
     
-    # Load Topology Indices
-    off_lookup = node_idx * sl_n + tl.arange(0, LEVELS) * sl_lvl
-    neighbor_indices = tl.load(Lookup_ptr + off_lookup, mask=tl.arange(0, LEVELS) < LEVELS, other=0)
+    # --- FIX: Use BLOCK_LEVELS for arange (Must be Power of 2) ---
+    offs_lvl = tl.arange(0, BLOCK_LEVELS)
+    mask_lvl = offs_lvl < LEVELS
     
-    # -----------------------------------------------------------
-    # CONDITIONAL MASK LOADING
-    # -----------------------------------------------------------
-    # We initialize a "safe" mask (0 = Visible)
-    # If HAS_MASK is False, this value (0) is used statically.
-    neighbor_mask_val = tl.zeros([LEVELS], dtype=tl.int1)
-
+    # Load Topology Indices
+    # We use 'offs_lvl' for offsets, but apply 'mask_lvl' to ensure we don't read garbage
+    off_lookup = node_idx * sl_n + offs_lvl * sl_lvl
+    neighbor_indices = tl.load(Lookup_ptr + off_lookup, mask=mask_lvl, other=0)
+    
+    # Load Causal Mask (Conditional)
+    neighbor_mask_val = tl.zeros([BLOCK_LEVELS], dtype=tl.int1)
     if HAS_MASK:
-        # Only load from memory if the flag is True
-        neighbor_mask_val = tl.load(Mask_ptr + off_lookup, mask=tl.arange(0, LEVELS) < LEVELS, other=1).to(tl.int1)
+        neighbor_mask_val = tl.load(Mask_ptr + off_lookup, mask=mask_lvl, other=1).to(tl.int1)
 
-    # ... (Load Q, K, V as before) ...
+    # Base Pointers
     q_base = Q_ptr + b_idx * sq_b + node_idx * sq_n
     k_base = K_ptr + b_idx * sk_b 
     
     acc_self = tl.zeros([H], dtype=tl.float32)
-    acc_cross = tl.zeros([H, LEVELS], dtype=tl.float32)
+    
+    # Accumulator must match the Block Size
+    acc_cross = tl.zeros([H, BLOCK_LEVELS], dtype=tl.float32)
 
-    # ... (Dot Product Loop is Unchanged) ...
+    # 2. Score Accumulation (Dot Product)
     for off_d_start in range(0, D, BLOCK_D):
         d_range = off_d_start + offs_d
         d_mask = d_range < D
         
+        # Load Q
         ptr_q = q_base + (h_idx[:, None] * sq_h) + (d_range[None, :] * sq_d)
         q = tl.load(ptr_q, mask=d_mask[None, :], other=0.0)
         
+        # Load K_Self
         ptr_k_self = k_base + (node_idx * sk_n) + (h_idx[:, None] * sk_h) + (d_range[None, :] * sk_d)
         k_self = tl.load(ptr_k_self, mask=d_mask[None, :], other=0.0)
         acc_self += tl.sum(q * k_self, axis=1)
 
+        # Load K_Neighbors (Indirect)
+        # neighbor_indices is [BLOCK_LEVELS]
         ptr_k_cross = k_base + (neighbor_indices[None, :, None] * sk_n) + \
                       (h_idx[:, None, None] * sk_h) + (d_range[None, None, :] * sk_d)
-        k_cross = tl.load(ptr_k_cross, mask=d_mask[None, None, :], other=0.0)
+        
+        # Mask: valid Levels AND valid Dim
+        mask_k_cross = mask_lvl[None, :, None] & d_mask[None, None, :]
+        k_cross = tl.load(ptr_k_cross, mask=mask_k_cross, other=0.0)
+        
         acc_cross += tl.sum(q[:, None, :] * k_cross, axis=2)
 
-    # -----------------------------------------------------------
-    # 3. Softmax (With Conditional Masking)
-    # -----------------------------------------------------------
+    # 3. Softmax
     acc_self = acc_self * sm_scale
     acc_cross = acc_cross * sm_scale
     
-    # Base invalid mask (Indices out of bounds)
-    mask_broadcast = (tl.arange(0, LEVELS) >= LEVELS)
-    
+    # Mask invalid levels (Padding or User Mask)
+    # 1. Padding levels (offs_lvl >= LEVELS)
+    # 2. User Mask (neighbor_mask_val == 1)
+    mask_broadcast = (offs_lvl >= LEVELS)
     if HAS_MASK:
-        # OR with the loaded causal mask
         mask_broadcast = mask_broadcast | (neighbor_mask_val == 1)
         
     acc_cross = tl.where(mask_broadcast[None, :], -1.0e9, acc_cross)
     
-    # ... (Rest of Softmax and Weighted Sum is Unchanged) ...
     max_cross = tl.max(acc_cross, axis=1)
     max_all = tl.maximum(acc_self, max_cross)
     
@@ -261,7 +265,7 @@ def hierarchical_fused_attention_kernel(
     w_self = exp_self / denom 
     w_cross = exp_cross / denom[:, None]
 
-    # Weighted Sum Loop ...
+    # 4. Weighted Sum
     v_base = V_ptr + b_idx * sk_b
     out_base = Out_ptr + b_idx * so_b + node_idx * so_n
     
@@ -269,17 +273,24 @@ def hierarchical_fused_attention_kernel(
         d_range = off_d_start + offs_d
         d_mask = d_range < D
         
+        # Load V_Self
         ptr_v_self = v_base + (node_idx * sk_n) + (h_idx[:, None] * sk_h) + (d_range[None, :] * sk_d)
         v_self = tl.load(ptr_v_self, mask=d_mask[None, :], other=0.0)
         out_acc = w_self[:, None] * v_self
         
+        # Load V_Neighbors (Indirect)
         ptr_v_cross = v_base + (neighbor_indices[None, :, None] * sk_n) + \
                       (h_idx[:, None, None] * sk_h) + (d_range[None, None, :] * sk_d)
-        v_cross = tl.load(ptr_v_cross, mask=d_mask[None, None, :], other=0.0)
+        
+        mask_v_cross = mask_lvl[None, :, None] & d_mask[None, None, :]
+        v_cross = tl.load(ptr_v_cross, mask=mask_v_cross, other=0.0)
+        
         out_acc += tl.sum(w_cross[:, :, None] * v_cross, axis=1)
         
+        # Store
         ptr_out = out_base + (h_idx[:, None] * so_h) + (d_range[None, :] * so_d)
         tl.store(ptr_out, out_acc.to(Out_ptr.dtype.element_ty), mask=d_mask[None, :])
+
 
 
 def hierarchical_fused_attention(Q, K, V, idx_table, mask_table):
@@ -287,37 +298,31 @@ def hierarchical_fused_attention(Q, K, V, idx_table, mask_table):
     LEVELS = idx_table.shape[1]
     Out = torch.empty_like(Q)
 
-    # --- HANDLE MASK POINTER ---
     HAS_MASK = (mask_table is not None)
-    
-    # If None, pass a dummy pointer (e.g., Q) to satisfy the signature.
-    # The kernel won't read it because HAS_MASK is False.
     mask_ptr_safe = mask_table if HAS_MASK else Q 
 
     grid = (N, B)
 
+    # --- FIX: Calculate next power of 2 for LEVELS ---
+    BLOCK_LEVELS = triton.next_power_of_2(LEVELS)
+
     hierarchical_fused_attention_kernel[grid](
         Q, K, V, 
-        idx_table, mask_ptr_safe, # Pass safe pointer
+        idx_table, mask_ptr_safe, 
         Out,
-
         Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
         K.stride(0), K.stride(1), K.stride(2), K.stride(3),
         idx_table.stride(0), idx_table.stride(1),
         Out.stride(0), Out.stride(1), Out.stride(2), Out.stride(3),
-
         sm_scale=1.0 / math.sqrt(Dh),
         H=H,
         D=Dh,
         LEVELS=LEVELS,
         BLOCK_D=triton.next_power_of_2(Dh),
-        
-        # Pass the Flag
+        BLOCK_LEVELS=BLOCK_LEVELS, # <--- PASS THIS
         HAS_MASK=HAS_MASK,
-        
-        num_warps=4
+        num_warps=4 
     )
-
     return Out
 
 
@@ -979,7 +984,7 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cpu": print("No GPU found."); exit()
 
-    B, N, D, H = 16, 2048, 2048, 16
+    B, N, D, H = 16, 2048, 1024, 16
     dtype = torch.float16
     
     print(f"\n--- CONFIG: B={B}, N={N}, D={D}, H={H} ---")
