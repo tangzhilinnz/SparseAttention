@@ -603,7 +603,7 @@ if __name__ == "__main__":
     # Large enough size to make the kernel launch overhead negligible compared to math
     B = 16          # Batch size
     N = 2048        # Sequence length (Leaf nodes)
-    D = 2024        # Model dimension
+    D = 2048        # Model dimension
     H = 16          # Number of heads
     dropout = 0.0   # Disable dropout for deterministic validation checking
     
