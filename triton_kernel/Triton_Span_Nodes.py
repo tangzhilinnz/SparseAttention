@@ -989,7 +989,7 @@ if __name__ == "__main__":
     dtype = torch.float16
     
     print(f"\n--- CONFIG: B={B}, N={N}, D={D}, H={H} ---")
-    model = HierarchicalSparseAttention(dim=D, num_heads=H).to(device).to(dtype)
+    model = HierarchicalSparseAttention(dim=D, num_heads=H, dropout = 0.0).to(device).to(dtype)
     model.eval()
 
     x = torch.randn(B, N, D, device=device, dtype=dtype)
