@@ -603,7 +603,7 @@ if __name__ == "__main__":
     # Large enough size to make the kernel launch overhead negligible compared to math
     B = 16          # Batch size
     N = 2048        # Sequence length (Leaf nodes)
-    D = 1024        # Model dimension
+    D = 2024        # Model dimension
     H = 16          # Number of heads
     dropout = 0.0   # Disable dropout for deterministic validation checking
     
@@ -684,24 +684,51 @@ if __name__ == "__main__":
     ref_latency_ms = start_event.elapsed_time(end_event) / num_trials
     print(f"PyTorch Reference Avg time: {ref_latency_ms:.4f} ms")
 
-    # B. Benchmark Triton Optimized
-    # -----------------------------
-    # Warmup (Compiles the kernel)
+    # --- Benchmark PyTorch Reference ---
+    # Warmup
+    for _ in range(num_warmup):
+        _ = model.cross_update_Y(x, y_in)
+    torch.cuda.synchronize(device=device)
+    
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    
+    start_event.record()
+    for _ in range(num_trials):
+        _ = model.cross_update_Y(x, y_in)
+    end_event.record()
+    torch.cuda.synchronize(device=device)
+    
+    ref_total_ms = start_event.elapsed_time(end_event)
+    ref_avg_ms = ref_total_ms / num_trials
+
+    # --- Benchmark Triton Optimized ---
+    # Warmup
     for _ in range(num_warmup):
         _ = model.cross_update_Y_Triton(x, y_in)
-    torch.cuda.synchronize()
+    torch.cuda.synchronize(device=device)
     
     start_event.record()
     for _ in range(num_trials):
         _ = model.cross_update_Y_Triton(x, y_in)
     end_event.record()
-    torch.cuda.synchronize()
+    torch.cuda.synchronize(device=device)
     
-    triton_latency_ms = start_event.elapsed_time(end_event) / num_trials
-    print(f"Triton Optimized  Avg time: {triton_latency_ms:.4f} ms")
+    triton_total_ms = start_event.elapsed_time(end_event)
+    triton_avg_ms = triton_total_ms / num_trials
 
     # ------------------------------------------------------------------
-    # Summary
+    # Final Summary
     # ------------------------------------------------------------------
-    speedup = ref_latency_ms / triton_latency_ms
-    print(f"\n>>> Speedup: {speedup:.2f}x")
+    print(f"\n{'='*40}")
+    print(f"Results ({num_trials} trials)")
+    print(f"{'='*40}")
+    
+    print(f"{'Metric':<20} | {'PyTorch (Ref)':<15} | {'Triton (Opt)':<15}")
+    print(f"{'-'*20}-+-{'-'*15}-+-{'-'*15}")
+    print(f"{'Avg Latency':<20} | {ref_avg_ms:.4f} ms      | {triton_avg_ms:.4f} ms")
+    print(f"{'Total Time':<20} | {ref_total_ms:.2f} ms      | {triton_total_ms:.2f} ms")
+    print(f"{'Throughput (est)':<20} | {1000/ref_avg_ms:.1f} iter/s   | {1000/triton_avg_ms:.1f} iter/s")
+    print(f"{'='*40}")
+    
+    print(f"\n>>> Speedup: {ref_avg_ms / triton_avg_ms:.2f}x faster")
