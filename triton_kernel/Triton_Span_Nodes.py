@@ -142,7 +142,7 @@ def build_parent_nodes(Q, K, V):
     # We let the internal loop handle H
     grid = (P, B)
 
-    print(f" BLOCK_SIZE (next_power_of_2)={triton.next_power_of_2(D)}")
+    #print(f" BLOCK_SIZE (next_power_of_2)={triton.next_power_of_2(D)}")
     
     build_parent_nodes_kernel[grid](
         Q, K, V, Out,
