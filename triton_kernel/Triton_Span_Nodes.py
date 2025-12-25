@@ -630,6 +630,25 @@ if __name__ == "__main__":
     # (Size doesn't strictly matter for the kernel logic, but usually matches N)
     y_in = torch.randn(B, N, D, device=device, dtype=dtype)
 
+
+    # -------------------------------------------------------
+    #           COMPILE STEP (The Key Optimization)
+    # -------------------------------------------------------
+    # Check for PyTorch 2.0+
+    if int(torch.__version__.split(".")[0]) >= 2:
+        print(">>> Applying torch.compile(mode='reduce-overhead')...")
+        print("    (This will take a moment during the first warmup run)")
+        
+        # Option A: Compile just the specific method
+        # 'reduce-overhead' uses CUDA Graphs to eliminate CPU launch latency
+        model.cross_update_Y_Triton = torch.compile(
+            model.cross_update_Y_Triton, 
+            mode="reduce-overhead"
+        )
+    else:
+        print(">>> WARNING: PyTorch < 2.0 detected. Skipping torch.compile.")
+
+
     # ------------------------------------------------------------------
     # Correctness Check (Sanity Check)
     # ------------------------------------------------------------------
