@@ -141,6 +141,8 @@ def build_parent_nodes(Q, K, V):
     # 2D Grid: (Parent_Nodes, Batch)
     # We let the internal loop handle H
     grid = (P, B)
+
+    print(f" BLOCK_SIZE (next_power_of_2)={triton.next_power_of_2(D)}")
     
     build_parent_nodes_kernel[grid](
         Q, K, V, Out,
@@ -601,8 +603,8 @@ if __name__ == "__main__":
     # Large enough size to make the kernel launch overhead negligible compared to math
     B = 16          # Batch size
     N = 2048        # Sequence length (Leaf nodes)
-    D = 768         # Model dimension
-    H = 8           # Number of heads
+    D = 1024        # Model dimension
+    H = 16          # Number of heads
     dropout = 0.0   # Disable dropout for deterministic validation checking
     
     device = "cuda"
