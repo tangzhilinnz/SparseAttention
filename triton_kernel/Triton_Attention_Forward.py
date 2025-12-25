@@ -4,21 +4,7 @@ import math
 import triton
 import triton.language as tl
 
-
-
-
-
-
-
-
-
-
-
-
-import torch
 import torch.nn.functional as F
-import triton
-import triton.language as tl
 import time
 
 # --- (Your existing Triton kernels and helper functions go here) ---
@@ -114,47 +100,45 @@ def build_hierarchical_index_lookup_table(seq_len, device="cuda", dtype=torch.in
     max_valid = total_nodes - 2
     level_num = int(math.log2(seq_len))
 
-    # Only store neighbor indices (exclude the leaf itself)
+    # 1. Initialize Tensors
+    # Mask defaults to True (attend to everything), we set False to mask out future tokens.
+    causal_mask = torch.full((seq_len, level_num), False, dtype=torch.bool, device=device)
+    
+    # Map defaults to -1 (padding/invalid)
     idx_map = torch.full((seq_len, level_num), -1, dtype=dtype, device=device)
 
     for n in range(seq_len):
-        n_cur = n
+        n_cur = n # Starts as the leaf index
+        
         for lvl in range(level_num):
+            # --- 1. Calculate the Neighbor (n_next) and Self/Ancestor (pair) ---
             if lvl == 0:
-                n_next = n_cur ^ 1  # sibling leaf
+                n_next = n_cur ^ 1  # Sibling leaf
+                pair = n_cur        # The leaf itself
             else:
-                n_next = (n_cur // 2 + seq_len) ^ 1  # sibling parent
+                # Formula: (Child_Index // 2) + Offset
+                # Note: We use n_cur (which is the *neighbor* from prev loop).
+                # This works because floor(neighbor / 2) == floor(self / 2).
+                n_next = (n_cur // 2 + seq_len) ^ 1 # Uncle
+                pair = (n_cur // 2 + seq_len)       # Parent
 
+            # --- 2. Boundary Check ---
+            # If the neighbor is the Root or out of bounds
             if n_next > max_valid:
                 break
 
+            # --- 3. Causal Masking Logic ---
+            # If our Ancestor (pair) appears BEFORE the Neighbor (n_next),
+            # it means the Neighbor is in the "Future" (Right branch).
+            # We must mask it out.
+            if pair < n_next:
+                causal_mask[n, lvl] = True
+
+            # --- 4. Update for next iteration ---
             idx_map[n, lvl] = n_next
-            n_cur = n_next
+            n_cur = n_next # Climb up via the neighbor
 
-    return idx_map
-
-
-
-
-#def main():
-#    seq_len = 1024
-#    idx_map = build_hierarchical_index_lookup_table(seq_len, device="cpu")
-#
-#    print(f"Sequence length: {seq_len}")
-#    print(f"Hierarchical index map (shape: {tuple(idx_map.shape)}):")
-#    print(idx_map)
-#
-#    for i in range(seq_len):
-#        row = idx_map[i].tolist()
-#        print(f"token {i:2d}: {row}")
-#
-#
-#if __name__ == "__main__":
-#    main()
-
-
-
-
+    return idx_map, causal_mask
 
 
 
