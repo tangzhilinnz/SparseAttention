@@ -163,6 +163,165 @@ def build_parent_nodes(Q, K, V):
 
 
 
+
+
+
+@triton.jit
+def hierarchical_fused_attention_kernel(
+    # Pointers
+    Q_ptr, K_ptr, V_ptr, 
+    Lookup_ptr, Mask_ptr,  # Mask_ptr can now be ignored if HAS_MASK=False
+    Out_ptr,
+    
+    # Strides
+    sq_b, sq_n, sq_h, sq_d,
+    sk_b, sk_n, sk_h, sk_d,
+    sl_n, sl_lvl,
+    so_b, so_n, so_h, so_d,
+    
+    # Constants
+    sm_scale,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    LEVELS: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    
+    # --- NEW FLAG ---
+    HAS_MASK: tl.constexpr 
+):
+    node_idx = tl.program_id(0)
+    b_idx = tl.program_id(1)
+
+    # 1. Setup
+    h_idx = tl.arange(0, H)
+    offs_d = tl.arange(0, BLOCK_D)
+    
+    # Load Topology Indices
+    off_lookup = node_idx * sl_n + tl.arange(0, LEVELS) * sl_lvl
+    neighbor_indices = tl.load(Lookup_ptr + off_lookup, mask=tl.arange(0, LEVELS) < LEVELS, other=0)
+    
+    # -----------------------------------------------------------
+    # CONDITIONAL MASK LOADING
+    # -----------------------------------------------------------
+    # We initialize a "safe" mask (0 = Visible)
+    # If HAS_MASK is False, this value (0) is used statically.
+    neighbor_mask_val = tl.zeros([LEVELS], dtype=tl.int1)
+
+    if HAS_MASK:
+        # Only load from memory if the flag is True
+        neighbor_mask_val = tl.load(Mask_ptr + off_lookup, mask=tl.arange(0, LEVELS) < LEVELS, other=1).to(tl.int1)
+
+    # ... (Load Q, K, V as before) ...
+    q_base = Q_ptr + b_idx * sq_b + node_idx * sq_n
+    k_base = K_ptr + b_idx * sk_b 
+    
+    acc_self = tl.zeros([H], dtype=tl.float32)
+    acc_cross = tl.zeros([H, LEVELS], dtype=tl.float32)
+
+    # ... (Dot Product Loop is Unchanged) ...
+    for off_d_start in range(0, D, BLOCK_D):
+        d_range = off_d_start + offs_d
+        d_mask = d_range < D
+        
+        ptr_q = q_base + (h_idx[:, None] * sq_h) + (d_range[None, :] * sq_d)
+        q = tl.load(ptr_q, mask=d_mask[None, :], other=0.0)
+        
+        ptr_k_self = k_base + (node_idx * sk_n) + (h_idx[:, None] * sk_h) + (d_range[None, :] * sk_d)
+        k_self = tl.load(ptr_k_self, mask=d_mask[None, :], other=0.0)
+        acc_self += tl.sum(q * k_self, axis=1)
+
+        ptr_k_cross = k_base + (neighbor_indices[None, :, None] * sk_n) + \
+                      (h_idx[:, None, None] * sk_h) + (d_range[None, None, :] * sk_d)
+        k_cross = tl.load(ptr_k_cross, mask=d_mask[None, None, :], other=0.0)
+        acc_cross += tl.sum(q[:, None, :] * k_cross, axis=2)
+
+    # -----------------------------------------------------------
+    # 3. Softmax (With Conditional Masking)
+    # -----------------------------------------------------------
+    acc_self = acc_self * sm_scale
+    acc_cross = acc_cross * sm_scale
+    
+    # Base invalid mask (Indices out of bounds)
+    mask_broadcast = (tl.arange(0, LEVELS) >= LEVELS)
+    
+    if HAS_MASK:
+        # OR with the loaded causal mask
+        mask_broadcast = mask_broadcast | (neighbor_mask_val == 1)
+        
+    acc_cross = tl.where(mask_broadcast[None, :], -1.0e9, acc_cross)
+    
+    # ... (Rest of Softmax and Weighted Sum is Unchanged) ...
+    max_cross = tl.max(acc_cross, axis=1)
+    max_all = tl.maximum(acc_self, max_cross)
+    
+    exp_self = tl.exp(acc_self - max_all)
+    exp_cross = tl.exp(acc_cross - max_all[:, None])
+    
+    denom = exp_self + tl.sum(exp_cross, axis=1)
+    w_self = exp_self / denom 
+    w_cross = exp_cross / denom[:, None]
+
+    # Weighted Sum Loop ...
+    v_base = V_ptr + b_idx * sk_b
+    out_base = Out_ptr + b_idx * so_b + node_idx * so_n
+    
+    for off_d_start in range(0, D, BLOCK_D):
+        d_range = off_d_start + offs_d
+        d_mask = d_range < D
+        
+        ptr_v_self = v_base + (node_idx * sk_n) + (h_idx[:, None] * sk_h) + (d_range[None, :] * sk_d)
+        v_self = tl.load(ptr_v_self, mask=d_mask[None, :], other=0.0)
+        out_acc = w_self[:, None] * v_self
+        
+        ptr_v_cross = v_base + (neighbor_indices[None, :, None] * sk_n) + \
+                      (h_idx[:, None, None] * sk_h) + (d_range[None, None, :] * sk_d)
+        v_cross = tl.load(ptr_v_cross, mask=d_mask[None, None, :], other=0.0)
+        out_acc += tl.sum(w_cross[:, :, None] * v_cross, axis=1)
+        
+        ptr_out = out_base + (h_idx[:, None] * so_h) + (d_range[None, :] * so_d)
+        tl.store(ptr_out, out_acc.to(Out_ptr.dtype.element_ty), mask=d_mask[None, :])
+
+
+def hierarchical_fused_attention(Q, K, V, idx_table, mask_table):
+    B, N, H, Dh = Q.shape
+    LEVELS = idx_table.shape[1]
+    Out = torch.empty_like(Q)
+
+    # --- HANDLE MASK POINTER ---
+    HAS_MASK = (mask_table is not None)
+    
+    # If None, pass a dummy pointer (e.g., Q) to satisfy the signature.
+    # The kernel won't read it because HAS_MASK is False.
+    mask_ptr_safe = mask_table if HAS_MASK else Q 
+
+    grid = (N, B)
+
+    hierarchical_fused_attention_kernel[grid](
+        Q, K, V, 
+        idx_table, mask_ptr_safe, # Pass safe pointer
+        Out,
+
+        Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
+        K.stride(0), K.stride(1), K.stride(2), K.stride(3),
+        idx_table.stride(0), idx_table.stride(1),
+        Out.stride(0), Out.stride(1), Out.stride(2), Out.stride(3),
+
+        sm_scale=1.0 / math.sqrt(Dh),
+        H=H,
+        D=Dh,
+        LEVELS=LEVELS,
+        BLOCK_D=triton.next_power_of_2(Dh),
+        
+        # Pass the Flag
+        HAS_MASK=HAS_MASK,
+        
+        num_warps=4
+    )
+
+    return Out
+
+
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -542,6 +701,51 @@ class HierarchicalSparseAttention(nn.Module):
         # --- Inline Merge Heads ---
         return output_leaf.transpose(1, 2).reshape(B, N, D)
 
+
+    def update_X_from_Y_Triton(self, x, y, mask=None):
+        B, N, D = x.shape
+        H, Dh = self.num_heads, self.head_dim
+
+        # [Check] Enforce strict existence
+        assert y is not None, "y (parents) cannot be None during top-down update"
+
+        # 1. Combine Input (Leaves + Parents)
+        XY = torch.cat([x, y], dim=1)
+        
+        # 2. Separate Projections (No Fused Wkv)
+        # Q: [B, N, H, Dh]
+        Q = self.Wq_x(x).view(B, N, H, Dh)
+        
+        # K, V: [B, Total_Nodes, H, Dh]
+        # We project K and V separately using your existing layers
+        K_full = self.Wk_x(XY).view(B, -1, H, Dh)
+        V_full = self.Wv_x(XY).view(B, -1, H, Dh)
+        
+        # Apply dropout to V
+        V_full = self.dropout(V_full)
+
+        # 3. Ensure Contiguity
+        # The Triton kernel does pointer arithmetic. While Linear() outputs are usually 
+        # contiguous, operations like Dropout or View can sometimes create strides 
+        # that break optimized kernels. We enforce it here to be safe.
+        if not K_full.is_contiguous(): K_full = K_full.contiguous()
+        if not V_full.is_contiguous(): V_full = V_full.contiguous()
+
+        # Get Topology
+        idx_table, neighbor_mask = self._get_lookup_table(N, device=x.device)
+
+        # DECISION LOGIC:
+        # If the user passed a mask (indicating causality is on), use neighbor_mask.
+        # If mask is None (indicating full/bidirectional), pass None.
+        active_mask = neighbor_mask if mask is not None else None
+
+        output_leaf_heads = hierarchical_fused_attention(
+            Q, K_full, V_full, 
+            idx_table, active_mask
+        )
+    
+        return self.out_proj_x(output_leaf_heads.view(B, N, D))
+
     def _standard_attention(self, Q, K, V, mask):
         # Q, K, V are already [B, H, N, Dh]
         D_head = Q.size(-1)
@@ -585,178 +789,287 @@ class HierarchicalSparseAttention(nn.Module):
 
 import time
 
+#if __name__ == "__main__":
+#    # ------------------------------------------------------------------
+#    # Configuration & Setup
+#    # ------------------------------------------------------------------
+#    torch.manual_seed(42)
+#
+#    # Check availability of GPU 2
+#    target_device_idx = 2
+#    if torch.cuda.device_count() <= target_device_idx:
+#        print(f"Error: GPU {target_device_idx} not found. Available GPUs: {torch.cuda.device_count()}")
+#        print("Switching to 'cuda:0' by default.")
+#        device = "cuda:0"
+#    else:
+#        device = f"cuda:{target_device_idx}"
+#    
+#    # Large enough size to make the kernel launch overhead negligible compared to math
+#    B = 16          # Batch size
+#    N = 2048        # Sequence length (Leaf nodes)
+#    D = 2048        # Model dimension
+#    H = 16          # Number of heads
+#    dropout = 0.0   # Disable dropout for deterministic validation checking
+#    
+#    device = "cuda"
+#    dtype = torch.float16 # Test in FP16 for realistic performance metrics
+#
+#    print(f"--- Benchmarking Configuration ---")
+#    print(f"Batch Size (B): {B}")
+#    print(f"Seq Len (N)   : {N}")
+#    print(f"Dim (D)       : {D}")
+#    print(f"Heads (H)     : {H}")
+#    print(f"Dtype         : {dtype}")
+#    print(f"----------------------------------")
+#
+#    # 1. Initialize Model
+#    model = HierarchicalSparseAttention(dim=D, num_heads=H, dropout=dropout).to(device).to(dtype)
+#    model.eval() # Set to eval to disable dropout non-determinism
+#
+#    # 2. Generate Random Inputs
+#    # x: The leaf nodes [B, N, D]
+#    x = torch.randn(B, N, D, device=device, dtype=dtype)
+#    
+#    # y_in: The input for the query projection [B, N, D] 
+#    # (Size doesn't strictly matter for the kernel logic, but usually matches N)
+#    y_in = torch.randn(B, N, D, device=device, dtype=dtype)
+#
+#
+#    # ------------------------------------------------------------------
+#    # Correctness Check (Sanity Check)
+#    # ------------------------------------------------------------------
+#    print("\n[1] Running Correctness Check...")
+#    
+#    # Run PyTorch Reference
+#    with torch.no_grad():
+#        out_ref = model.cross_update_Y(x, y_in)
+#    
+#    # Run Triton Optimized
+#    with torch.no_grad():
+#        out_triton = model.cross_update_Y_Triton(x, y_in)
+#
+#    # Calculate Error
+#    # Note: FP16 accumulation can lead to slight deviations vs FP32, 
+#    # but since both use similar logic, they should be very close.
+#    max_diff = (out_ref - out_triton).abs().max().item()
+#    mean_diff = (out_ref - out_triton).abs().mean().item()
+#    
+#    print(f"Max Absolute Error: {max_diff:.6e}")
+#    print(f"Mean Absolute Error: {mean_diff:.6e}")
+#    
+#    if max_diff < 1e-2: # Relaxed tolerance for FP16
+#        print(">>> SUCCESS: Outputs match.")
+#    else:
+#        print(">>> WARNING: Outputs differ significantly!")
+#
+#    # ------------------------------------------------------------------
+#    # Performance Benchmarking
+#    # ------------------------------------------------------------------
+#    print("\n[2] Running Performance Benchmark...")
+#    
+#    num_warmup = 10
+#    num_trials = 100
+#
+#    # A. Benchmark PyTorch Reference
+#    # -----------------------------
+#    # Warmup
+#    for _ in range(num_warmup):
+#        _ = model.cross_update_Y(x, y_in)
+#    torch.cuda.synchronize()
+#    
+#    start_event = torch.cuda.Event(enable_timing=True)
+#    end_event = torch.cuda.Event(enable_timing=True)
+#    
+#    start_event.record()
+#    for _ in range(num_trials):
+#        _ = model.cross_update_Y(x, y_in)
+#    end_event.record()
+#    torch.cuda.synchronize()
+#    
+#    ref_latency_ms = start_event.elapsed_time(end_event) / num_trials
+#    print(f"PyTorch Reference Avg time: {ref_latency_ms:.4f} ms")
+#
+#    # --- Benchmark PyTorch Reference ---
+#    # Warmup
+#    for _ in range(num_warmup):
+#        _ = model.cross_update_Y(x, y_in)
+#    torch.cuda.synchronize(device=device)
+#    
+#    start_event = torch.cuda.Event(enable_timing=True)
+#    end_event = torch.cuda.Event(enable_timing=True)
+#    
+#    start_event.record()
+#    for _ in range(num_trials):
+#        _ = model.cross_update_Y(x, y_in)
+#    end_event.record()
+#    torch.cuda.synchronize(device=device)
+#    
+#    ref_total_ms = start_event.elapsed_time(end_event)
+#    ref_avg_ms = ref_total_ms / num_trials
+#
+#    # --- Benchmark Triton Optimized ---
+#    # Warmup
+#    for _ in range(num_warmup):
+#        _ = model.cross_update_Y_Triton(x, y_in)
+#    torch.cuda.synchronize(device=device)
+#    
+#    start_event.record()
+#    for _ in range(num_trials):
+#        _ = model.cross_update_Y_Triton(x, y_in)
+#    end_event.record()
+#    torch.cuda.synchronize(device=device)
+#    
+#    triton_total_ms = start_event.elapsed_time(end_event)
+#    triton_avg_ms = triton_total_ms / num_trials
+#
+#    # ------------------------------------------------------------------
+#    # Final Summary
+#    # ------------------------------------------------------------------
+#    print(f"\n{'='*40}")
+#    print(f"Results ({num_trials} trials)")
+#    print(f"{'='*40}")
+#    
+#    print(f"{'Metric':<20} | {'PyTorch (Ref)':<15} | {'Triton (Opt)':<15}")
+#    print(f"{'-'*20}-+-{'-'*15}-+-{'-'*15}")
+#    print(f"{'Avg Latency':<20} | {ref_avg_ms:.4f} ms      | {triton_avg_ms:.4f} ms")
+#    print(f"{'Total Time':<20} | {ref_total_ms:.2f} ms      | {triton_total_ms:.2f} ms")
+#    print(f"{'Throughput (est)':<20} | {1000/ref_avg_ms:.1f} iter/s   | {1000/triton_avg_ms:.1f} iter/s")
+#    print(f"{'='*40}")
+#    
+#    print(f"\n>>> Speedup: {ref_avg_ms / triton_avg_ms:.2f}x faster")
+#
+#
+#
+#    from torch.profiler import profile, record_function, ProfilerActivity
+#
+#    # ... setup your model and inputs ...
+#
+#    print("Profiling...")
+#    # Warmup to ensure we don't profile compilation time
+#    for _ in range(5):
+#        model.cross_update_Y_Triton(x, y_in)
+#
+#    with profile(
+#        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+#        schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1),
+#        on_trace_ready=torch.profiler.tensorboard_trace_handler('./log/hierarchical_opt'),
+#        record_shapes=True,
+#        profile_memory=True,
+#        with_stack=True
+#    ) as prof:
+#        for i in range(5): # run enough iterations for the schedule
+#            # Optional: Add labels to specific parts of your code
+#            with record_function("Top_Level_Step"):
+#                model.cross_update_Y_Triton(x, y_in)
+#            prof.step()
+#
+#print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+
+
+
+
+# ==============================================================================
+#                               BENCHMARK SUITE
+# ==============================================================================
+
 if __name__ == "__main__":
-    # ------------------------------------------------------------------
-    # Configuration & Setup
-    # ------------------------------------------------------------------
     torch.manual_seed(42)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cpu": print("No GPU found."); exit()
 
-    # Check availability of GPU 2
-    target_device_idx = 2
-    if torch.cuda.device_count() <= target_device_idx:
-        print(f"Error: GPU {target_device_idx} not found. Available GPUs: {torch.cuda.device_count()}")
-        print("Switching to 'cuda:0' by default.")
-        device = "cuda:0"
-    else:
-        device = f"cuda:{target_device_idx}"
+    B, N, D, H = 16, 2048, 2048, 16
+    dtype = torch.float16
     
-    # Large enough size to make the kernel launch overhead negligible compared to math
-    B = 16          # Batch size
-    N = 2048        # Sequence length (Leaf nodes)
-    D = 2048        # Model dimension
-    H = 16          # Number of heads
-    dropout = 0.0   # Disable dropout for deterministic validation checking
-    
-    device = "cuda"
-    dtype = torch.float16 # Test in FP16 for realistic performance metrics
+    print(f"\n--- CONFIG: B={B}, N={N}, D={D}, H={H} ---")
+    model = HierarchicalSparseAttention(dim=D, num_heads=H).to(device).to(dtype)
+    model.eval()
 
-    print(f"--- Benchmarking Configuration ---")
-    print(f"Batch Size (B): {B}")
-    print(f"Seq Len (N)   : {N}")
-    print(f"Dim (D)       : {D}")
-    print(f"Heads (H)     : {H}")
-    print(f"Dtype         : {dtype}")
-    print(f"----------------------------------")
-
-    # 1. Initialize Model
-    model = HierarchicalSparseAttention(dim=D, num_heads=H, dropout=dropout).to(device).to(dtype)
-    model.eval() # Set to eval to disable dropout non-determinism
-
-    # 2. Generate Random Inputs
-    # x: The leaf nodes [B, N, D]
     x = torch.randn(B, N, D, device=device, dtype=dtype)
-    
-    # y_in: The input for the query projection [B, N, D] 
-    # (Size doesn't strictly matter for the kernel logic, but usually matches N)
-    y_in = torch.randn(B, N, D, device=device, dtype=dtype)
+    y_in = torch.randn(B, N-1, D, device=device, dtype=dtype) # N-1 for Bottom-Up
+    y_full = torch.randn(B, N, D, device=device, dtype=dtype)   # N for Top-Down (Simulated)
 
-
-    # ------------------------------------------------------------------
-    # Correctness Check (Sanity Check)
-    # ------------------------------------------------------------------
-    print("\n[1] Running Correctness Check...")
+    # --------------------------------------------------------------------------
+    # 1. BOTTOM-UP BENCHMARK
+    # --------------------------------------------------------------------------
+    print("\n[1] TEST: BOTTOM-UP (cross_update_Y)")
+    print("-" * 50)
     
-    # Run PyTorch Reference
+    # A. Correctness
     with torch.no_grad():
         out_ref = model.cross_update_Y(x, y_in)
-    
-    # Run Triton Optimized
-    with torch.no_grad():
-        out_triton = model.cross_update_Y_Triton(x, y_in)
+        out_opt = model.cross_update_Y_Triton(x, y_in)
+    err = (out_ref - out_opt).abs().max().item()
+    print(f"    Correctness Max Diff: {err:.6e} -> {'OK' if err < 1e-2 else 'FAIL'}")
 
-    # Calculate Error
-    # Note: FP16 accumulation can lead to slight deviations vs FP32, 
-    # but since both use similar logic, they should be very close.
-    max_diff = (out_ref - out_triton).abs().max().item()
-    mean_diff = (out_ref - out_triton).abs().mean().item()
-    
-    print(f"Max Absolute Error: {max_diff:.6e}")
-    print(f"Mean Absolute Error: {mean_diff:.6e}")
-    
-    if max_diff < 1e-2: # Relaxed tolerance for FP16
-        print(">>> SUCCESS: Outputs match.")
-    else:
-        print(">>> WARNING: Outputs differ significantly!")
-
-    # ------------------------------------------------------------------
-    # Performance Benchmarking
-    # ------------------------------------------------------------------
-    print("\n[2] Running Performance Benchmark...")
-    
-    num_warmup = 10
-    num_trials = 100
-
-    # A. Benchmark PyTorch Reference
-    # -----------------------------
-    # Warmup
-    for _ in range(num_warmup):
-        _ = model.cross_update_Y(x, y_in)
+    # B. Speed
+    num_warmup, num_trials = 10, 100
+    for _ in range(num_warmup): model.cross_update_Y(x, y_in)
     torch.cuda.synchronize()
-    
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-    
-    start_event.record()
-    for _ in range(num_trials):
-        _ = model.cross_update_Y(x, y_in)
-    end_event.record()
+    start = torch.cuda.Event(enable_timing=True); end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(num_trials): model.cross_update_Y(x, y_in)
+    end.record()
     torch.cuda.synchronize()
-    
-    ref_latency_ms = start_event.elapsed_time(end_event) / num_trials
-    print(f"PyTorch Reference Avg time: {ref_latency_ms:.4f} ms")
+    ms_ref = start.elapsed_time(end)
 
-    # --- Benchmark PyTorch Reference ---
-    # Warmup
-    for _ in range(num_warmup):
-        _ = model.cross_update_Y(x, y_in)
-    torch.cuda.synchronize(device=device)
-    
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-    
-    start_event.record()
-    for _ in range(num_trials):
-        _ = model.cross_update_Y(x, y_in)
-    end_event.record()
-    torch.cuda.synchronize(device=device)
-    
-    ref_total_ms = start_event.elapsed_time(end_event)
-    ref_avg_ms = ref_total_ms / num_trials
+    for _ in range(num_warmup): model.cross_update_Y_Triton(x, y_in)
+    torch.cuda.synchronize()
+    start.record()
+    for _ in range(num_trials): model.cross_update_Y_Triton(x, y_in)
+    end.record()
+    torch.cuda.synchronize()
+    ms_opt = start.elapsed_time(end)
 
-    # --- Benchmark Triton Optimized ---
-    # Warmup
-    for _ in range(num_warmup):
-        _ = model.cross_update_Y_Triton(x, y_in)
-    torch.cuda.synchronize(device=device)
-    
-    start_event.record()
-    for _ in range(num_trials):
-        _ = model.cross_update_Y_Triton(x, y_in)
-    end_event.record()
-    torch.cuda.synchronize(device=device)
-    
-    triton_total_ms = start_event.elapsed_time(end_event)
-    triton_avg_ms = triton_total_ms / num_trials
+    print(f"    PyTorch (Total/Avg): {ms_ref:.1f}ms / {ms_ref/num_trials:.3f}ms")
+    print(f"    Triton  (Total/Avg): {ms_opt:.1f}ms / {ms_opt/num_trials:.3f}ms")
+    print(f"    >>> Speedup: {ms_ref/ms_opt:.2f}x")
 
-    # ------------------------------------------------------------------
-    # Final Summary
-    # ------------------------------------------------------------------
-    print(f"\n{'='*40}")
-    print(f"Results ({num_trials} trials)")
-    print(f"{'='*40}")
-    
-    print(f"{'Metric':<20} | {'PyTorch (Ref)':<15} | {'Triton (Opt)':<15}")
-    print(f"{'-'*20}-+-{'-'*15}-+-{'-'*15}")
-    print(f"{'Avg Latency':<20} | {ref_avg_ms:.4f} ms      | {triton_avg_ms:.4f} ms")
-    print(f"{'Total Time':<20} | {ref_total_ms:.2f} ms      | {triton_total_ms:.2f} ms")
-    print(f"{'Throughput (est)':<20} | {1000/ref_avg_ms:.1f} iter/s   | {1000/triton_avg_ms:.1f} iter/s")
-    print(f"{'='*40}")
-    
-    print(f"\n>>> Speedup: {ref_avg_ms / triton_avg_ms:.2f}x faster")
-
-
-
-    from torch.profiler import profile, record_function, ProfilerActivity
-
-    # ... setup your model and inputs ...
-
-    print("Profiling...")
-    # Warmup to ensure we don't profile compilation time
-    for _ in range(5):
-        model.cross_update_Y_Triton(x, y_in)
-
-    with profile(
-        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-        schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1),
-        on_trace_ready=torch.profiler.tensorboard_trace_handler('./log/hierarchical_opt'),
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=True
-    ) as prof:
-        for i in range(5): # run enough iterations for the schedule
-            # Optional: Add labels to specific parts of your code
-            with record_function("Top_Level_Step"):
+    # C. Profiler (Triton)
+    print("    Profiling Triton Kernel...")
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
+        for _ in range(5):
+             with record_function("Bottom_Up_Triton"):
                 model.cross_update_Y_Triton(x, y_in)
-            prof.step()
+    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=5))
 
-print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+    # --------------------------------------------------------------------------
+    # 2. TOP-DOWN BENCHMARK
+    # --------------------------------------------------------------------------
+    print("\n[2] TEST: TOP-DOWN (update_X_from_Y)")
+    print("-" * 50)
+
+    # A. Correctness
+    with torch.no_grad():
+        out_ref = model.update_X_from_Y(x, y_full, mask=None)
+        out_opt = model.update_X_from_Y_Triton(x, y_full, mask=None)
+    err = (out_ref - out_opt).abs().max().item()
+    print(f"    Correctness Max Diff: {err:.6e} -> {'OK' if err < 1e-1 else 'FAIL'}")
+
+    # B. Speed
+    for _ in range(num_warmup): model.update_X_from_Y(x, y_full, mask=None)
+    torch.cuda.synchronize()
+    start.record()
+    for _ in range(num_trials): model.update_X_from_Y(x, y_full, mask=None)
+    end.record()
+    torch.cuda.synchronize()
+    ms_ref = start.elapsed_time(end)
+
+    for _ in range(num_warmup): model.update_X_from_Y_Triton(x, y_full, mask=None)
+    torch.cuda.synchronize()
+    start.record()
+    for _ in range(num_trials): model.update_X_from_Y_Triton(x, y_full, mask=None)
+    end.record()
+    torch.cuda.synchronize()
+    ms_opt = start.elapsed_time(end)
+
+    print(f"    PyTorch (Total/Avg): {ms_ref:.1f}ms / {ms_ref/num_trials:.3f}ms")
+    print(f"    Triton  (Total/Avg): {ms_opt:.1f}ms / {ms_opt/num_trials:.3f}ms")
+    print(f"    >>> Speedup: {ms_ref/ms_opt:.2f}x")
+
+    # C. Profiler (Triton)
+    print("    Profiling Triton Kernel...")
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
+        for _ in range(5):
+             with record_function("Top_Down_Triton"):
+                model.update_X_from_Y_Triton(x, y_full, mask=None)
+    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=5))
