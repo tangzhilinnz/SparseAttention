@@ -936,8 +936,8 @@ if __name__ == "__main__":
 
     # A. Correctness
     with torch.no_grad():
-        out_ref = model.update_X_from_Y(x, y_full, mask=None)
-        out_opt = model.update_X_from_Y_Triton(x, y_full, mask=None)
+        out_ref = model.update_X_from_Y(x, y_full, mask=True)
+        out_opt = model.update_X_from_Y_Triton(x, y_full, mask=True)
     err = (out_ref - out_opt).abs().max().item()
     print(f"    Correctness Max Diff: {err:.6e} -> {'OK' if err < 1e-1 else 'FAIL'}")
 
