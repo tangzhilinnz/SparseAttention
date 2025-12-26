@@ -1340,7 +1340,7 @@ def run_transformer_benchmark():
     DROPOUT = 0.0 # As requested
     
     # Batch config
-    B = 8   # Reduced slightly from 16 to ensure safety on standard VRAM with 12 layers
+    B = 4   # Reduced slightly from 16 to ensure safety on standard VRAM with 12 layers
     SEQ_LEN = 2048
     
     print(f"\n{'='*60}")
