@@ -630,73 +630,57 @@ class HierarchicalSparseAttention(nn.Module):
         return Y_new
 
     def cross_update_Y_Triton(self, x, y_in):
-        """
-        Optimized bottom-up update using Triton Kernel.
-        
-        Key Optimization:
-        - Uses [Batch, Node, Head, Dim] layout to avoid transposes.
-        - Replaces the O(N) loop of reshaping/masking with a single fused kernel.
-        """
         B, N, D = x.shape
         H, Dh = self.num_heads, self.head_dim
         
         assert y_in is not None, "y_in cannot be None"
-        assert y_in.size(1) > 0, "y_in must have valid tokens"
-
         if self.sizes is None: self.sizes, self.offsets = self.build_level_info(N)
 
-        # -------------------------------------------------------
-        # OPTIMIZATION 1: Global Query Projection (Layout Adjusted)
-        # -------------------------------------------------------
-        # We project all Y tokens at once. 
-        # CRITICAL: We DO NOT transpose to [B, H, N, D]. 
-        # We keep it as [B, N, H, D] which is the native Linear output.
-        # This matches the stride logic of our new Triton kernel perfectly.
+        # 1. Global Query Projection
         Q_all = self.Wq_y(y_in).view(B, -1, H, Dh) 
         
         new_Y_levels = []
-        prev_sources = x # Starts as the leaves
+        prev_sources = x 
         
+        # PRE-FUSE Weights for Loop
+        # We cat them once here to avoid cat overhead inside loop
+        W_kv_fused = torch.cat([self.Wk_y.weight, self.Wv_y.weight], dim=0)
+
         for level, parent_count in enumerate(self.sizes):
             offset = self.offsets[level]
 
-            # ---------------------------------------------------
-            # 1. Prepare Inputs (Zero-Copy Slicing)
-            # ---------------------------------------------------
-            # Slice Q for this level. Shape: [B, Parent_Count, H, Dh]
+            # Slice Q
             Q = Q_all[:, offset : offset + parent_count, :, :]
             
-            # Prepare Children (Keys/Values)
+            # Slice Children
             useful_len = parent_count * 2
-            # Slice strictly to useful length to ensure even pairs
             children_in = prev_sources[:, :useful_len, :]
             
-            # Project K and V
-            # Shape: [B, Child_Count, H, Dh]
-            # Again, NO transpose. We keep the native [B, N, H, D] layout.
-            K = self.Wk_y(children_in).view(B, -1, H, Dh)
-            V = self.Wv_y(children_in).view(B, -1, H, Dh)
+            # ---------------------------------------------------
+            # OPTIMIZATION: Fused K/V Projection
+            # ---------------------------------------------------
+            # Old: K = Wk(child), V = Wv(child) -> 2 Launches
+            # New: KV = W_fused(child)          -> 1 Launch
+            
+            kv_out = F.linear(children_in, W_kv_fused) # [B, Useful_Len, 2*D]
+            kv_out = kv_out.view(B, -1, 2, H, Dh)
+            
+            K = kv_out[:, :, 0] # Zero-copy view
+            V = kv_out[:, :, 1] # Zero-copy view
             V = self.dropout(V)
 
-            # ---------------------------------------------------
-            # 2. Triton Kernel (Fused Reduction)
-            # ---------------------------------------------------
-            # Replaces: Reshape -> Dot -> Softmax -> Weighted Sum -> Reshape
-            # The kernel natively handles the tree structure (2 children -> 1 parent)
-            # Input:  [B, 2*P, H, D] (Children)
-            # Output: [B, P, H, D]   (Parents)
-            updated_heads = build_parent_nodes(Q, K, V)
+            # Ensure Contiguity for Triton (Important for 'view' based tensors)
+            if not K.is_contiguous(): K = K.contiguous()
+            if not V.is_contiguous(): V = V.contiguous()
 
-            # ---------------------------------------------------
-            # 3. Merge Heads
-            # ---------------------------------------------------
-            # [B, P, H, Dh] -> [B, P, H*Dh] (i.e., [B, P, D])
-            updated_merged = updated_heads.reshape(B, parent_count, D)
+            # Call Triton Kernel
+            updated_heads = build_parent_nodes(Q, K, V)
             
+            # Merge Heads
+            updated_merged = updated_heads.reshape(B, parent_count, D)
             new_Y_levels.append(updated_merged)
             prev_sources = updated_merged
 
-        # Concatenate and Project
         Y_new = torch.cat(new_Y_levels, dim=1)
         Y_new = self.out_proj_y(Y_new)
         
@@ -777,44 +761,74 @@ class HierarchicalSparseAttention(nn.Module):
         B, N, D = x.shape
         H, Dh = self.num_heads, self.head_dim
 
-        # [Check] Enforce strict existence
         assert y is not None, "y (parents) cannot be None during top-down update"
 
-        # 1. Combine Input (Leaves + Parents)
-        XY = torch.cat([x, y], dim=1)
+        # -----------------------------------------------------------
+        # OPTIMIZATION: Fused Projection (Run-time Weight Stacking)
+        # -----------------------------------------------------------
+        # We perform one large GEMM for X and one for Y, instead of concating inputs.
         
-        # 2. Separate Projections (No Fused Wkv)
-        # Q: [B, N, H, Dh]
-        Q = self.Wq_x(x).view(B, N, H, Dh)
+        # 1. Project X (Leaves) -> Generates Q, K_x, V_x
+        # Stack weights: [3*D, D]
+        # This creates a temporary view of weights (tiny), not inputs (huge).
+        W_qkv_x = torch.cat([self.Wq_x.weight, self.Wk_x.weight, self.Wv_x.weight], dim=0)
         
-        # K, V: [B, Total_Nodes, H, Dh]
-        # We project K and V separately using your existing layers
-        K_full = self.Wk_x(XY).view(B, -1, H, Dh)
-        V_full = self.Wv_x(XY).view(B, -1, H, Dh)
+        # Compute: [B, N, 3*D] (One Kernel Launch)
+        qkv_x = F.linear(x, W_qkv_x)
         
-        # Apply dropout to V
+        # Reshape: [B, N, 3, H, Dh]
+        qkv_x = qkv_x.view(B, N, 3, H, Dh)
+        
+        # Zero-copy unbind
+        Q   = qkv_x[:, :, 0]
+        K_x = qkv_x[:, :, 1]
+        V_x = qkv_x[:, :, 2]
+
+        # 2. Project Y (Parents) -> Generates K_y, V_y (No Q needed for parents here)
+        # Stack weights: [2*D, D]
+        W_kv_y = torch.cat([self.Wk_x.weight, self.Wv_x.weight], dim=0)
+        
+        # Compute: [B, P, 2*D]
+        kv_y = F.linear(y, W_kv_y)
+        
+        # Reshape: [B, P, 2, H, Dh]
+        kv_y = kv_y.view(B, -1, 2, H, Dh)
+        K_y = kv_y[:, :, 0]
+        V_y = kv_y[:, :, 1]
+
+        # 3. Concatenate K and V results
+        # This is unavoidable as we need a contiguous buffer for the kernel lookups.
+        K_full = torch.cat([K_x, K_y], dim=1) # [B, N+P, H, Dh]
+        V_full = torch.cat([V_x, V_y], dim=1)
+        
+        # Apply Dropout
         V_full = self.dropout(V_full)
 
-        # 3. Ensure Contiguity
-        # The Triton kernel does pointer arithmetic. While Linear() outputs are usually 
-        # contiguous, operations like Dropout or View can sometimes create strides 
-        # that break optimized kernels. We enforce it here to be safe.
+        # 4. Enforce Contiguity & Alignment
+        # Q is a strided view from qkv_x. Making it contiguous helps memory coalescing.
+        if not Q.is_contiguous(): Q = Q.contiguous()
+        
+        # K_full/V_full are fresh from cat(), so they are contiguous, but we check for safety.
         if not K_full.is_contiguous(): K_full = K_full.contiguous()
         if not V_full.is_contiguous(): V_full = V_full.contiguous()
 
-        # Get Topology
+        # -----------------------------------------------------------
+        # Kernel Execution
+        # -----------------------------------------------------------
         idx_table, neighbor_mask = self._get_lookup_table(N, device=x.device)
-
-        # DECISION LOGIC:
-        # If the user passed a mask (indicating causality is on), use neighbor_mask.
-        # If mask is None (indicating full/bidirectional), pass None.
         active_mask = neighbor_mask if mask is not None else None
+
+        # Fused Head Grid (N, B) is faster for shared topology
+        grid = (N, B)
+        
+        # Alignment Checks (Safe to remove in production if inputs are guaranteed)
+        # assert Q.data_ptr() % 16 == 0 
 
         output_leaf_heads = hierarchical_fused_attention(
             Q, K_full, V_full, 
             idx_table, active_mask
         )
-    
+
         return output_leaf_heads.view(B, N, D)
 
     def _standard_attention(self, Q, K, V, mask):
@@ -859,184 +873,6 @@ class HierarchicalSparseAttention(nn.Module):
 
 
 import time
-
-#if __name__ == "__main__":
-#    # ------------------------------------------------------------------
-#    # Configuration & Setup
-#    # ------------------------------------------------------------------
-#    torch.manual_seed(42)
-#
-#    # Check availability of GPU 2
-#    target_device_idx = 2
-#    if torch.cuda.device_count() <= target_device_idx:
-#        print(f"Error: GPU {target_device_idx} not found. Available GPUs: {torch.cuda.device_count()}")
-#        print("Switching to 'cuda:0' by default.")
-#        device = "cuda:0"
-#    else:
-#        device = f"cuda:{target_device_idx}"
-#    
-#    # Large enough size to make the kernel launch overhead negligible compared to math
-#    B = 16          # Batch size
-#    N = 2048        # Sequence length (Leaf nodes)
-#    D = 2048        # Model dimension
-#    H = 16          # Number of heads
-#    dropout = 0.0   # Disable dropout for deterministic validation checking
-#    
-#    device = "cuda"
-#    dtype = torch.float16 # Test in FP16 for realistic performance metrics
-#
-#    print(f"--- Benchmarking Configuration ---")
-#    print(f"Batch Size (B): {B}")
-#    print(f"Seq Len (N)   : {N}")
-#    print(f"Dim (D)       : {D}")
-#    print(f"Heads (H)     : {H}")
-#    print(f"Dtype         : {dtype}")
-#    print(f"----------------------------------")
-#
-#    # 1. Initialize Model
-#    model = HierarchicalSparseAttention(dim=D, num_heads=H, dropout=dropout).to(device).to(dtype)
-#    model.eval() # Set to eval to disable dropout non-determinism
-#
-#    # 2. Generate Random Inputs
-#    # x: The leaf nodes [B, N, D]
-#    x = torch.randn(B, N, D, device=device, dtype=dtype)
-#    
-#    # y_in: The input for the query projection [B, N, D] 
-#    # (Size doesn't strictly matter for the kernel logic, but usually matches N)
-#    y_in = torch.randn(B, N, D, device=device, dtype=dtype)
-#
-#
-#    # ------------------------------------------------------------------
-#    # Correctness Check (Sanity Check)
-#    # ------------------------------------------------------------------
-#    print("\n[1] Running Correctness Check...")
-#    
-#    # Run PyTorch Reference
-#    with torch.no_grad():
-#        out_ref = model.cross_update_Y(x, y_in)
-#    
-#    # Run Triton Optimized
-#    with torch.no_grad():
-#        out_triton = model.cross_update_Y_Triton(x, y_in)
-#
-#    # Calculate Error
-#    # Note: FP16 accumulation can lead to slight deviations vs FP32, 
-#    # but since both use similar logic, they should be very close.
-#    max_diff = (out_ref - out_triton).abs().max().item()
-#    mean_diff = (out_ref - out_triton).abs().mean().item()
-#    
-#    print(f"Max Absolute Error: {max_diff:.6e}")
-#    print(f"Mean Absolute Error: {mean_diff:.6e}")
-#    
-#    if max_diff < 1e-2: # Relaxed tolerance for FP16
-#        print(">>> SUCCESS: Outputs match.")
-#    else:
-#        print(">>> WARNING: Outputs differ significantly!")
-#
-#    # ------------------------------------------------------------------
-#    # Performance Benchmarking
-#    # ------------------------------------------------------------------
-#    print("\n[2] Running Performance Benchmark...")
-#    
-#    num_warmup = 10
-#    num_trials = 100
-#
-#    # A. Benchmark PyTorch Reference
-#    # -----------------------------
-#    # Warmup
-#    for _ in range(num_warmup):
-#        _ = model.cross_update_Y(x, y_in)
-#    torch.cuda.synchronize()
-#    
-#    start_event = torch.cuda.Event(enable_timing=True)
-#    end_event = torch.cuda.Event(enable_timing=True)
-#    
-#    start_event.record()
-#    for _ in range(num_trials):
-#        _ = model.cross_update_Y(x, y_in)
-#    end_event.record()
-#    torch.cuda.synchronize()
-#    
-#    ref_latency_ms = start_event.elapsed_time(end_event) / num_trials
-#    print(f"PyTorch Reference Avg time: {ref_latency_ms:.4f} ms")
-#
-#    # --- Benchmark PyTorch Reference ---
-#    # Warmup
-#    for _ in range(num_warmup):
-#        _ = model.cross_update_Y(x, y_in)
-#    torch.cuda.synchronize(device=device)
-#    
-#    start_event = torch.cuda.Event(enable_timing=True)
-#    end_event = torch.cuda.Event(enable_timing=True)
-#    
-#    start_event.record()
-#    for _ in range(num_trials):
-#        _ = model.cross_update_Y(x, y_in)
-#    end_event.record()
-#    torch.cuda.synchronize(device=device)
-#    
-#    ref_total_ms = start_event.elapsed_time(end_event)
-#    ref_avg_ms = ref_total_ms / num_trials
-#
-#    # --- Benchmark Triton Optimized ---
-#    # Warmup
-#    for _ in range(num_warmup):
-#        _ = model.cross_update_Y_Triton(x, y_in)
-#    torch.cuda.synchronize(device=device)
-#    
-#    start_event.record()
-#    for _ in range(num_trials):
-#        _ = model.cross_update_Y_Triton(x, y_in)
-#    end_event.record()
-#    torch.cuda.synchronize(device=device)
-#    
-#    triton_total_ms = start_event.elapsed_time(end_event)
-#    triton_avg_ms = triton_total_ms / num_trials
-#
-#    # ------------------------------------------------------------------
-#    # Final Summary
-#    # ------------------------------------------------------------------
-#    print(f"\n{'='*40}")
-#    print(f"Results ({num_trials} trials)")
-#    print(f"{'='*40}")
-#    
-#    print(f"{'Metric':<20} | {'PyTorch (Ref)':<15} | {'Triton (Opt)':<15}")
-#    print(f"{'-'*20}-+-{'-'*15}-+-{'-'*15}")
-#    print(f"{'Avg Latency':<20} | {ref_avg_ms:.4f} ms      | {triton_avg_ms:.4f} ms")
-#    print(f"{'Total Time':<20} | {ref_total_ms:.2f} ms      | {triton_total_ms:.2f} ms")
-#    print(f"{'Throughput (est)':<20} | {1000/ref_avg_ms:.1f} iter/s   | {1000/triton_avg_ms:.1f} iter/s")
-#    print(f"{'='*40}")
-#    
-#    print(f"\n>>> Speedup: {ref_avg_ms / triton_avg_ms:.2f}x faster")
-#
-#
-#
-#    from torch.profiler import profile, record_function, ProfilerActivity
-#
-#    # ... setup your model and inputs ...
-#
-#    print("Profiling...")
-#    # Warmup to ensure we don't profile compilation time
-#    for _ in range(5):
-#        model.cross_update_Y_Triton(x, y_in)
-#
-#    with profile(
-#        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-#        schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1),
-#        on_trace_ready=torch.profiler.tensorboard_trace_handler('./log/hierarchical_opt'),
-#        record_shapes=True,
-#        profile_memory=True,
-#        with_stack=True
-#    ) as prof:
-#        for i in range(5): # run enough iterations for the schedule
-#            # Optional: Add labels to specific parts of your code
-#            with record_function("Top_Level_Step"):
-#                model.cross_update_Y_Triton(x, y_in)
-#            prof.step()
-#
-#print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
-
-
 
 
 # ==============================================================================
