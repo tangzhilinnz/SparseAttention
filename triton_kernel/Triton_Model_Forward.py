@@ -1414,23 +1414,23 @@ def run_transformer_benchmark():
     num_warmup = 5
     num_trials = 20
 
-    # --- Benchmark PyTorch ---
-    print(f"Benchmarking PyTorch (Ref)...")
-    with torch.no_grad():
-        for _ in range(num_warmup):
-            _ = model_ref(x_input)
-        
-        torch.cuda.synchronize()
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        
-        start_event.record()
-        for _ in range(num_trials):
-            _ = model_ref(x_input)
-        end_event.record()
-        torch.cuda.synchronize()
-        
-        ms_ref = start_event.elapsed_time(end_event) / num_trials
+    ## --- Benchmark PyTorch ---
+    #print(f"Benchmarking PyTorch (Ref)...")
+    #with torch.no_grad():
+    #    for _ in range(num_warmup):
+    #        _ = model_ref(x_input)
+    #    
+    #    torch.cuda.synchronize()
+    #    start_event = torch.cuda.Event(enable_timing=True)
+    #    end_event = torch.cuda.Event(enable_timing=True)
+    #    
+    #    start_event.record()
+    #    for _ in range(num_trials):
+    #        _ = model_ref(x_input)
+    #    end_event.record()
+    #    torch.cuda.synchronize()
+    #    
+    #    ms_ref = start_event.elapsed_time(end_event) / num_trials
 
     # --- Benchmark Triton ---
     print(f"Benchmarking Triton (Opt)...")
@@ -1470,10 +1470,10 @@ def run_transformer_benchmark():
         ms_flash = start_event.elapsed_time(end_event) / num_trials
 
     print(f"\nRESULTS:")
-    print(f"  PyTorch Avg Latency: {ms_ref:.2f} ms")
+    #print(f"  PyTorch Avg Latency: {ms_ref:.2f} ms")
     print(f"  FlashAttention Avg Latency: {ms_flash:.2f} ms")
     print(f"  Triton  Avg Latency: {ms_opt:.2f} ms")
-    print(f"  >>> Speedup: {ms_ref / ms_opt:.2f}x")
+    #print(f"  >>> Speedup: {ms_ref / ms_opt:.2f}x")
     print(f"  >>> Speedup: {ms_flash / ms_opt:.2f}x")
 
     # --------------------------------------------------------------------------
