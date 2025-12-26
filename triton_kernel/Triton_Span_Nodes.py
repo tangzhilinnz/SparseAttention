@@ -750,7 +750,7 @@ class HierarchicalSparseAttention(nn.Module):
             idx_table, active_mask
         )
     
-        return self.out_proj_x(output_leaf_heads.view(B, N, D))
+        return output_leaf_heads.view(B, N, D)
 
     def _standard_attention(self, Q, K, V, mask):
         # Q, K, V are already [B, H, N, Dh]
