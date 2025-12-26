@@ -135,9 +135,9 @@ def build_parent_nodes(Q, K, V):
         Out.stride(0), Out.stride(1), Out.stride(2), Out.stride(3),
         sm_scale=1.0 / math.sqrt(D),
         H=H,
-        BLOCK_H=triton.next_power_of_2(H),
+        BLOCK_H=BLOCK_H,
         D=D,
-        BLOCK_SIZE=triton.next_power_of_2(D),
+        BLOCK_SIZE=BLOCK_SIZE,
         num_warps=4
     )
     return Out
@@ -159,6 +159,7 @@ def hierarchical_fused_attention_kernel(
     # Constants
     sm_scale,
     H: tl.constexpr,
+    BLOCK_H: tl.constexpr,
     D: tl.constexpr,
     LEVELS: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -171,7 +172,10 @@ def hierarchical_fused_attention_kernel(
     # -----------------------------------------------------------
     # 1. Setup & Alignment
     # -----------------------------------------------------------
-    h_idx = tl.arange(0, H)
+    # FIXED: Padded H to power of 2
+    h_idx = tl.arange(0, BLOCK_H)
+    mask_h = h_idx < H
+
     offs_d = tl.arange(0, BLOCK_D)
     offs_lvl = tl.arange(0, BLOCK_LEVELS)
     
@@ -214,8 +218,8 @@ def hierarchical_fused_attention_kernel(
             (h_idx[:, None] * sq_h) + (offs_d[None, :] * sq_d)
 
     # Accumulators
-    acc_self = tl.zeros([H], dtype=tl.float32)
-    acc_cross = tl.zeros([H, BLOCK_LEVELS], dtype=tl.float32)
+    acc_self = tl.zeros([BLOCK_H], dtype=tl.float32)
+    acc_cross = tl.zeros([BLOCK_H, BLOCK_LEVELS], dtype=tl.float32)
 
     # -----------------------------------------------------------
     # 4. Score Loop
@@ -229,7 +233,8 @@ def hierarchical_fused_attention_kernel(
         
         # Load Q
         # Pointer arithmetic is minimal here (just adding off_d_start)
-        q = tl.load(q_ptr, mask=d_mask[None, :], other=0.0)
+        mask_q = mask_h[:, None] & d_mask[None, :]
+        q = tl.load(q_ptr, mask=mask_q, other=0.0)
         
         # --- K SELF ---
         # Reconstruct pointer using pre-calculated offsets
@@ -237,7 +242,7 @@ def hierarchical_fused_attention_kernel(
         ptr_k_self = k_batch_base + off_node_self + \
                      (h_idx[:, None] * sk_h) + (cur_offs_d[None, :] * sk_d)
         
-        k_self = tl.load(ptr_k_self, mask=d_mask[None, :], other=0.0)
+        k_self = tl.load(ptr_k_self, mask=mask_q, other=0.0)
         acc_self += tl.sum(q * k_self, axis=1)
 
         # --- K CROSS (Neighbors) ---
@@ -251,8 +256,8 @@ def hierarchical_fused_attention_kernel(
                       (h_idx[:, None, None] * sk_h) + \
                       (cur_offs_d[None, None, :] * sk_d)
         
-        # Mask: Levels & Dim
-        mask_k = mask_lvl[None, :, None] & d_mask[None, None, :]
+        # Mask: H & Levels & Dim
+        mask_k = mask_h[:, None, None] & mask_lvl[None, :, None] & d_mask[None, None, :]
         k_cross = tl.load(ptr_k_cross, mask=mask_k, other=0.0)
         
         # Math: [H, 1, D] * [H, LEVELS, D]
@@ -295,11 +300,13 @@ def hierarchical_fused_attention_kernel(
         cur_offs_d = off_d_start + offs_d
         d_mask = cur_offs_d < D
         
+        mask_op = mask_h[:, None] & d_mask[None, :]
+
         # --- V SELF ---
         ptr_v_self = v_batch_base + off_node_self + \
                      (h_idx[:, None] * sk_h) + (cur_offs_d[None, :] * sk_d)
-                     
-        v_self = tl.load(ptr_v_self, mask=d_mask[None, :], other=0.0)
+                      
+        v_self = tl.load(ptr_v_self, mask=mask_op, other=0.0)
         out_acc = w_self[:, None] * v_self
         
         # --- V CROSS ---
@@ -308,7 +315,7 @@ def hierarchical_fused_attention_kernel(
                       (h_idx[:, None, None] * sk_h) + \
                       (cur_offs_d[None, None, :] * sk_d)
                       
-        mask_v = mask_lvl[None, :, None] & d_mask[None, None, :]
+        mask_v = mask_h[:, None, None] & mask_lvl[None, :, None] & d_mask[None, None, :]
         v_cross = tl.load(ptr_v_cross, mask=mask_v, other=0.0)
         
         # Accumulate
@@ -316,7 +323,8 @@ def hierarchical_fused_attention_kernel(
         
         # Store
         # ptr matches out_base_ptr structure
-        tl.store(out_base_ptr, out_acc.to(Out_ptr.dtype.element_ty), mask=d_mask[None, :])
+        # FIXED: Mask store by H
+        tl.store(out_base_ptr, out_acc.to(Out_ptr.dtype.element_ty), mask=mask_op)
         
         # Advance Output Pointer
         out_base_ptr += BLOCK_D * so_d
@@ -349,6 +357,8 @@ def hierarchical_fused_attention(Q, K, V, idx_table, mask_table):
     grid = (N, B)
 
     BLOCK_LEVELS = triton.next_power_of_2(LEVELS)
+    BLOCK_H = triton.next_power_of_2(H)
+    BLOCK_D = triton.next_power_of_2(Dh)
 
     hierarchical_fused_attention_kernel[grid](
         Q, K, V, 
@@ -360,14 +370,17 @@ def hierarchical_fused_attention(Q, K, V, idx_table, mask_table):
         Out.stride(0), Out.stride(1), Out.stride(2), Out.stride(3),
         sm_scale=1.0 / math.sqrt(Dh),
         H=H,
+        BLOCK_H=BLOCK_H, # Pass padded H
         D=Dh,
         LEVELS=LEVELS,
-        BLOCK_D=triton.next_power_of_2(Dh),
+        BLOCK_D=BLOCK_D,
         BLOCK_LEVELS=BLOCK_LEVELS, 
         HAS_MASK=HAS_MASK,
         num_warps=4 # 4 is usually better than 8 for smaller workloads unless D > 128
     )
     return Out
+
+
 
 def build_hierarchical_index_lookup_table(seq_len, device="cuda", dtype=torch.int32):
     """
