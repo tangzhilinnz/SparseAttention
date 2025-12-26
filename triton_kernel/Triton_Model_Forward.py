@@ -1431,14 +1431,14 @@ def run_transformer_benchmark():
     # Integers for Embedding layer
     x_input = torch.randint(0, VOCAB_SIZE, (B, SEQ_LEN), device=device)
 
-    # In run_transformer_benchmark, before the sanity check loop:
-
     print("Pre-building lookup tables...")
-    # Force build by running a dummy pass or calling the method directly
-    dummy_y = torch.zeros(B, SEQ_LEN//2, D_MODEL, device=device).half() # Approximate shape
-    model_opt.update_X_from_Y(x_input, dummy_y) 
-    model_ref.update_X_from_Y(x_input, dummy_y) 
+    # Access the first layer -> self_attn -> call _get_lookup_table directly
+    # We don't need update_X_from_Y, we just need to trigger the table build
+    model_opt.layers[0].self_attn._get_lookup_table(SEQ_LEN, device=device)
+    model_ref.layers[0].self_attn._get_lookup_table(SEQ_LEN, device=device)
     print("Tables built.")
+
+    # In run_transformer_benchmark, before the sanity check loop:
 
     # --------------------------------------------------------------------------
     # 2. SANITY CHECK (Correctness)
