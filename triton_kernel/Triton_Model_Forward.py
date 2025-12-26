@@ -1041,18 +1041,18 @@ class MultiHeadAttention(nn.Module):
 
         # 2. FlashAttention Implementation
         if not return_attention:
-            # F.scaled_dot_product_attention automatically selects FlashAttention-2 on A100
-            # It handles scaling (1/sqrt(dim)), softmax, and dropout internally.
+            # OPTIMIZATION:
+            # If mask is present, we assume it's the standard causal mask.
+            # We set is_causal=True and attn_mask=None to force the FlashAttention-2 kernel.
+            is_causal = (mask is not None)
             
-            # Ensure mask is broadcastable if provided. 
-            # Your make_causal_mask returns [1, 1, Seq, Seq], which works perfectly here.
             output = F.scaled_dot_product_attention(
                 Q, K, V,
-                attn_mask=mask, 
+                attn_mask=None,           # <--- Pass None here
                 dropout_p=self.dropout.p if self.training else 0.0,
-                is_causal=False # We use explicit mask, so is_causal=False
+                is_causal=is_causal       # <--- Pass True here
             )
-            attn_weights = None # FlashAttention does not produce materialized weights
+            attn_weights = None
             
         else:
             # 3. Fallback for Visualization (Standard Implementation)
