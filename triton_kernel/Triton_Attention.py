@@ -1,9 +1,6 @@
 import torch
 import triton
-import torch.nn as nn
-import torch.nn.functional as F
 import triton.language as tl
-from torch import einsum
 import math
 
 # ------------------------------------------------------------------
@@ -124,6 +121,7 @@ def build_parent_nodes_kernel(
         
         # Store
         tl.store(ptr_out, out_val, mask=mask_d[None, :])
+
 
 # ------------------------------------------------------------------
 #                   Python Wrapper
@@ -343,6 +341,7 @@ def hierarchical_fused_attention_kernel(
         # Advance Output Pointer
         out_base_ptr += BLOCK_D * so_d
 
+
 def hierarchical_fused_attention(Q, K, V, idx_table, mask_table):
     B, N, H, Dh = Q.shape
     LEVELS = idx_table.shape[1]
@@ -390,6 +389,14 @@ def hierarchical_fused_attention(Q, K, V, idx_table, mask_table):
         num_warps=4 # 4 is usually better than 8 for smaller workloads unless D > 128
     )
     return Out
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch import einsum
+import math
 
 def build_hierarchical_index_lookup_table(seq_len, device="cuda", dtype=torch.int32):
     """
@@ -622,199 +629,7 @@ class HierarchicalSparseAttention(nn.Module):
         
         return Y_new
 
-    def update_X_from_Y(self, x, y, mask=None):
-
-        B, N, D = x.shape
-        H, Dh = self.num_heads, self.head_dim
-
-        if y is None: return x
-
-        # Concatenate inputs once to allow unified K/V calculation
-        XY = torch.cat([x, y], dim=1)
-
-        # --- Inline Split Heads ---
-        Q = self.Wq_x(x).view(B, N, H, Dh).transpose(1, 2)
-        
-        # Calculate K, V on combined input (Efficiency: one large matmul instead of two)
-        kv_input = self.Wk_x(XY).view(B, -1, H, Dh).transpose(1, 2)
-        v_input = self.Wv_x(XY).view(B, -1, H, Dh).transpose(1, 2)
-
-        K_full = kv_input
-        V_full = self.dropout(v_input) # Apply dropout to the projected values
-
-        idx_table, neighbor_causal_mask = self._get_lookup_table(N, device=x.device)
-            
-        # Assert table validity
-        # assert (idx_table != -1).all(), "Index table contains invalid entries."
-
-        # Self: The leaves attending to themselves (indices 0 to N-1)
-        K_self = K_full[:, :, :N, :]                 # [B, H, N, D]
-        V_self = V_full[:, :, :N, :]                 # [B, H, N, D]
-
-        # Gather neighbors using index table
-        # idx_table: [N, Levels]
-        gather_indices = idx_table
-            
-        # neighbors_k: [B, H, L, Levels, D]
-        neighbors_k = K_full[:, :, gather_indices, :] 
-        neighbors_v = V_full[:, :, gather_indices, :]
-
-        # Compute Self Logits (Leaf Q * Leaf K)
-        # [B, H, L, D] * [B, H, L, D] -> [B, H, L]
-        self_logits = torch.einsum('b h n d, b h n d -> b h n', Q, K_self) / math.sqrt(Dh)
-
-        # Compute Neighbor Logits (Leaf Q * Neighbor K)
-        # Q: [B, H, N, D] -> unsqueeze -> [B, H, N, 1, D]
-        # neighbors_k: [B, H, N, Levels, D]
-        # Result: [B, H, N, Levels]
-        neighbors_logits = torch.einsum('b h l x d, b h l n d -> b h l n', Q.unsqueeze(3), neighbors_k)
-        neighbors_logits = neighbors_logits / math.sqrt(Dh)
-
-        # Apply Causal Mask
-        if mask is not None:
-            # neighbor_causal_mask is [L, Levels]. 
-            # True means "future" (masked).
-            neighbors_logits = neighbors_logits.masked_fill(neighbor_causal_mask, float('-inf'))
-
-        # Concatenate (Self + Neighbors)
-        # V: [B, H, L, D] -> [B, H, L, 1, D]
-        # self_logits: [B, H, L] -> [B, H, L, 1]  
-        # Corrected: Use 'V_self' instead of 'V' (which is undefined in this scope)
-        all_v = torch.cat([V_self.unsqueeze(3), neighbors_v], dim=3)             # [B, H, L, Levels+1, Dh]
-        all_logits = torch.cat([self_logits.unsqueeze(3), neighbors_logits], dim=3) # [B, H, L, Levels+1]
-
-        # Attention Softmax & Weighted Sum
-        max_logits = all_logits.max(dim=-1, keepdim=True)[0]
-        weights = F.softmax(all_logits - max_logits, dim=-1)             # [B, H, L, Levels+1]
-            
-        output_leaf = torch.einsum('b h l n, b h l n d -> b h l d', weights, all_v)
-
-        # --- Inline Merge Heads ---
-        return output_leaf.transpose(1, 2).reshape(B, N, D)
-
-    def _standard_attention(self, Q, K, V, mask):
-        # Q, K, V are already [B, H, N, Dh]
-        D_head = Q.size(-1)
-        
-        # Optimization: removed explicit .contiguous() calls.
-        scores = torch.matmul(Q, K.transpose(-1, -2)) / math.sqrt(D_head)
-        
-        if mask is not None:
-            scores = scores.masked_fill(mask == 0, float('-inf'))
-            
-        attn = self.dropout(torch.softmax(scores, dim=-1))
-        return torch.matmul(attn, V), attn
-
-    def forward(self, query, key, value, y=None, mask=None, return_attention=False):
-        x = query 
-        B, L_Q, D = x.size()
-        H, Dh = self.num_heads, self.head_dim
-        L_K = key.size(1)
-        L_V = value.size(1)
-
-        if L_Q == L_K == L_V and y is not None:
-            # Hierarchical Update
-            output_leaf = self.update_X_from_Y(x, y, mask)
-            output = self.out_proj_x(output_leaf)
-            return (output, None) if return_attention else output
-        else:
-            # Standard Attention Fallback
-            # --- Inline Split ---
-            Q = self.Wq_x(query).view(B, L_Q, H, Dh).transpose(1, 2)
-            K = self.Wk_x(key).view(B, L_K, H, Dh).transpose(1, 2)
-            V = self.Wv_x(value).view(B, L_V, H, Dh).transpose(1, 2)
-            
-            output_leaf, attn_weights = self._standard_attention(Q, K, V, mask)
-            
-            # --- Inline Merge ---
-            output = output_leaf.transpose(1, 2).reshape(B, L_Q, D)
-            output = self.out_proj_x(output)
-            
-            return (output, attn_weights) if return_attention else output
-
-
-class HierarchicalSparseAttentionTriton(nn.Module):
-    def __init__(self, dim, num_heads, dropout=0.1):
-        super().__init__()
-        self.dim = dim
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-
-        # --- Y Updates (Bottom-Up) ---
-        self.Wq_y = nn.Linear(dim, dim, bias=False)
-        self.Wk_y = nn.Linear(dim, dim, bias=False)
-        self.Wv_y = nn.Linear(dim, dim, bias=False)
-        self.out_proj_y = nn.Linear(dim, dim)
-
-        # --- X Updates (Top-Down) ---
-        self.Wq_x = nn.Linear(dim, dim, bias=False)
-        self.Wk_x = nn.Linear(dim, dim, bias=False)
-        self.Wv_x = nn.Linear(dim, dim, bias=False)
-        self.out_proj_x = nn.Linear(dim, dim)
-
-        self.dropout = nn.Dropout(dropout)
-        
-        self.cached_idx_table = None
-        self.cached_causal_mask = None
-        self.cached_seq_len = -1
-
-        self.sizes = None
-        self.offsets = None
-
-    def _get_lookup_table(self, L, device):
-        """
-        Smart retrieval: Returns cached table if L matches, otherwise recomputes.
-        """
-        # Check if we can reuse the cache
-        # 1. Cache exists
-        # 2. Sequence length matches
-        # 3. Device matches (crucial for moving model CPU <-> GPU)
-        if (self.cached_idx_table is not None and 
-            self.cached_seq_len == L and 
-            self.cached_idx_table.device == device):
-            return self.cached_idx_table, self.cached_causal_mask
-
-        # If not, recompute and update cache
-        idx_table, mask = build_hierarchical_index_lookup_table(L, device=device, dtype=torch.int64)
-        
-        self.cached_idx_table = idx_table
-        self.cached_causal_mask = mask
-        self.cached_seq_len = L
-        
-        return idx_table, mask
-
-    @staticmethod
-    def generate_span_input_Y(x):
-        """Initializes Y by averaging adjacent pairs of X."""
-        B, N, D = x.shape
-        Y_levels = []
-        curr = x
-        while curr.size(1) > 1:
-            L = curr.size(1)
-            even = L - (L % 2)
-            curr_pairs = curr[:, :even, :].reshape(B, even // 2, 2, D)
-            parents = 0.5 * curr_pairs[:, :, 0, :] + 0.5 * curr_pairs[:, :, 1, :]
-            Y_levels.append(parents)
-            curr = parents
-        
-        if not Y_levels:
-            return None
-            
-        return torch.cat(Y_levels, dim=1)
-
-    @staticmethod
-    def build_level_info(N):
-        sizes = []
-        curr = N
-        while curr > 1:
-            sizes.append(curr // 2)
-            curr = curr // 2
-        offsets = [0]
-        for s in sizes[:-1]:
-            offsets.append(offsets[-1] + s)
-        return sizes, offsets
-
-    def cross_update_Y(self, x, y_in):
+    def cross_update_Y_Triton(self, x, y_in):
         """
         Optimized bottom-up update using Triton Kernel.
         
@@ -888,6 +703,77 @@ class HierarchicalSparseAttentionTriton(nn.Module):
         return Y_new
 
     def update_X_from_Y(self, x, y, mask=None):
+
+        B, N, D = x.shape
+        H, Dh = self.num_heads, self.head_dim
+
+        if y is None: return x
+
+        # Concatenate inputs once to allow unified K/V calculation
+        XY = torch.cat([x, y], dim=1)
+
+        # --- Inline Split Heads ---
+        Q = self.Wq_x(x).view(B, N, H, Dh).transpose(1, 2)
+        
+        # Calculate K, V on combined input (Efficiency: one large matmul instead of two)
+        kv_input = self.Wk_x(XY).view(B, -1, H, Dh).transpose(1, 2)
+        v_input = self.Wv_x(XY).view(B, -1, H, Dh).transpose(1, 2)
+
+        K_full = kv_input
+        V_full = self.dropout(v_input) # Apply dropout to the projected values
+
+        idx_table, neighbor_causal_mask = self._get_lookup_table(N, device=x.device)
+            
+        # Assert table validity
+        # assert (idx_table != -1).all(), "Index table contains invalid entries."
+
+        # Self: The leaves attending to themselves (indices 0 to N-1)
+        K_self = K_full[:, :, :N, :]                 # [B, H, N, D]
+        V_self = V_full[:, :, :N, :]                 # [B, H, N, D]
+
+        # Gather neighbors using index table
+        # idx_table: [N, Levels]
+        gather_indices = idx_table
+            
+        # neighbors_k: [B, H, L, Levels, D]
+        neighbors_k = K_full[:, :, gather_indices, :] 
+        neighbors_v = V_full[:, :, gather_indices, :]
+
+        # Compute Self Logits (Leaf Q * Leaf K)
+        # [B, H, L, D] * [B, H, L, D] -> [B, H, L]
+        self_logits = torch.einsum('b h n d, b h n d -> b h n', Q, K_self) / math.sqrt(Dh)
+
+        # Compute Neighbor Logits (Leaf Q * Neighbor K)
+        # Q: [B, H, N, D] -> unsqueeze -> [B, H, N, 1, D]
+        # neighbors_k: [B, H, N, Levels, D]
+        # Result: [B, H, N, Levels]
+        neighbors_logits = torch.einsum('b h l x d, b h l n d -> b h l n', Q.unsqueeze(3), neighbors_k)
+        neighbors_logits = neighbors_logits / math.sqrt(Dh)
+
+        # Apply Causal Mask
+        if mask is not None:
+            # neighbor_causal_mask is [L, Levels]. 
+            # True means "future" (masked).
+            neighbors_logits = neighbors_logits.masked_fill(neighbor_causal_mask, float('-inf'))
+
+        # Concatenate (Self + Neighbors)
+        # V: [B, H, L, D] -> [B, H, L, 1, D]
+        # self_logits: [B, H, L] -> [B, H, L, 1]  
+        # Corrected: Use 'V_self' instead of 'V' (which is undefined in this scope)
+        all_v = torch.cat([V_self.unsqueeze(3), neighbors_v], dim=3)             # [B, H, L, Levels+1, Dh]
+        all_logits = torch.cat([self_logits.unsqueeze(3), neighbors_logits], dim=3) # [B, H, L, Levels+1]
+
+        # Attention Softmax & Weighted Sum
+        max_logits = all_logits.max(dim=-1, keepdim=True)[0]
+        weights = F.softmax(all_logits - max_logits, dim=-1)             # [B, H, L, Levels+1]
+            
+        output_leaf = torch.einsum('b h l n, b h l n d -> b h l d', weights, all_v)
+
+        # --- Inline Merge Heads ---
+        return output_leaf.transpose(1, 2).reshape(B, N, D)
+
+
+    def update_X_from_Y_Triton(self, x, y, mask=None):
         B, N, D = x.shape
         H, Dh = self.num_heads, self.head_dim
 
@@ -970,6 +856,180 @@ class HierarchicalSparseAttentionTriton(nn.Module):
             output = self.out_proj_x(output)
             
             return (output, attn_weights) if return_attention else output
+
+
+
+
+
+
+
+
+
+
+class PositionwiseFeedForward(nn.Module):
+    def __init__(self, d_model, d_ff, dropout=0.1):
+        super(PositionwiseFeedForward, self).__init__()
+        self.fc1 = nn.Linear(d_model, d_ff)
+        self.fc2 = nn.Linear(d_ff, d_model)
+        self.dropout = nn.Dropout(p=dropout)
+    
+    def forward(self, x):
+        return self.fc2(self.dropout(F.relu(self.fc1(x))))
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, dropout, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0. , max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0. , d_model, 2) * -(math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
+    
+    def forward(self, x):
+        x = x + Variable(self.pe[:, :x.size(1), :], requires_grad=False)
+        return self.dropout(x)
+
+# --- IMPROVED DECODER LAYER (Pre-LN Architecture) ---
+class DecoderLayer(nn.Module):
+    def __init__(self, d_model, num_heads, d_ff, dropout=0.1):
+        super().__init__()
+        # Note: dim=d_model to match your previous code hyperparameters
+        self.self_attn = HierarchicalSparseAttention(d_model, num_heads, dropout)
+        self.feed_forward = PositionwiseFeedForward(d_model, d_ff, dropout)
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+
+        # --- NEW: Norm for Y ---
+        self.norm_y = nn.LayerNorm(d_model)
+
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, x, y, mask=None, return_attention=False):
+        ## Update Y (Hierarchy)
+        ## Using the specific cross_update_Y method from your Attention class
+        #y_next = self.self_attn.cross_update_Y(x, y_in=y)
+        
+        # 1. Update Y (Hierarchy) with Residual + Norm
+        # We use 'norm_y(y)' as input to be safe, similar to Pre-LN for x
+        y_norm = self.norm_y(y)
+        
+        # Calculate the update (delta)
+        y_delta = self.self_attn.cross_update_Y(x, y_in=y_norm)
+        
+        # Apply Residual Connection to Y
+        y_next = y + self.dropout(y_delta)
+
+    
+        # PRE-LAYER NORMALIZATION (Apply Norm BEFORE Attention)
+        # This significantly improves stability and convergence speed
+        
+        # Norm -> Attention -> Add
+        norm_x = self.norm1(x)
+
+        if return_attention:
+            attn_output, self_attn_weights = self.self_attn(norm_x, norm_x, norm_x, y=y_next, mask=mask, return_attention=True)
+        else:
+            attn_output = self.self_attn(norm_x, norm_x, norm_x, y=y_next, mask=mask)
+            
+        x = x + self.dropout(attn_output) # Residual
+        
+        # FF
+        norm_x = self.norm2(x)
+        ff_output = self.feed_forward(norm_x)
+        x = x + self.dropout(ff_output)
+        
+        if return_attention:
+            return x, y_next, self_attn_weights
+        return x, y_next
+
+# --- IMPROVED MODEL CLASS (Added Initialization) ---
+class TransformerLM(nn.Module):
+    def __init__(self, vocab_size, d_model, num_heads, d_ff, num_layers, dropout=0.1):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.pos_encoding = PositionalEncoding(d_model, dropout=dropout)
+        self.layers = nn.ModuleList([
+            DecoderLayer(d_model, num_heads, d_ff, dropout)
+            for _ in range(num_layers)
+        ])
+        self.fc_out = nn.Linear(d_model, vocab_size)
+        
+        # Weight Tying (Optional but good for PPL)
+        self.fc_out.weight = self.embedding.weight
+        self.d_model = d_model
+        
+        # --- Apply Initialization ---
+        self.apply(self._init_weights)
+        
+    def _init_weights(self, module):
+        # Initialize weights with small std (0.02) to prevent high starting loss
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        
+    def make_causal_mask(self, x):
+        seq_len = x.shape[1]
+        mask = torch.tril(torch.ones((seq_len, seq_len), device=x.device)).bool()
+        return mask.unsqueeze(0).unsqueeze(0)
+
+    def forward(self, trg, return_attention=False):
+        x = self.embedding(trg) * math.sqrt(self.d_model)
+        x = self.pos_encoding(x)
+
+        # Initialize Y from the embeddings using the static method
+        y = HierarchicalSparseAttention.generate_span_input_Y(x)
+        
+        trg_mask = self.make_causal_mask(trg)
+
+        attentions = [] if return_attention else None
+        
+        for layer in self.layers:
+            if return_attention:
+                x, y, attention = layer(x, y, mask=trg_mask, return_attention=True)
+                attentions.append(attention)
+            else:
+                x, y = layer(x, y, mask=trg_mask)
+        
+        output = self.fc_out(x)
+        return output
+    
+    def generate(self, src, start_token=2, max_len=50, temperature=1.0):
+        self.eval()
+        device = next(self.parameters()).device
+        
+        # Src is treated as prompt in Decoder-Only
+        current_tokens = src.to(device)
+        if current_tokens.dim() == 1:
+            current_tokens = current_tokens.unsqueeze(0)
+            
+        with torch.no_grad():
+            for _ in range(max_len):
+                logits = self.forward(current_tokens)
+                last_token_logits = logits[:, -1, :] / temperature
+                probs = F.softmax(last_token_logits, dim=-1)
+                next_token = torch.multinomial(probs, 1)
+                
+                current_tokens = torch.cat([current_tokens, next_token], dim=1)
+                
+                if next_token.item() == 3: # EOS token ID
+                    break
+        
+        return current_tokens
+
+
+
+
+
+
+
+
 
 
 
