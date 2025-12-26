@@ -630,57 +630,73 @@ class HierarchicalSparseAttention(nn.Module):
         return Y_new
 
     def cross_update_Y_Triton(self, x, y_in):
+        """
+        Optimized bottom-up update using Triton Kernel.
+        
+        Key Optimization:
+        - Uses [Batch, Node, Head, Dim] layout to avoid transposes.
+        - Replaces the O(N) loop of reshaping/masking with a single fused kernel.
+        """
         B, N, D = x.shape
         H, Dh = self.num_heads, self.head_dim
         
         assert y_in is not None, "y_in cannot be None"
+        assert y_in.size(1) > 0, "y_in must have valid tokens"
+
         if self.sizes is None: self.sizes, self.offsets = self.build_level_info(N)
 
-        # 1. Global Query Projection
+        # -------------------------------------------------------
+        # OPTIMIZATION 1: Global Query Projection (Layout Adjusted)
+        # -------------------------------------------------------
+        # We project all Y tokens at once. 
+        # CRITICAL: We DO NOT transpose to [B, H, N, D]. 
+        # We keep it as [B, N, H, D] which is the native Linear output.
+        # This matches the stride logic of our new Triton kernel perfectly.
         Q_all = self.Wq_y(y_in).view(B, -1, H, Dh) 
         
         new_Y_levels = []
-        prev_sources = x 
+        prev_sources = x # Starts as the leaves
         
-        # PRE-FUSE Weights for Loop
-        # We cat them once here to avoid cat overhead inside loop
-        W_kv_fused = torch.cat([self.Wk_y.weight, self.Wv_y.weight], dim=0)
-
         for level, parent_count in enumerate(self.sizes):
             offset = self.offsets[level]
 
-            # Slice Q
+            # ---------------------------------------------------
+            # 1. Prepare Inputs (Zero-Copy Slicing)
+            # ---------------------------------------------------
+            # Slice Q for this level. Shape: [B, Parent_Count, H, Dh]
             Q = Q_all[:, offset : offset + parent_count, :, :]
             
-            # Slice Children
+            # Prepare Children (Keys/Values)
             useful_len = parent_count * 2
+            # Slice strictly to useful length to ensure even pairs
             children_in = prev_sources[:, :useful_len, :]
             
-            # ---------------------------------------------------
-            # OPTIMIZATION: Fused K/V Projection
-            # ---------------------------------------------------
-            # Old: K = Wk(child), V = Wv(child) -> 2 Launches
-            # New: KV = W_fused(child)          -> 1 Launch
-            
-            kv_out = F.linear(children_in, W_kv_fused) # [B, Useful_Len, 2*D]
-            kv_out = kv_out.view(B, -1, 2, H, Dh)
-            
-            K = kv_out[:, :, 0] # Zero-copy view
-            V = kv_out[:, :, 1] # Zero-copy view
+            # Project K and V
+            # Shape: [B, Child_Count, H, Dh]
+            # Again, NO transpose. We keep the native [B, N, H, D] layout.
+            K = self.Wk_y(children_in).view(B, -1, H, Dh)
+            V = self.Wv_y(children_in).view(B, -1, H, Dh)
             V = self.dropout(V)
 
-            # Ensure Contiguity for Triton (Important for 'view' based tensors)
-            if not K.is_contiguous(): K = K.contiguous()
-            if not V.is_contiguous(): V = V.contiguous()
-
-            # Call Triton Kernel
+            # ---------------------------------------------------
+            # 2. Triton Kernel (Fused Reduction)
+            # ---------------------------------------------------
+            # Replaces: Reshape -> Dot -> Softmax -> Weighted Sum -> Reshape
+            # The kernel natively handles the tree structure (2 children -> 1 parent)
+            # Input:  [B, 2*P, H, D] (Children)
+            # Output: [B, P, H, D]   (Parents)
             updated_heads = build_parent_nodes(Q, K, V)
-            
-            # Merge Heads
+
+            # ---------------------------------------------------
+            # 3. Merge Heads
+            # ---------------------------------------------------
+            # [B, P, H, Dh] -> [B, P, H*Dh] (i.e., [B, P, D])
             updated_merged = updated_heads.reshape(B, parent_count, D)
+            
             new_Y_levels.append(updated_merged)
             prev_sources = updated_merged
 
+        # Concatenate and Project
         Y_new = torch.cat(new_Y_levels, dim=1)
         Y_new = self.out_proj_y(Y_new)
         
@@ -761,74 +777,44 @@ class HierarchicalSparseAttention(nn.Module):
         B, N, D = x.shape
         H, Dh = self.num_heads, self.head_dim
 
+        # [Check] Enforce strict existence
         assert y is not None, "y (parents) cannot be None during top-down update"
 
-        # -----------------------------------------------------------
-        # OPTIMIZATION: Fused Projection (Run-time Weight Stacking)
-        # -----------------------------------------------------------
-        # We perform one large GEMM for X and one for Y, instead of concating inputs.
+        # 1. Combine Input (Leaves + Parents)
+        XY = torch.cat([x, y], dim=1)
         
-        # 1. Project X (Leaves) -> Generates Q, K_x, V_x
-        # Stack weights: [3*D, D]
-        # This creates a temporary view of weights (tiny), not inputs (huge).
-        W_qkv_x = torch.cat([self.Wq_x.weight, self.Wk_x.weight, self.Wv_x.weight], dim=0)
+        # 2. Separate Projections (No Fused Wkv)
+        # Q: [B, N, H, Dh]
+        Q = self.Wq_x(x).view(B, N, H, Dh)
         
-        # Compute: [B, N, 3*D] (One Kernel Launch)
-        qkv_x = F.linear(x, W_qkv_x)
+        # K, V: [B, Total_Nodes, H, Dh]
+        # We project K and V separately using your existing layers
+        K_full = self.Wk_x(XY).view(B, -1, H, Dh)
+        V_full = self.Wv_x(XY).view(B, -1, H, Dh)
         
-        # Reshape: [B, N, 3, H, Dh]
-        qkv_x = qkv_x.view(B, N, 3, H, Dh)
-        
-        # Zero-copy unbind
-        Q   = qkv_x[:, :, 0]
-        K_x = qkv_x[:, :, 1]
-        V_x = qkv_x[:, :, 2]
-
-        # 2. Project Y (Parents) -> Generates K_y, V_y (No Q needed for parents here)
-        # Stack weights: [2*D, D]
-        W_kv_y = torch.cat([self.Wk_x.weight, self.Wv_x.weight], dim=0)
-        
-        # Compute: [B, P, 2*D]
-        kv_y = F.linear(y, W_kv_y)
-        
-        # Reshape: [B, P, 2, H, Dh]
-        kv_y = kv_y.view(B, -1, 2, H, Dh)
-        K_y = kv_y[:, :, 0]
-        V_y = kv_y[:, :, 1]
-
-        # 3. Concatenate K and V results
-        # This is unavoidable as we need a contiguous buffer for the kernel lookups.
-        K_full = torch.cat([K_x, K_y], dim=1) # [B, N+P, H, Dh]
-        V_full = torch.cat([V_x, V_y], dim=1)
-        
-        # Apply Dropout
+        # Apply dropout to V
         V_full = self.dropout(V_full)
 
-        # 4. Enforce Contiguity & Alignment
-        # Q is a strided view from qkv_x. Making it contiguous helps memory coalescing.
-        if not Q.is_contiguous(): Q = Q.contiguous()
-        
-        # K_full/V_full are fresh from cat(), so they are contiguous, but we check for safety.
+        # 3. Ensure Contiguity
+        # The Triton kernel does pointer arithmetic. While Linear() outputs are usually 
+        # contiguous, operations like Dropout or View can sometimes create strides 
+        # that break optimized kernels. We enforce it here to be safe.
         if not K_full.is_contiguous(): K_full = K_full.contiguous()
         if not V_full.is_contiguous(): V_full = V_full.contiguous()
 
-        # -----------------------------------------------------------
-        # Kernel Execution
-        # -----------------------------------------------------------
+        # Get Topology
         idx_table, neighbor_mask = self._get_lookup_table(N, device=x.device)
-        active_mask = neighbor_mask if mask is not None else None
 
-        # Fused Head Grid (N, B) is faster for shared topology
-        grid = (N, B)
-        
-        # Alignment Checks (Safe to remove in production if inputs are guaranteed)
-        # assert Q.data_ptr() % 16 == 0 
+        # DECISION LOGIC:
+        # If the user passed a mask (indicating causality is on), use neighbor_mask.
+        # If mask is None (indicating full/bidirectional), pass None.
+        active_mask = neighbor_mask if mask is not None else None
 
         output_leaf_heads = hierarchical_fused_attention(
             Q, K_full, V_full, 
             idx_table, active_mask
         )
-
+    
         return output_leaf_heads.view(B, N, D)
 
     def _standard_attention(self, Q, K, V, mask):
