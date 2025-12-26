@@ -1473,7 +1473,7 @@ def run_transformer_benchmark():
     print(f"  FlashAttention Avg Latency: {ms_flash:.2f} ms")
     print(f"  Triton  Avg Latency: {ms_opt:.2f} ms")
     print(f"  >>> Speedup: {ms_ref / ms_opt:.2f}x")
-    print(f"  >>> Speedup: {ms_ref / ms_flash:.2f}x")
+    print(f"  >>> Speedup: {ms_flash / ms_opt:.2f}x")
 
     # --------------------------------------------------------------------------
     # 4. PROFILING
