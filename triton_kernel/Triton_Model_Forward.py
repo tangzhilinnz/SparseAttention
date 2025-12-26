@@ -1284,7 +1284,7 @@ def run_transformer_benchmark():
     
     with torch.no_grad():
         with profile(
-            activities=[ProfilerActivity.CUDA],
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
             record_shapes=True,
             with_stack=False
         ) as prof:
