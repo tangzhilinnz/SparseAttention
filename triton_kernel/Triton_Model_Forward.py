@@ -967,7 +967,68 @@ class HierarchicalSparseAttentionTriton(nn.Module):
 
 
 
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model, num_heads, dropout=0.1):
+        super().__init__()
+        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, query, key, value, mask=None, return_attention=False):
+        batch_size = query.shape[0]
+        
+        # 1. Project and Reshape
+        # Resulting shape: [Batch, Heads, SeqLen, HeadDim]
+        Q = self.q_proj(query).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        K = self.k_proj(key).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        V = self.v_proj(value).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
 
+        # 2. FlashAttention Implementation
+        if not return_attention:
+            # F.scaled_dot_product_attention automatically selects FlashAttention-2 on A100
+            # It handles scaling (1/sqrt(dim)), softmax, and dropout internally.
+            
+            # Ensure mask is broadcastable if provided. 
+            # Your make_causal_mask returns [1, 1, Seq, Seq], which works perfectly here.
+            output = F.scaled_dot_product_attention(
+                Q, K, V,
+                attn_mask=mask, 
+                dropout_p=self.dropout.p if self.training else 0.0,
+                is_causal=False # We use explicit mask, so is_causal=False
+            )
+            attn_weights = None # FlashAttention does not produce materialized weights
+            
+        else:
+            # 3. Fallback for Visualization (Standard Implementation)
+            # FlashAttention cannot return weights because it never calculates the full NxN matrix.
+            # We revert to standard logic only if weights are explicitly requested.
+            scale = math.sqrt(self.head_dim)
+            scores = torch.matmul(Q, K.transpose(-2, -1)) / scale
+            
+            if mask is not None:
+                min_value = torch.finfo(scores.dtype).min
+                scores = scores.masked_fill(mask == 0, min_value)
+            
+            attn_weights = F.softmax(scores, dim=-1)
+            attn_weights = self.dropout(attn_weights)
+            output = torch.matmul(attn_weights, V)
+
+        # 4. Reassemble Heads
+        output = output.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
+        output = self.out_proj(output)
+        
+        if return_attention:
+            return output, attn_weights
+        
+        return output
 
 
 
@@ -1143,6 +1204,115 @@ class TransformerLM(nn.Module):
         return current_tokens
 
 
+
+
+class DecoderLayerStandard(nn.Module):
+    def __init__(self, d_model, num_heads, d_ff, dropout=0.1):
+        super().__init__()
+        self.self_attn = MultiHeadAttention(d_model, num_heads, dropout)
+        self.feed_forward = PositionwiseFeedForward(d_model, d_ff, dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, x, trg_mask=None, return_attention=False):
+        # PRE-LAYER NORMALIZATION (Apply Norm BEFORE Attention)
+        # This significantly improves stability and convergence speed
+        
+        # 1. Norm -> Attention -> Add
+        norm_x = self.norm1(x)
+        if return_attention:
+            attn_output, self_attn_weights = self.self_attn(norm_x, norm_x, norm_x, mask=trg_mask, return_attention=True)
+        else:
+            attn_output = self.self_attn(norm_x, norm_x, norm_x, mask=trg_mask)
+            
+        x = x + self.dropout(attn_output) # Residual
+        
+        # 2. Norm -> FeedForward -> Add
+        norm_x = self.norm2(x)
+        ff_output = self.feed_forward(norm_x)
+        x = x + self.dropout(ff_output) # Residual
+        
+        if return_attention:
+            return x, self_attn_weights
+        return x
+
+
+class TransformerLMStandard(nn.Module):
+    def __init__(self, vocab_size, d_model, num_heads, d_ff, num_layers, dropout=0.1):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.pos_encoding = PositionalEncoding(d_model, dropout=dropout)
+        self.layers = nn.ModuleList([
+            DecoderLayer(d_model, num_heads, d_ff, dropout)
+            for _ in range(num_layers)
+        ])
+        self.fc_out = nn.Linear(d_model, vocab_size)
+        
+        # Weight Tying (Optional but good for PPL)
+        self.fc_out.weight = self.embedding.weight
+        self.d_model = d_model
+        
+        # --- Apply Initialization ---
+        self.apply(self._init_weights)
+        
+    def _init_weights(self, module):
+        # Initialize weights with small std (0.02) to prevent high starting loss
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        
+    def make_causal_mask(self, x):
+        seq_len = x.shape[1]
+        mask = torch.tril(torch.ones((seq_len, seq_len), device=x.device)).bool()
+        return mask.unsqueeze(0).unsqueeze(0)
+
+    def forward(self, trg, return_attention=False):
+        trg_mask = self.make_causal_mask(trg)
+        
+        x = self.embedding(trg) * math.sqrt(self.d_model)
+        x = self.pos_encoding(x)
+        
+        attentions = [] if return_attention else None
+        
+        for layer in self.layers:
+            if return_attention:
+                x, attention = layer(x, trg_mask=trg_mask, return_attention=True)
+                attentions.append(attention)
+            else:
+                x = layer(x, trg_mask=trg_mask)
+        
+        output = self.fc_out(x)
+        return output
+    
+    def generate(self, src, start_token=2, max_len=50, temperature=1.0):
+        self.eval()
+        device = next(self.parameters()).device
+        
+        # Src is treated as prompt in Decoder-Only
+        current_tokens = src.to(device)
+        if current_tokens.dim() == 1:
+            current_tokens = current_tokens.unsqueeze(0)
+            
+        with torch.no_grad():
+            for _ in range(max_len):
+                logits = self.forward(current_tokens)
+                last_token_logits = logits[:, -1, :] / temperature
+                probs = F.softmax(last_token_logits, dim=-1)
+                next_token = torch.multinomial(probs, 1)
+                
+                current_tokens = torch.cat([current_tokens, next_token], dim=1)
+                
+                if next_token.item() == 3: # EOS token ID
+                    break
+        
+        return current_tokens
+
+
+
 import time
 from torch.profiler import profile, record_function, ProfilerActivity
 
@@ -1191,6 +1361,12 @@ def run_transformer_benchmark():
         vocab_size=VOCAB_SIZE, d_model=D_MODEL, num_heads=NUM_HEADS, 
         d_ff=D_FF, num_layers=NUM_LAYERS, triton=True, dropout=DROPOUT
     ).to(device).half() # Float16
+    
+    # C. Flash Attention Model
+    model_flash = TransformerLMStandard(
+        vocab_size=VOCAB_SIZE, d_model=D_MODEL, num_heads=NUM_HEADS, 
+        d_ff=D_FF, num_layers=NUM_LAYERS, dropout=DROPOUT
+    ).to(device).half() # Float16
 
     # CRITICAL: Load weights from Ref to Opt to ensure outputs are comparable
     print("Synchronizing weights (Ref -> Opt)...")
@@ -1198,6 +1374,7 @@ def run_transformer_benchmark():
 
     model_ref.eval()
     model_opt.eval()
+    model_flash.eval()
 
     # Generate Dummy Input
     # Integers for Embedding layer
@@ -1233,6 +1410,24 @@ def run_transformer_benchmark():
     
     num_warmup = 5
     num_trials = 20
+
+    # --- Benchmark FlashAttention ---
+    print(f"Benchmarking FlashAttention (Ref)...")
+    with torch.no_grad():
+        for _ in range(num_warmup):
+            _ = model_flash(x_input)
+        
+        torch.cuda.synchronize()
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        
+        start_event.record()
+        for _ in range(num_trials):
+            _ = model_flash(x_input)
+        end_event.record()
+        torch.cuda.synchronize()
+        
+        ms_flash = start_event.elapsed_time(end_event) / num_trials
 
     # --- Benchmark PyTorch ---
     print(f"Benchmarking PyTorch (Ref)...")
@@ -1272,8 +1467,10 @@ def run_transformer_benchmark():
 
     print(f"\nRESULTS:")
     print(f"  PyTorch Avg Latency: {ms_ref:.2f} ms")
+    print(f"  FlashAttention Avg Latency: {ms_flash:.2f} ms")
     print(f"  Triton  Avg Latency: {ms_opt:.2f} ms")
     print(f"  >>> Speedup: {ms_ref / ms_opt:.2f}x")
+    print(f"  >>> Speedup: {ms_ref / ms_flash:.2f}x")
 
     # --------------------------------------------------------------------------
     # 4. PROFILING
