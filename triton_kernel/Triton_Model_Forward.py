@@ -1553,5 +1553,19 @@ def run_transformer_benchmark():
                     
     print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=100))
 
+
+    with torch.no_grad():
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            record_shapes=True,
+            with_stack=False
+        ) as prof:
+            # Run the forward pass 5 times
+            for i in range(5):
+                with record_function(f"model_forward_flash"):
+                    model_flash(x_input)
+                    
+    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=100))
+
 if __name__ == "__main__":
     run_transformer_benchmark()
