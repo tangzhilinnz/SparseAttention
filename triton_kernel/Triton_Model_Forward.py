@@ -1389,7 +1389,7 @@ def run_transformer_benchmark():
     
     # Batch config
     B = 16   # Reduced slightly from 16 to ensure safety on standard VRAM with 12 layers
-    SEQ_LEN = 2048
+    SEQ_LEN = 2048 * 2
     
     print(f"\n{'='*60}")
     print(f" TRANSFORMER LM BENCHMARK (B={B}, L={SEQ_LEN}, Layers={NUM_LAYERS})")
