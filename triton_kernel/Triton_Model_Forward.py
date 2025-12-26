@@ -1013,9 +1013,9 @@ class DecoderLayer(nn.Module):
         super().__init__()
         # Note: dim=d_model to match your previous code hyperparameters
         if triton:
-            self.self_attn = HierarchicalSparseAttention(d_model, num_heads, dropout)
-        else:
             self.self_attn = HierarchicalSparseAttentionTriton(d_model, num_heads, dropout)
+        else:
+            self.self_attn = HierarchicalSparseAttention(d_model, num_heads, dropout)
 
         self.feed_forward = PositionwiseFeedForward(d_model, d_ff, dropout)
 
