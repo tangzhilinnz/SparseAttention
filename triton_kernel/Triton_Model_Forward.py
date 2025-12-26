@@ -1227,31 +1227,6 @@ class TransformerLM(nn.Module):
         
         output = self.fc_out(x)
         return output
-    
-    def generate(self, src, start_token=2, max_len=50, temperature=1.0):
-        self.eval()
-        device = next(self.parameters()).device
-        
-        # Src is treated as prompt in Decoder-Only
-        current_tokens = src.to(device)
-        if current_tokens.dim() == 1:
-            current_tokens = current_tokens.unsqueeze(0)
-            
-        with torch.no_grad():
-            for _ in range(max_len):
-                logits = self.forward(current_tokens)
-                last_token_logits = logits[:, -1, :] / temperature
-                probs = F.softmax(last_token_logits, dim=-1)
-                next_token = torch.multinomial(probs, 1)
-                
-                current_tokens = torch.cat([current_tokens, next_token], dim=1)
-                
-                if next_token.item() == 3: # EOS token ID
-                    break
-        
-        return current_tokens
-
-
 
 
 class DecoderLayerStandard(nn.Module):
@@ -1335,29 +1310,6 @@ class TransformerLMStandard(nn.Module):
         
         output = self.fc_out(x)
         return output
-    
-    def generate(self, src, start_token=2, max_len=50, temperature=1.0):
-        self.eval()
-        device = next(self.parameters()).device
-        
-        # Src is treated as prompt in Decoder-Only
-        current_tokens = src.to(device)
-        if current_tokens.dim() == 1:
-            current_tokens = current_tokens.unsqueeze(0)
-            
-        with torch.no_grad():
-            for _ in range(max_len):
-                logits = self.forward(current_tokens)
-                last_token_logits = logits[:, -1, :] / temperature
-                probs = F.softmax(last_token_logits, dim=-1)
-                next_token = torch.multinomial(probs, 1)
-                
-                current_tokens = torch.cat([current_tokens, next_token], dim=1)
-                
-                if next_token.item() == 3: # EOS token ID
-                    break
-        
-        return current_tokens
 
 
 
