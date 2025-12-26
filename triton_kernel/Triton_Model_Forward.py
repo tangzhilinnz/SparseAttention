@@ -128,6 +128,9 @@ def build_parent_nodes(Q, K, V):
     Out = torch.empty_like(Q)
     grid = (P, B)
 
+    BLOCK_H = triton.next_power_of_2(H)
+    BLOCK_SIZE = triton.next_power_of_2(D)
+
     build_parent_nodes_kernel[grid](
         Q, K, V, Out,
         Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
