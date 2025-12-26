@@ -163,10 +163,12 @@ def build_parent_nodes(Q, K, V):
 
 
 
-
+import torch
+import triton
+import triton.language as tl
 
 @triton.jit
-def hierarchical_fused_attention_kernel(
+def hierarchical_fused_attention_kernel_split(
     # Pointers
     Q_ptr, K_ptr, V_ptr, 
     Lookup_ptr, Mask_ptr, 
@@ -184,113 +186,133 @@ def hierarchical_fused_attention_kernel(
     D: tl.constexpr,
     LEVELS: tl.constexpr,
     BLOCK_D: tl.constexpr,
-    BLOCK_LEVELS: tl.constexpr, # <--- NEW CONSTANT (Power of 2)
+    BLOCK_LEVELS: tl.constexpr,
     HAS_MASK: tl.constexpr 
 ):
+    # -----------------------------------------------------------
+    # 1. Grid & Indices (Optimized: Head Parallelism)
+    # -----------------------------------------------------------
     node_idx = tl.program_id(0)
-    b_idx = tl.program_id(1)
-
-    # 1. Setup
-    h_idx = tl.arange(0, H)
-    offs_d = tl.arange(0, BLOCK_D)
+    bh_idx = tl.program_id(1)
     
-    # --- FIX: Use BLOCK_LEVELS for arange (Must be Power of 2) ---
+    # Split Batch and Head from the grid index
+    b_idx = bh_idx // H
+    h_idx = bh_idx % H  # Process strictly ONE head per kernel instance
+
+    offs_d = tl.arange(0, BLOCK_D)
     offs_lvl = tl.arange(0, BLOCK_LEVELS)
     mask_lvl = offs_lvl < LEVELS
     
-    # Load Topology Indices
-    # We use 'offs_lvl' for offsets, but apply 'mask_lvl' to ensure we don't read garbage
+    # -----------------------------------------------------------
+    # 2. Load Topology (Scalar / Shared across this node)
+    # -----------------------------------------------------------
     off_lookup = node_idx * sl_n + offs_lvl * sl_lvl
     neighbor_indices = tl.load(Lookup_ptr + off_lookup, mask=mask_lvl, other=0)
     
-    # Load Causal Mask (Conditional)
     neighbor_mask_val = tl.zeros([BLOCK_LEVELS], dtype=tl.int1)
     if HAS_MASK:
-        neighbor_mask_val = tl.load(Mask_ptr + off_lookup, mask=mask_lvl, other=1).to(tl.int1)
+        # Load as int8 then cast to int1 (boolean)
+        val_int8 = tl.load(Mask_ptr + off_lookup, mask=mask_lvl, other=1).to(tl.int8)
+        neighbor_mask_val = (val_int8 != 0)
 
-    # Base Pointers
-    q_base = Q_ptr + b_idx * sq_b + node_idx * sq_n
-    k_base = K_ptr + b_idx * sk_b 
+    # -----------------------------------------------------------
+    # 3. Setup Pointers & Accumulators (Scalar Head)
+    # -----------------------------------------------------------
+    # Note: We remove 'h_idx' vectorization. h_idx is now a scalar.
     
-    acc_self = tl.zeros([H], dtype=tl.float32)
+    # Q Base: [Batch, Node, Head, Dim]
+    q_ptr_base = Q_ptr + (b_idx * sq_b) + (node_idx * sq_n) + (h_idx * sq_h)
     
-    # Accumulator must match the Block Size
-    acc_cross = tl.zeros([H, BLOCK_LEVELS], dtype=tl.float32)
+    # K/V Base: [Batch, :, Head, Dim]
+    k_ptr_base = K_ptr + (b_idx * sk_b) + (h_idx * sk_h)
+    v_ptr_base = V_ptr + (b_idx * sk_b) + (h_idx * sk_h)
+    
+    # Accumulators (Acc_self is scalar, Acc_cross is vector [BLOCK_LEVELS])
+    acc_self = 0.0 # scalar
+    acc_cross = tl.zeros([BLOCK_LEVELS], dtype=tl.float32) 
 
-    # 2. Score Accumulation (Dot Product)
+    # -----------------------------------------------------------
+    # 4. Score Loop (Stream D)
+    # -----------------------------------------------------------
     for off_d_start in range(0, D, BLOCK_D):
         d_range = off_d_start + offs_d
         d_mask = d_range < D
         
-        # Load Q
-        ptr_q = q_base + (h_idx[:, None] * sq_h) + (d_range[None, :] * sq_d)
-        q = tl.load(ptr_q, mask=d_mask[None, :], other=0.0)
+        # Load Q [BLOCK_D]
+        ptr_q = q_ptr_base + (d_range * sq_d)
+        q = tl.load(ptr_q, mask=d_mask, other=0.0)
         
-        # Load K_Self
-        ptr_k_self = k_base + (node_idx * sk_n) + (h_idx[:, None] * sk_h) + (d_range[None, :] * sk_d)
-        k_self = tl.load(ptr_k_self, mask=d_mask[None, :], other=0.0)
-        acc_self += tl.sum(q * k_self, axis=1)
+        # Load K_Self [BLOCK_D]
+        ptr_k_self = k_ptr_base + (node_idx * sk_n) + (d_range * sk_d)
+        k_self = tl.load(ptr_k_self, mask=d_mask, other=0.0)
+        
+        # Dot Product (Scalar Accumulation)
+        acc_self += tl.sum(q * k_self)
 
-        # Load K_Neighbors (Indirect)
-        # neighbor_indices is [BLOCK_LEVELS]
-        ptr_k_cross = k_base + (neighbor_indices[None, :, None] * sk_n) + \
-                      (h_idx[:, None, None] * sk_h) + (d_range[None, None, :] * sk_d)
+        # Load K_Neighbors (Gather) [BLOCK_LEVELS, BLOCK_D]
+        # ptr math: Base + (Node_List * stride_n) + (Dim_Range * stride_d)
+        ptr_k_cross = k_ptr_base + (neighbor_indices[:, None] * sk_n) + (d_range[None, :] * sk_d)
         
-        # Mask: valid Levels AND valid Dim
-        mask_k_cross = mask_lvl[None, :, None] & d_mask[None, None, :]
-        k_cross = tl.load(ptr_k_cross, mask=mask_k_cross, other=0.0)
+        mask_k = mask_lvl[:, None] & d_mask[None, :]
+        k_cross = tl.load(ptr_k_cross, mask=mask_k, other=0.0)
         
-        acc_cross += tl.sum(q[:, None, :] * k_cross, axis=2)
+        # Dot Product (Vector Accumulation along D) -> [BLOCK_LEVELS]
+        # q[None, :] broadcasts [1, D] against [Levels, D]
+        acc_cross += tl.sum(q[None, :] * k_cross, axis=1)
 
-    # 3. Softmax
+    # -----------------------------------------------------------
+    # 5. Softmax (Head-Specific)
+    # -----------------------------------------------------------
     acc_self = acc_self * sm_scale
     acc_cross = acc_cross * sm_scale
     
-    # Mask invalid levels (Padding or User Mask)
-    # 1. Padding levels (offs_lvl >= LEVELS)
-    # 2. User Mask (neighbor_mask_val == 1)
+    # Apply Masks
     mask_broadcast = (offs_lvl >= LEVELS)
     if HAS_MASK:
-        mask_broadcast = mask_broadcast | (neighbor_mask_val == 1)
-        
-    acc_cross = tl.where(mask_broadcast[None, :], -1.0e9, acc_cross)
+        mask_broadcast = mask_broadcast | neighbor_mask_val
     
-    max_cross = tl.max(acc_cross, axis=1)
+    # Masking with -inf for stability
+    acc_cross = tl.where(mask_broadcast, -float('inf'), acc_cross)
+    
+    # Max Subtraction
+    max_cross = tl.max(acc_cross, axis=0)
     max_all = tl.maximum(acc_self, max_cross)
     
     exp_self = tl.exp(acc_self - max_all)
-    exp_cross = tl.exp(acc_cross - max_all[:, None])
+    exp_cross = tl.exp(acc_cross - max_all)
     
-    denom = exp_self + tl.sum(exp_cross, axis=1)
-    w_self = exp_self / denom 
-    w_cross = exp_cross / denom[:, None]
+    denom = exp_self + tl.sum(exp_cross, axis=0)
+    
+    w_self = exp_self / denom
+    w_cross = exp_cross / denom # [BLOCK_LEVELS]
 
-    # 4. Weighted Sum
-    v_base = V_ptr + b_idx * sk_b
-    out_base = Out_ptr + b_idx * so_b + node_idx * so_n
-    
+    # -----------------------------------------------------------
+    # 6. Weighted Sum Loop (Stream D)
+    # -----------------------------------------------------------
+    # Output Base
+    out_ptr_base = Out_ptr + (b_idx * so_b) + (node_idx * so_n) + (h_idx * so_h)
+
     for off_d_start in range(0, D, BLOCK_D):
         d_range = off_d_start + offs_d
         d_mask = d_range < D
         
-        # Load V_Self
-        ptr_v_self = v_base + (node_idx * sk_n) + (h_idx[:, None] * sk_h) + (d_range[None, :] * sk_d)
-        v_self = tl.load(ptr_v_self, mask=d_mask[None, :], other=0.0)
-        out_acc = w_self[:, None] * v_self
+        # Load V_Self [BLOCK_D]
+        ptr_v_self = v_ptr_base + (node_idx * sk_n) + (d_range * sk_d)
+        v_self = tl.load(ptr_v_self, mask=d_mask, other=0.0)
         
-        # Load V_Neighbors (Indirect)
-        ptr_v_cross = v_base + (neighbor_indices[None, :, None] * sk_n) + \
-                      (h_idx[:, None, None] * sk_h) + (d_range[None, None, :] * sk_d)
+        # Weighted Self
+        out_acc = w_self * v_self
         
-        mask_v_cross = mask_lvl[None, :, None] & d_mask[None, None, :]
-        v_cross = tl.load(ptr_v_cross, mask=mask_v_cross, other=0.0)
+        # Load V_Neighbors [BLOCK_LEVELS, BLOCK_D]
+        ptr_v_cross = v_ptr_base + (neighbor_indices[:, None] * sk_n) + (d_range[None, :] * sk_d)
+        mask_v = mask_lvl[:, None] & d_mask[None, :]
+        v_cross = tl.load(ptr_v_cross, mask=mask_v, other=0.0)
         
-        out_acc += tl.sum(w_cross[:, :, None] * v_cross, axis=1)
+        # Weighted Neighbors: [Levels, 1] * [Levels, D] -> Sum(Levels) -> [D]
+        out_acc += tl.sum(w_cross[:, None] * v_cross, axis=0)
         
-        # Store
-        ptr_out = out_base + (h_idx[:, None] * so_h) + (d_range[None, :] * so_d)
-        tl.store(ptr_out, out_acc.to(Out_ptr.dtype.element_ty), mask=d_mask[None, :])
-
+        # Store Result
+        tl.store(out_ptr_base + (d_range * so_d), out_acc, mask=d_mask)
 
 
 def hierarchical_fused_attention(Q, K, V, idx_table, mask_table):
@@ -299,30 +321,45 @@ def hierarchical_fused_attention(Q, K, V, idx_table, mask_table):
     Out = torch.empty_like(Q)
 
     HAS_MASK = (mask_table is not None)
+    # Safety: Point to Q if mask is None to avoid dereferencing NonePtr in Triton
     mask_ptr_safe = mask_table if HAS_MASK else Q 
 
-    grid = (N, B)
+    # --- OPTIMIZATION: Head Parallel Grid ---
+    # Grid Logic: 
+    #   Dim 0: N (Process every node)
+    #   Dim 1: B * H (Process every Batch & Head independently)
+    # This matches the kernel logic: pid_bh // H = batch, pid_bh % H = head
+    grid = (N, B * H)
 
-    # --- FIX: Calculate next power of 2 for LEVELS ---
+    # Calculate next power of 2 for block size (Compile-time requirement for Triton)
     BLOCK_LEVELS = triton.next_power_of_2(LEVELS)
 
-    hierarchical_fused_attention_kernel[grid](
+    hierarchical_fused_attention_kernel_split[grid](
+        # Pointers
         Q, K, V, 
         idx_table, mask_ptr_safe, 
         Out,
+        
+        # Strides
         Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
         K.stride(0), K.stride(1), K.stride(2), K.stride(3),
         idx_table.stride(0), idx_table.stride(1),
         Out.stride(0), Out.stride(1), Out.stride(2), Out.stride(3),
+        
+        # Constants
         sm_scale=1.0 / math.sqrt(Dh),
         H=H,
         D=Dh,
         LEVELS=LEVELS,
         BLOCK_D=triton.next_power_of_2(Dh),
-        BLOCK_LEVELS=BLOCK_LEVELS, # <--- PASS THIS
+        BLOCK_LEVELS=BLOCK_LEVELS,
         HAS_MASK=HAS_MASK,
+        
+        # Performance Tuning
+        # num_warps=4 is standard. For very large Head Dims (e.g., >128), try 8.
         num_warps=4 
     )
+    
     return Out
 
 
