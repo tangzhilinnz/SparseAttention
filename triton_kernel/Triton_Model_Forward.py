@@ -1293,7 +1293,7 @@ def run_transformer_benchmark():
                 with record_function(f"model_forward_triton"):
                     model_opt(x_input)
                     
-    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=30))
+    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=100))
 
 if __name__ == "__main__":
     run_transformer_benchmark()
