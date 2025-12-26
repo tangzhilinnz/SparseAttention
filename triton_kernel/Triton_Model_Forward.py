@@ -12,95 +12,85 @@ import math
 @triton.jit
 def build_parent_nodes_kernel(
     Q_ptr, K_ptr, V_ptr, Out_ptr,
-    # Strides for Q: [Batch, Node, Head, Dim]
+    # Strides
     sq_b, sq_n, sq_h, sq_d,
-    # Strides for K/V: [Batch, Node, Head, Dim]
     sk_b, sk_n, sk_h, sk_d,
-    # Strides for Out: [Batch, Node, Head, Dim]
     so_b, so_n, so_h, so_d,
     # Constants
     sm_scale,
     H: tl.constexpr,
+    BLOCK_H: tl.constexpr,  # <--- NEW: Power of 2 Size
     D: tl.constexpr,
     BLOCK_SIZE: tl.constexpr
 ):
-    # -----------------------------------------------------------
-    # 1. Grid & Indices
-    # Matches your reference: Grid is (Node, Batch)
-    # -----------------------------------------------------------
     node_idx = tl.program_id(0)
     b_idx = tl.program_id(1)
     
-    # We process ALL heads [0..H] in this single thread block
-    offs_h = tl.arange(0, H)
+    # -----------------------------------------------------------
+    # 1. Grid & Indices (FIXED)
+    # -----------------------------------------------------------
+    # Create range of size 16 (if H=12)
+    offs_h = tl.arange(0, BLOCK_H)
+    # Create a mask to ignore indices 12, 13, 14, 15
+    mask_h = offs_h < H
 
     # -----------------------------------------------------------
-    # 2. Base Pointers (Batch + Node)
+    # 2. Base Pointers
     # -----------------------------------------------------------
-    # Q Base: [Batch, Node, :, :]
     q_base_ptr = Q_ptr + (b_idx * sq_b) + (node_idx * sq_n)
-    
-    # K/V Child Indices
     child0_idx = 2 * node_idx
     child1_idx = 2 * node_idx + 1
     
-    # K Base: [Batch, Child, :, :]
     k0_base_ptr = K_ptr + (b_idx * sk_b) + (child0_idx * sk_n)
     k1_base_ptr = K_ptr + (b_idx * sk_b) + (child1_idx * sk_n)
     
     # -----------------------------------------------------------
-    # 3. Compute Scores (Vectorized over H)
+    # 3. Compute Scores
     # -----------------------------------------------------------
-    # Accumulators shape: [H]
-    score0 = tl.zeros([H], dtype=tl.float32)
-    score1 = tl.zeros([H], dtype=tl.float32)
+    # Accumulators must be size [BLOCK_H]
+    score0 = tl.zeros([BLOCK_H], dtype=tl.float32)
+    score1 = tl.zeros([BLOCK_H], dtype=tl.float32)
 
     for off_d in range(0, D, BLOCK_SIZE):
         offs_d = off_d + tl.arange(0, BLOCK_SIZE)
         mask_d = offs_d < D
         
-        # Pointer Arithmetic for [H, BLOCK_SIZE] block
-        # ptr = base + (h * stride_h) + (d * stride_d)
-        # Broadcasting: offs_h[:, None] ensures shape [H, 1]
-        # Broadcasting: offs_d[None, :] ensures shape [1, BLOCK]
+        # Combined Mask: (Valid Head) AND (Valid Dim)
+        mask_load = mask_h[:, None] & mask_d[None, :]
         
         ptr_q = q_base_ptr + (offs_h[:, None] * sq_h) + (offs_d[None, :] * sq_d)
         ptr_k0 = k0_base_ptr + (offs_h[:, None] * sk_h) + (offs_d[None, :] * sk_d)
         ptr_k1 = k1_base_ptr + (offs_h[:, None] * sk_h) + (offs_d[None, :] * sk_d)
         
-        # Load Data [H, BLOCK_SIZE]
-        # We mask strictly on the D dimension. H is assumed to fit (compile-time constant)
-        q = tl.load(ptr_q, mask=mask_d[None, :], other=0.0)
-        k0 = tl.load(ptr_k0, mask=mask_d[None, :], other=0.0)
-        k1 = tl.load(ptr_k1, mask=mask_d[None, :], other=0.0)
+        q = tl.load(ptr_q, mask=mask_load, other=0.0)
+        k0 = tl.load(ptr_k0, mask=mask_load, other=0.0)
+        k1 = tl.load(ptr_k1, mask=mask_load, other=0.0)
         
-        # Dot Product along D (axis=1) -> Result [H]
         score0 += tl.sum(q * k0, axis=1)
         score1 += tl.sum(q * k1, axis=1)
 
     # -----------------------------------------------------------
-    # 4. Softmax (Vectorized over H)
+    # 4. Softmax
     # -----------------------------------------------------------
     score0 = score0 * sm_scale
     score1 = score1 * sm_scale
     
-    # Element-wise operations on [H] vector
+    # Note: We don't mask score calculations because masked values are 0.0,
+    # which results in valid but irrelevant softmax outputs. 
+    # The crucial part is masking the STORE later.
+    
     max_score = tl.maximum(score0, score1)
     exp0 = tl.exp(score0 - max_score)
     exp1 = tl.exp(score1 - max_score)
     denom = exp0 + exp1 + 1e-9
     
-    w0 = exp0 / denom # [H]
-    w1 = exp1 / denom # [H]
+    w0 = exp0 / denom 
+    w1 = exp1 / denom 
 
     # -----------------------------------------------------------
     # 5. Weighted Sum & Store
     # -----------------------------------------------------------
-    # Output Base Pointer
     out_base_ptr = Out_ptr + (b_idx * so_b) + (node_idx * so_n)
-
-    # Reuse V offsets (assuming V strides == K strides)
-    # If V is separate, we'd need sv_b, sv_n, etc.
     v0_base_ptr = V_ptr + (b_idx * sk_b) + (child0_idx * sk_n)
     v1_base_ptr = V_ptr + (b_idx * sk_b) + (child1_idx * sk_n)
 
@@ -108,22 +98,20 @@ def build_parent_nodes_kernel(
         offs_d = off_d + tl.arange(0, BLOCK_SIZE)
         mask_d = offs_d < D
         
-        # Calculate Pointers [H, BLOCK]
+        # Combined Mask
+        mask_op = mask_h[:, None] & mask_d[None, :]
+        
         ptr_v0 = v0_base_ptr + (offs_h[:, None] * sk_h) + (offs_d[None, :] * sk_d)
         ptr_v1 = v1_base_ptr + (offs_h[:, None] * sk_h) + (offs_d[None, :] * sk_d)
         ptr_out = out_base_ptr + (offs_h[:, None] * so_h) + (offs_d[None, :] * so_d)
         
-        # Load V
-        v0 = tl.load(ptr_v0, mask=mask_d[None, :], other=0.0)
-        v1 = tl.load(ptr_v1, mask=mask_d[None, :], other=0.0)
+        v0 = tl.load(ptr_v0, mask=mask_op, other=0.0)
+        v1 = tl.load(ptr_v1, mask=mask_op, other=0.0)
         
-        # Weighted Sum
-        # w0 is [H], v0 is [H, BLOCK]. 
-        # w0[:, None] broadcasts to [H, 1] for multiplication
         out_val = w0[:, None] * v0 + w1[:, None] * v1
         
-        # Store
-        tl.store(ptr_out, out_val, mask=mask_d[None, :])
+        # CRITICAL: Mask the store so we don't write to invalid memory
+        tl.store(ptr_out, out_val, mask=mask_op)
 
 # ------------------------------------------------------------------
 #                   Python Wrapper
@@ -137,31 +125,21 @@ def build_parent_nodes(Q, K, V):
     """
     # Check shapes
     B, P, H, D = Q.shape
-    
     Out = torch.empty_like(Q)
-    
-    # 2D Grid: (Parent_Nodes, Batch)
-    # We let the internal loop handle H
     grid = (P, B)
 
-    #print(f" BLOCK_SIZE (next_power_of_2)={triton.next_power_of_2(D)}")
-    
     build_parent_nodes_kernel[grid](
         Q, K, V, Out,
-        # Q Strides
         Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
-        # K Strides
         K.stride(0), K.stride(1), K.stride(2), K.stride(3),
-        # Out Strides
         Out.stride(0), Out.stride(1), Out.stride(2), Out.stride(3),
-        # Constants
         sm_scale=1.0 / math.sqrt(D),
         H=H,
+        BLOCK_H=triton.next_power_of_2(H),
         D=D,
         BLOCK_SIZE=triton.next_power_of_2(D),
         num_warps=4
     )
-    
     return Out
 
 
