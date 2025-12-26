@@ -333,53 +333,72 @@ import torch.nn.functional as F
 from torch import einsum
 import math
 
-
-
 def build_hierarchical_index_lookup_table(seq_len, device="cuda", dtype=torch.int32):
+    """
+    Build a hierarchical index lookup table storing only neighbor nodes
+    across different levels (excluding the leaf itself).
+
+    The relationship follows:
+        level 0: n ^ 1
+        level 1: (n // 2 + seq_len) ^ 1
+        level 2: (n1 // 2 + seq_len) ^ 1
+        ...
+    Stops when the next index exceeds total_nodes - 2.
+
+    Args:
+        seq_len (int): number of leaf tokens (must be a power of 2)
+        device (str): 'cuda' or 'cpu'
+        dtype (torch.dtype): index dtype (default int32)
+
+    Returns:
+        idx_map: [seq_len, level_num] int tensor
+    """
     assert (seq_len & (seq_len - 1)) == 0, "seq_len must be a power of 2"
 
     total_nodes = 2 * seq_len - 1
     max_valid = total_nodes - 2
     level_num = int(math.log2(seq_len))
 
-    # FIX 1: Default to True (Masked) so invalid slots are ignored
-    causal_mask = torch.full((seq_len, level_num), True, dtype=torch.bool, device=device)
+    # 1. Initialize Tensors
+    # Mask defaults to True (attend to everything), we set False to mask out future tokens.
+    causal_mask = torch.full((seq_len, level_num), False, dtype=torch.bool, device=device)
     
-    # FIX 2: Default to 0 (Safe Index) to prevent segfaults/wrapping in Triton/PyTorch
-    idx_map = torch.full((seq_len, level_num), 0, dtype=dtype, device=device)
+    # Map defaults to -1 (padding/invalid)
+    idx_map = torch.full((seq_len, level_num), -1, dtype=dtype, device=device)
 
     for n in range(seq_len):
-        n_cur = n
+        n_cur = n # Starts as the leaf index
+        
         for lvl in range(level_num):
+            # --- 1. Calculate the Neighbor (n_next) and Self/Ancestor (pair) ---
             if lvl == 0:
-                n_next = n_cur ^ 1
-                pair = n_cur
+                n_next = n_cur ^ 1  # Sibling leaf
+                pair = n_cur        # The leaf itself
             else:
-                n_next = (n_cur // 2 + seq_len) ^ 1
-                pair = (n_cur // 2 + seq_len)
+                # Formula: (Child_Index // 2) + Offset
+                # Note: We use n_cur (which is the *neighbor* from prev loop).
+                # This works because floor(neighbor / 2) == floor(self / 2).
+                n_next = (n_cur // 2 + seq_len) ^ 1 # Uncle
+                pair = (n_cur // 2 + seq_len)       # Parent
 
-            # Boundary Check
+            # --- 2. Boundary Check ---
+            # If the neighbor is the Root or out of bounds
             if n_next > max_valid:
+                #assert False, "Should not be here!!!"
                 break
 
-            # Valid Neighbor Found: Update Index
-            idx_map[n, lvl] = n_next
-            
-            # Logic: Determine visibility
-            # If pair < n_next, it is "Future" (Right branch). 
-            # If you want strict Causal, keep it True. 
-            # If valid but future, unmask ONLY if you want bidirectional (adjust as needed).
-            # Here we preserve your original Causal Logic:
+            # --- 3. Causal Masking Logic ---
+            # If our Ancestor (pair) appears BEFORE the Neighbor (n_next),
+            # it means the Neighbor is in the "Future" (Right branch).
+            # We must mask it out.
             if pair < n_next:
-                causal_mask[n, lvl] = True # Future -> Masked
-            else:
-                causal_mask[n, lvl] = False # Past -> Unmasked/Visible
+                causal_mask[n, lvl] = True
 
-            n_cur = n_next
+            # --- 4. Update for next iteration ---
+            idx_map[n, lvl] = n_next
+            n_cur = n_next # Climb up via the neighbor
 
     return idx_map, causal_mask
-
-
 
 class HierarchicalSparseAttention(nn.Module):
     def __init__(self, dim, num_heads, dropout=0.1):
@@ -966,7 +985,9 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cpu": print("No GPU found."); exit()
 
-    B, N, D, H = 16, 2048, 1024, 16
+    #B, N, D, H = 16, 2048, 1024, 16
+
+    B, N, D, H = 1, 16, 16, 2
     dtype = torch.float16
     
     print(f"\n--- CONFIG: B={B}, N={N}, D={D}, H={H} ---")
