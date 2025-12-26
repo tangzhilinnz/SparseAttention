@@ -985,9 +985,8 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cpu": print("No GPU found."); exit()
 
-    #B, N, D, H = 16, 2048, 1024, 16
-
-    B, N, D, H = 1, 16, 16, 2
+    B, N, D, H = 16, 2048, 1024, 16
+    #B, N, D, H = 1, 16, 16, 2
     dtype = torch.float16
     
     print(f"\n--- CONFIG: B={B}, N={N}, D={D}, H={H} ---")
