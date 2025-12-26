@@ -385,7 +385,7 @@ def hierarchical_fused_attention(Q, K, V, idx_table, mask_table):
 
 
 
-def build_hierarchical_index_lookup_table(seq_len, device="cuda", dtype=torch.int32):
+def build_hierarchical_index_lookup_table_bak(seq_len, device="cuda", dtype=torch.int32):
     """
     Build a hierarchical index lookup table storing only neighbor nodes
     across different levels (excluding the leaf itself).
@@ -449,6 +449,54 @@ def build_hierarchical_index_lookup_table(seq_len, device="cuda", dtype=torch.in
             # --- 4. Update for next iteration ---
             idx_map[n, lvl] = n_next
             n_cur = n_next # Climb up via the neighbor
+
+    return idx_map, causal_mask
+
+
+def build_hierarchical_index_lookup_table(seq_len, device="cuda", dtype=torch.int32):
+    """
+    Vectorized version: Builds index table without Python loops over seq_len.
+    Drastically faster for large sequences.
+    """
+    assert (seq_len & (seq_len - 1)) == 0, "seq_len must be a power of 2"
+
+    total_nodes = 2 * seq_len - 1
+    max_valid = total_nodes - 2
+    level_num = int(math.log2(seq_len))
+
+    # Initialize Tensors
+    causal_mask = torch.zeros((seq_len, level_num), dtype=torch.bool, device=device)
+    idx_map = torch.full((seq_len, level_num), -1, dtype=dtype, device=device)
+
+    # Start with the leaf nodes [0, 1, 2, ..., seq_len-1]
+    n_cur = torch.arange(seq_len, device=device, dtype=torch.int64)
+
+    for lvl in range(level_num):
+        # Vectorized Logic
+        if lvl == 0:
+            n_next = n_cur ^ 1
+            pair = n_cur
+        else:
+            # Vectorized formula
+            n_next = (n_cur // 2 + seq_len) ^ 1
+            pair = (n_cur // 2 + seq_len)
+
+        # Boundary Check (Vectorized)
+        # We use a mask to prevent writing invalid indices, 
+        # effectively mimicking the 'break' in the loop
+        valid_mask = n_next <= max_valid
+        
+        # Causal Masking Logic (Vectorized)
+        # pair < n_next means neighbor is in the "future"
+        mask_step = (pair < n_next) & valid_mask
+
+        # Update Tables (Batch assignment)
+        # We only update where valid_mask is True
+        idx_map[:, lvl] = torch.where(valid_mask, n_next.to(dtype), idx_map[:, lvl])
+        causal_mask[:, lvl] = torch.where(valid_mask, mask_step, causal_mask[:, lvl])
+
+        # Climb up via the neighbor for the next iteration
+        n_cur = n_next
 
     return idx_map, causal_mask
 
@@ -1382,6 +1430,15 @@ def run_transformer_benchmark():
     # Generate Dummy Input
     # Integers for Embedding layer
     x_input = torch.randint(0, VOCAB_SIZE, (B, SEQ_LEN), device=device)
+
+    # In run_transformer_benchmark, before the sanity check loop:
+
+    print("Pre-building lookup tables...")
+    # Force build by running a dummy pass or calling the method directly
+    dummy_y = torch.zeros(B, SEQ_LEN//2, D_MODEL, device=device).half() # Approximate shape
+    model_opt.update_X_from_Y(x_input, dummy_y) 
+    model_ref.update_X_from_Y(x_input, dummy_y) 
+    print("Tables built.")
 
     # --------------------------------------------------------------------------
     # 2. SANITY CHECK (Correctness)
