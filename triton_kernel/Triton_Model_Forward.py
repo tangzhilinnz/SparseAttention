@@ -1244,7 +1244,7 @@ class TransformerLMStandard(nn.Module):
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.pos_encoding = PositionalEncoding(d_model, dropout=dropout)
         self.layers = nn.ModuleList([
-            DecoderLayer(d_model, num_heads, d_ff, dropout)
+            DecoderLayerStandard(d_model, num_heads, d_ff, dropout)
             for _ in range(num_layers)
         ])
         self.fc_out = nn.Linear(d_model, vocab_size)
@@ -1323,7 +1323,10 @@ def run_transformer_benchmark():
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
     
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # To this:
+    device = "cuda:3" if torch.cuda.is_available() else "cpu"
+    torch.cuda.set_device(device) # Important to set the default context for Triton
+
     if device == "cpu":
         print("Error: Triton requires a GPU. Exiting.")
         return
