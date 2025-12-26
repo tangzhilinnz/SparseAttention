@@ -1137,19 +1137,17 @@ class DecoderLayer(nn.Module):
         self.dropout = nn.Dropout(dropout)
         
     def forward(self, x, y, mask=None, return_attention=False):
-        ## Update Y (Hierarchy)
-        ## Using the specific cross_update_Y method from your Attention class
-        #y_next = self.self_attn.cross_update_Y(x, y_in=y)
-        
-        # 1. Update Y (Hierarchy) with Residual + Norm
-        # We use 'norm_y(y)' as input to be safe, similar to Pre-LN for x
-        y_norm = self.norm_y(y)
-        
-        # Calculate the update (delta)
-        y_delta = self.self_attn.cross_update_Y(x, y_in=y_norm)
-        
-        # Apply Residual Connection to Y
-        y_next = y + self.dropout(y_delta)
+ 
+        ## 1. Update Y (Hierarchy) with Residual + Norm
+        ## We use 'norm_y(y)' as input to be safe, similar to Pre-LN for x
+        #y_norm = self.norm_y(y)
+        #
+        ## Calculate the update (delta)
+        #y_delta = self.self_attn.cross_update_Y(x, y_in=y_norm)
+        #
+        ## Apply Residual Connection to Y
+        #y_next = y + self.dropout(y_delta)
+        y_next = y
 
     
         # PRE-LAYER NORMALIZATION (Apply Norm BEFORE Attention)
