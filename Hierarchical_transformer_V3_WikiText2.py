@@ -318,48 +318,95 @@ class HierarchicalSparseAttention(nn.Module):
             offsets.append(offsets[-1] + s)
         return sizes, offsets
 
-    def cross_update_Y_MLP(self, x, y_in):
+    def cross_update_Y(self, x, y_in):
         """
-        Alternative to Attention: Concatenate Left+Right and project.
-        Formula: Parent = MLP(Concat(Left, Right)) + Residual(Parent_Old)
+        Architecture: Recursive Parent-Self Attention.
+        
+        Logic:
+           Pool = [Parent_Old, Child_Left, Child_Right]
+           Query = Parent_Old
+           Output = Attention(Q, K=Pool, V=Pool)
+           
+        This allows the parent to selectively 'read' from itself or its children.
         """
         B, N, D = x.shape
-        assert y_in is not None, "y_in cannot be None"
-        
+        H, Dh = self.num_heads, self.head_dim
+        assert y_in is not None
+
         if self.sizes is None: self.sizes, self.offsets = self.build_level_info(N)
 
-        new_Y_levels = []
-        prev_sources = x  # Starts as the leaves
+        # -------------------------------------------------------
+        # OPTIMIZATION: Global Parent Projection
+        # -------------------------------------------------------
+        # Since y_in is static, we project ALL parents at once outside the loop.
+        # This saves massive compute compared to projecting inside the loop.
         
+        # Q_parents: The parent acts as the Query
+        Q_p_all = self.Wq_y(y_in).view(B, -1, H, Dh)
+        
+        # K_p_all, V_p_all: The parent also acts as a Key/Value (Target for attending to self)
+        K_p_all = self.Wk_y(y_in).view(B, -1, H, Dh)
+        V_p_all = self.Wv_y(y_in).view(B, -1, H, Dh)
+        
+        new_Y_levels = []
+        prev_sources = x 
+
         for level, parent_count in enumerate(self.sizes):
             # 1. Prepare Children
             useful_len = parent_count * 2
-            # Slice strictly to useful length to ensure even pairs
-            children = prev_sources[:, :useful_len, :] # [B, 2*P, D]
+            children = prev_sources[:, :useful_len, :] 
             
-            # 2. Reshape to pairs: [B, P, 2*D]
-            # We stack the feature dimensions of the left and right child
-            children_pairs = children.contiguous().view(B, parent_count, 2 * D)
-            
-            # 3. MLP Merge
-            # [B, P, 2*D] -> [B, P, D]
-            merged = self.merge_layer(children_pairs)
-            merged = F.gelu(merged) # Non-linearity is crucial here
-            merged = self.dropout(merged)
+            # Project Children (Must be done in loop as prev_sources changes)
+            # [B, 2*P, H, Dh]
+            K_c = self.Wk_y(children).view(B, -1, H, Dh)
+            V_c = self.Wv_y(children).view(B, -1, H, Dh)
+            V_c = self.dropout(V_c)
 
-            # 4. Residual Connection
-            # Add existing Y info (which contains position/initialization info)
+            # 2. Reshape Children to Pairs [B, P, 2, H, Dh]
+            K_c_pairs = K_c.view(B, parent_count, 2, H, Dh)
+            V_c_pairs = V_c.view(B, parent_count, 2, H, Dh)
+
+            # 3. Slice Parents for this Level [B, P, H, Dh]
             offset = self.offsets[level]
-            current_y_in = y_in[:, offset : offset + parent_count, :]
+            Q_p = Q_p_all[:, offset : offset + parent_count, :, :]
+            K_p = K_p_all[:, offset : offset + parent_count, :, :]
+            V_p = V_p_all[:, offset : offset + parent_count, :, :]
+
+            # 4. Form the Attention Pool: [Parent, Child_L, Child_R]
+            # K shape: [B, P, 3, H, Dh]
+            # We unsqueeze Parent to [B, P, 1, H, Dh] to stack
+            K_pool = torch.cat([K_p.unsqueeze(2), K_c_pairs], dim=2)
+            V_pool = torch.cat([V_p.unsqueeze(2), V_c_pairs], dim=2)
+
+            # 5. Compute Attention Scores
+            # Q: [B, P, H, Dh] -> [B, P, H, 1, Dh]
+            # K: [B, P, 3, H, Dh] -> [B, P, H, Dh, 3] (Permute for dot product)
             
-            # Combine
-            y_out = merged + current_y_in
+            q_vec = Q_p.unsqueeze(2).transpose(2, 3) # [B, P, H, 1, Dh]
+            k_vec = K_pool.permute(0, 1, 3, 4, 2)    # [B, P, H, Dh, 3]
+            
+            # Dot Product: [B, P, H, 1, 3]
+            # Result is 3 scores per head: [Score_Self, Score_Left, Score_Right]
+            logits = torch.matmul(q_vec, k_vec) / math.sqrt(Dh)
+            
+            weights = F.softmax(logits, dim=-1) # [B, P, H, 1, 3]
+            # weights = self.dropout(weights)
 
-            new_Y_levels.append(y_out)
-            prev_sources = y_out
+            # 6. Weighted Sum
+            # V_pool: [B, P, 3, H, Dh] -> [B, P, H, 3, Dh] (Permute to match weights)
+            v_vec = V_pool.permute(0, 1, 3, 2, 4)
+            
+            # [B, P, H, 1, 3] * [B, P, H, 3, Dh] -> [B, P, H, 1, Dh]
+            attn_out = torch.matmul(weights, v_vec)
+            
+            # 7. Merge Heads
+            # Remove the '1' dim, transpose back
+            # [B, P, H, 1, Dh] -> [B, P, H, Dh] -> [B, P, D]
+            attn_out = attn_out.squeeze(3).transpose(2, 3).reshape(B, parent_count, D)
+            
+            new_Y_levels.append(attn_out)
+            prev_sources = attn_out
 
-        # Concatenate all levels back into one sequence
-        # Apply output projection
         return self.out_proj_y(torch.cat(new_Y_levels, dim=1))
 
     def update_X_from_Y(self, x, y, mask=None):
@@ -504,7 +551,7 @@ class DecoderLayer(nn.Module):
         y_norm = self.norm_y(y)
         
         # Calculate the update (delta)
-        y_delta = self.self_attn.cross_update_Y_MLP(x, y_in=y_norm)
+        y_delta = self.self_attn.cross_update_Y(x, y_in=y_norm)
         
         # Apply Residual Connection to Y
         y_next = y + self.dropout(y_delta)
