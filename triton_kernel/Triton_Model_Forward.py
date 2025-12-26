@@ -982,7 +982,7 @@ class PositionwiseFeedForward(nn.Module):
         return self.fc2(self.dropout(F.relu(self.fc1(x))))
 
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, dropout, max_len=5000):
+    def __init__(self, d_model, dropout, max_len=10000):
         super(PositionalEncoding, self).__init__()
         self.dropout = nn.Dropout(p=dropout)
         
