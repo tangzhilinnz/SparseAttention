@@ -6,20 +6,32 @@ import triton.language as tl
 from torch import einsum
 import math
 
+import torch
+import triton
+import triton.language as tl
+import math
+
 # ------------------------------------------------------------------
-#                   Triton Kernel
+#                    Triton Kernel
 # ------------------------------------------------------------------
 @triton.jit
-def build_parent_nodes_kernel(
-    Q_ptr, K_ptr, V_ptr, Out_ptr,
-    # Strides
+def build_parent_self_attention_kernel(
+    Q_ptr,              # Parent Query [B, P, H, D]
+    Kp_ptr, Vp_ptr,     # Parent Key/Value (Self) [B, P, H, D]
+    Kc_ptr, Vc_ptr,     # Child Key/Value (Children) [B, 2*P, H, D]
+    Out_ptr,            # Output [B, P, H, D]
+    # Strides (Q - Parent Query)
     sq_b, sq_n, sq_h, sq_d,
-    sk_b, sk_n, sk_h, sk_d,
+    # Strides (Kp/Vp - Parent Self)
+    skp_b, skp_n, skp_h, skp_d,
+    # Strides (Kc/Vc - Children)
+    skc_b, skc_n, skc_h, skc_d,
+    # Strides (Out)
     so_b, so_n, so_h, so_d,
     # Constants
     sm_scale,
     H: tl.constexpr,
-    BLOCK_H: tl.constexpr,  # <--- NEW: Power of 2 Size
+    BLOCK_H: tl.constexpr, 
     D: tl.constexpr,
     BLOCK_SIZE: tl.constexpr
 ):
@@ -27,115 +39,150 @@ def build_parent_nodes_kernel(
     b_idx = tl.program_id(1)
     
     # -----------------------------------------------------------
-    # 1. Grid & Indices (FIXED)
+    # 1. Grid & Indices
     # -----------------------------------------------------------
-    # Create range of size 16 (if H=12)
     offs_h = tl.arange(0, BLOCK_H)
-    # Create a mask to ignore indices 12, 13, 14, 15
     mask_h = offs_h < H
 
     # -----------------------------------------------------------
-    # 2. Base Pointers
+    # 2. Base Pointers Setup
     # -----------------------------------------------------------
+    # Parent (Self) pointers
     q_base_ptr = Q_ptr + (b_idx * sq_b) + (node_idx * sq_n)
+    kp_base_ptr = Kp_ptr + (b_idx * skp_b) + (node_idx * skp_n)
+    
+    # Child pointers (2 children per parent)
     child0_idx = 2 * node_idx
     child1_idx = 2 * node_idx + 1
     
-    k0_base_ptr = K_ptr + (b_idx * sk_b) + (child0_idx * sk_n)
-    k1_base_ptr = K_ptr + (b_idx * sk_b) + (child1_idx * sk_n)
+    kc0_base_ptr = Kc_ptr + (b_idx * skc_b) + (child0_idx * skc_n)
+    kc1_base_ptr = Kc_ptr + (b_idx * skc_b) + (child1_idx * skc_n)
     
     # -----------------------------------------------------------
-    # 3. Compute Scores
+    # 3. Compute Scores (3-Way: Self, Left, Right)
     # -----------------------------------------------------------
-    # Accumulators must be size [BLOCK_H]
-    score0 = tl.zeros([BLOCK_H], dtype=tl.float32)
-    score1 = tl.zeros([BLOCK_H], dtype=tl.float32)
+    # Accumulators
+    score_self = tl.zeros([BLOCK_H], dtype=tl.float32)
+    score_c0   = tl.zeros([BLOCK_H], dtype=tl.float32)
+    score_c1   = tl.zeros([BLOCK_H], dtype=tl.float32)
 
     for off_d in range(0, D, BLOCK_SIZE):
         offs_d = off_d + tl.arange(0, BLOCK_SIZE)
         mask_d = offs_d < D
         
-        # Combined Mask: (Valid Head) AND (Valid Dim)
         mask_load = mask_h[:, None] & mask_d[None, :]
         
+        # Load Q
         ptr_q = q_base_ptr + (offs_h[:, None] * sq_h) + (offs_d[None, :] * sq_d)
-        ptr_k0 = k0_base_ptr + (offs_h[:, None] * sk_h) + (offs_d[None, :] * sk_d)
-        ptr_k1 = k1_base_ptr + (offs_h[:, None] * sk_h) + (offs_d[None, :] * sk_d)
-        
         q = tl.load(ptr_q, mask=mask_load, other=0.0)
-        k0 = tl.load(ptr_k0, mask=mask_load, other=0.0)
-        k1 = tl.load(ptr_k1, mask=mask_load, other=0.0)
         
-        score0 += tl.sum(q * k0, axis=1)
-        score1 += tl.sum(q * k1, axis=1)
+        # Load K (Self)
+        ptr_kp = kp_base_ptr + (offs_h[:, None] * skp_h) + (offs_d[None, :] * skp_d)
+        kp = tl.load(ptr_kp, mask=mask_load, other=0.0)
+
+        # Load K (Children)
+        ptr_kc0 = kc0_base_ptr + (offs_h[:, None] * skc_h) + (offs_d[None, :] * skc_d)
+        ptr_kc1 = kc1_base_ptr + (offs_h[:, None] * skc_h) + (offs_d[None, :] * skc_d)
+        kc0 = tl.load(ptr_kc0, mask=mask_load, other=0.0)
+        kc1 = tl.load(ptr_kc1, mask=mask_load, other=0.0)
+        
+        # Accumulate Dot Products
+        score_self += tl.sum(q * kp, axis=1)
+        score_c0   += tl.sum(q * kc0, axis=1)
+        score_c1   += tl.sum(q * kc1, axis=1)
 
     # -----------------------------------------------------------
-    # 4. Softmax
+    # 4. Softmax (over 3 elements)
     # -----------------------------------------------------------
-    score0 = score0 * sm_scale
-    score1 = score1 * sm_scale
+    score_self = score_self * sm_scale
+    score_c0   = score_c0 * sm_scale
+    score_c1   = score_c1 * sm_scale
+
+    # Find Max for numerical stability
+    max_score = tl.maximum(score_self, tl.maximum(score_c0, score_c1))
     
-    # Note: We don't mask score calculations because masked values are 0.0,
-    # which results in valid but irrelevant softmax outputs. 
-    # The crucial part is masking the STORE later.
+    exp_self = tl.exp(score_self - max_score)
+    exp_c0   = tl.exp(score_c0 - max_score)
+    exp_c1   = tl.exp(score_c1 - max_score)
     
-    max_score = tl.maximum(score0, score1)
-    exp0 = tl.exp(score0 - max_score)
-    exp1 = tl.exp(score1 - max_score)
-    denom = exp0 + exp1 + 1e-9
+    denom = exp_self + exp_c0 + exp_c1 + 1e-9
     
-    w0 = exp0 / denom 
-    w1 = exp1 / denom 
+    w_self = exp_self / denom
+    w_c0   = exp_c0 / denom
+    w_c1   = exp_c1 / denom
 
     # -----------------------------------------------------------
     # 5. Weighted Sum & Store
     # -----------------------------------------------------------
     out_base_ptr = Out_ptr + (b_idx * so_b) + (node_idx * so_n)
-    v0_base_ptr = V_ptr + (b_idx * sk_b) + (child0_idx * sk_n)
-    v1_base_ptr = V_ptr + (b_idx * sk_b) + (child1_idx * sk_n)
+    vp_base_ptr = Vp_ptr + (b_idx * skp_b) + (node_idx * skp_n)
+    
+    # Values for children need separate base pointers (re-using child indices)
+    # Assuming Vc follows same indexing logic as Kc
+    vc0_base_ptr = Vc_ptr + (b_idx * skc_b) + (child0_idx * skc_n)
+    vc1_base_ptr = Vc_ptr + (b_idx * skc_b) + (child1_idx * skc_n)
 
     for off_d in range(0, D, BLOCK_SIZE):
         offs_d = off_d + tl.arange(0, BLOCK_SIZE)
         mask_d = offs_d < D
-        
-        # Combined Mask
         mask_op = mask_h[:, None] & mask_d[None, :]
         
-        ptr_v0 = v0_base_ptr + (offs_h[:, None] * sk_h) + (offs_d[None, :] * sk_d)
-        ptr_v1 = v1_base_ptr + (offs_h[:, None] * sk_h) + (offs_d[None, :] * sk_d)
+        # Calculate Pointers for V
+        ptr_vp  = vp_base_ptr  + (offs_h[:, None] * skp_h) + (offs_d[None, :] * skp_d)
+        ptr_vc0 = vc0_base_ptr + (offs_h[:, None] * skc_h) + (offs_d[None, :] * skc_d)
+        ptr_vc1 = vc1_base_ptr + (offs_h[:, None] * skc_h) + (offs_d[None, :] * skc_d)
         ptr_out = out_base_ptr + (offs_h[:, None] * so_h) + (offs_d[None, :] * so_d)
         
-        v0 = tl.load(ptr_v0, mask=mask_op, other=0.0)
-        v1 = tl.load(ptr_v1, mask=mask_op, other=0.0)
+        vp  = tl.load(ptr_vp, mask=mask_op, other=0.0)
+        vc0 = tl.load(ptr_vc0, mask=mask_op, other=0.0)
+        vc1 = tl.load(ptr_vc1, mask=mask_op, other=0.0)
         
-        out_val = w0[:, None] * v0 + w1[:, None] * v1
+        # Weighted Sum: w_self*Vp + w_c0*Vc0 + w_c1*Vc1
+        out_val = (w_self[:, None] * vp) + (w_c0[:, None] * vc0) + (w_c1[:, None] * vc1)
         
-        # CRITICAL: Mask the store so we don't write to invalid memory
         tl.store(ptr_out, out_val, mask=mask_op)
 
 # ------------------------------------------------------------------
-#                   Python Wrapper
+#                    Python Wrapper
 # ------------------------------------------------------------------
-def build_parent_nodes(Q, K, V):
+def build_parent_nodes(Q_p, K_p, V_p, K_c, V_c):
     """
-    Q: [B, Parent_Count, H, D]
-    K: [B, Child_Count, H, D]
-    V: [B, Child_Count, H, D]
-    Returns: [B, Parent_Count, H, D]
+    Computes Parent-Self Attention using Triton.
+    
+    Inputs:
+      Q_p, K_p, V_p: [B, Parent_Count, H, D] (The parents)
+      K_c, V_c:      [B, Child_Count, H, D]  (The children)
+      
+    Note: Child_Count must equal 2 * Parent_Count
     """
-    # Check shapes
-    B, P, H, D = Q.shape
-    Out = torch.empty_like(Q)
+    B, P, H, D = Q_p.shape
+    C = K_c.shape[1]
+    assert C == 2 * P, f"Child count {C} must be 2x Parent count {P}"
+    
+    Out = torch.empty_like(Q_p)
+    
     grid = (P, B)
-
     BLOCK_H = triton.next_power_of_2(H)
     BLOCK_SIZE = triton.next_power_of_2(D)
 
-    build_parent_nodes_kernel[grid](
-        Q, K, V, Out,
-        Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
-        K.stride(0), K.stride(1), K.stride(2), K.stride(3),
+    # We assume V has same strides as K for simplicity in python args, 
+    # but pass them explicitly if your memory layout is weird.
+    
+    build_parent_self_attention_kernel[grid](
+        # Pointers
+        Q_p, 
+        K_p, V_p, 
+        K_c, V_c, 
+        Out,
+        # Strides Q
+        Q_p.stride(0), Q_p.stride(1), Q_p.stride(2), Q_p.stride(3),
+        # Strides Parent K/V (Assuming K_p and V_p share layout or are contiguous)
+        K_p.stride(0), K_p.stride(1), K_p.stride(2), K_p.stride(3),
+        # Strides Child K/V
+        K_c.stride(0), K_c.stride(1), K_c.stride(2), K_c.stride(3),
+        # Strides Out
         Out.stride(0), Out.stride(1), Out.stride(2), Out.stride(3),
+        # Constants
         sm_scale=1.0 / math.sqrt(D),
         H=H,
         BLOCK_H=BLOCK_H,
@@ -143,6 +190,7 @@ def build_parent_nodes(Q, K, V):
         BLOCK_SIZE=BLOCK_SIZE,
         num_warps=4
     )
+    
     return Out
 
 
@@ -583,86 +631,94 @@ class HierarchicalSparseAttention(nn.Module):
 
     def cross_update_Y(self, x, y_in):
         """
-        Optimized bottom-up update.
-        1. Projects all Queries at once.
-        2. Replaces O(N^2) masked attention with O(N) pair-wise reduction.
+        Architecture: Recursive Parent-Self Attention.
+        
+        Logic:
+            Pool = [Parent_Old, Child_Left, Child_Right]
+            Query = Parent_Old
+            Output = Attention(Q, K=Pool, V=Pool)
+           
+        This allows the parent to selectively 'read' from itself or its children.
         """
         B, N, D = x.shape
         H, Dh = self.num_heads, self.head_dim
-        
-        assert y_in is not None, "y_in cannot be None"
-        assert y_in.size(1) > 0, "y_in must have valid tokens"
+        assert y_in is not None
 
         if self.sizes is None: self.sizes, self.offsets = self.build_level_info(N)
 
-        # OPTIMIZATION 1: Global Query Projection
-        # Project all Y tokens at once to avoid small GEMMs inside the loop
-        # y_in: [B, Total_Nodes, D] -> Q_all: [B, H, Total_Nodes, Dh]
-        Q_all = self.Wq_y(y_in).view(B, -1, H, Dh).transpose(1, 2)
+        # -------------------------------------------------------
+        # OPTIMIZATION: Global Parent Projection
+        # -------------------------------------------------------
+        # Since y_in is static, we project ALL parents at once outside the loop.
+        # This saves massive compute compared to projecting inside the loop.
+        
+        # Q_parents: The parent acts as the Query
+        Q_p_all = self.Wq_y(y_in).view(B, -1, H, Dh)
+        
+        # K_p_all, V_p_all: The parent also acts as a Key/Value (Target for attending to self)
+        K_p_all = self.Wk_y(y_in).view(B, -1, H, Dh)
+        V_p_all = self.Wv_y(y_in).view(B, -1, H, Dh)
         
         new_Y_levels = []
-        prev_sources = x # Starts as the leaves
-        
+        prev_sources = x 
+
         for level, parent_count in enumerate(self.sizes):
-            offset = self.offsets[level]
-
-            # 1. Get Queries for this level (Slicing is free)
-            # [B, H, Parent_Count, Dh]
-            Q = Q_all[:, :, offset : offset + parent_count, :]
-            
-            # 2. Prepare Children (Keys/Values)
-            # The topology is strictly binary: Parent i connects to Child 2i and 2i+1.
-            # If prev_sources has odd length, the last token is ignored (per your original mask logic).
-            # We truncate to ensure strictly even pairs.
+            # 1. Prepare Children
             useful_len = parent_count * 2
-            children_in = prev_sources[:, :useful_len, :]
+            children = prev_sources[:, :useful_len, :] 
             
-            # Project K and V
-            # Note: We must project here because prev_sources changes every iteration
-            # [B, Useful_Len, H, Dh] -> [B, H, Useful_Len, Dh]
-            K = self.Wk_y(children_in).view(B, -1, H, Dh).transpose(1, 2)
-            V = self.Wv_y(children_in).view(B, -1, H, Dh).transpose(1, 2)
-            V = self.dropout(V)
+            # Project Children (Must be done in loop as prev_sources changes)
+            # [B, 2*P, H, Dh]
+            K_c = self.Wk_y(children).view(B, -1, H, Dh)
+            V_c = self.Wv_y(children).view(B, -1, H, Dh)
+            V_c = self.dropout(V_c)
 
-            # OPTIMIZATION 2: Reshape & Reduce (The "Tree Attention")
-            # Instead of Attn(Parent, Child) with a mask, we reshape Child to (Parent, 2)
-            # Shape changes: [B, H, 2*P, D] -> [B, H, P, 2, D]
-            K_pairs = K.view(B, H, parent_count, 2, Dh)
-            V_pairs = V.view(B, H, parent_count, 2, Dh)
+            # 2. Reshape Children to Pairs [B, P, 2, H, Dh]
+            K_c_pairs = K_c.view(B, parent_count, 2, H, Dh)
+            V_c_pairs = V_c.view(B, parent_count, 2, H, Dh)
+
+            # 3. Slice Parents for this Level [B, P, H, Dh]
+            offset = self.offsets[level]
+            Q_p = Q_p_all[:, offset : offset + parent_count, :, :]
+            K_p = K_p_all[:, offset : offset + parent_count, :, :]
+            V_p = V_p_all[:, offset : offset + parent_count, :, :]
+
+            # 4. Form the Attention Pool: [Parent, Child_L, Child_R]
+            # K shape: [B, P, 3, H, Dh]
+            # We unsqueeze Parent to [B, P, 1, H, Dh] to stack
+            K_pool = torch.cat([K_p.unsqueeze(2), K_c_pairs], dim=2)
+            V_pool = torch.cat([V_p.unsqueeze(2), V_c_pairs], dim=2)
+
+            # 5. Compute Attention Scores
+            # Q: [B, P, H, Dh] -> [B, P, H, 1, Dh]
+            # K: [B, P, 3, H, Dh] -> [B, P, H, Dh, 3] (Permute for dot product)
             
-            # Q shape: [B, H, P, D] -> [B, H, P, 1, D] for broadcast
-            Q_expanded = Q.unsqueeze(3)
-
-            # Compute Scores: Dot product between Parent and its 2 Children
-            # [B, H, P, 1, D] * [B, H, P, 2, D] -> sum(D) -> [B, H, P, 2]
-            attn_logits = torch.sum(Q_expanded * K_pairs, dim=-1) / math.sqrt(Dh)
+            q_vec = Q_p.unsqueeze(2).transpose(2, 3) # [B, P, H, 1, Dh]
+            k_vec = K_pool.permute(0, 1, 3, 4, 2)    # [B, P, H, Dh, 3]
             
-            # Softmax over the 2 children
-            # attn_weights = F.softmax(attn_logits, dim=-1) # [B, H, P, 2]
-
-            # ---- SAFE SOFTMAX (size=2) ----
-            max_logits = attn_logits.max(dim=-1, keepdim=True).values
-            exp_logits = torch.exp(attn_logits - max_logits)
-            denom = exp_logits.sum(dim=-1, keepdim=True) + 1e-9
-            attn_weights = exp_logits / denom  # [B, H, P, 2]
-     
-            # Weighted Sum
-            # Weights: [B, H, P, 2, 1] (unsqueeze for broadcast)
-            # V_pairs: [B, H, P, 2, D]
-            # Result:  sum(dim 2) -> [B, H, P, D]
-            updated = torch.sum(attn_weights.unsqueeze(-1) * V_pairs, dim=3)
-
-            # Merge Heads
-            updated_merged = updated.transpose(1, 2).reshape(B, parent_count, D)
+            # Dot Product: [B, P, H, 1, 3]
+            # Result is 3 scores per head: [Score_Self, Score_Left, Score_Right]
+            logits = torch.matmul(q_vec, k_vec) / math.sqrt(Dh)
             
-            new_Y_levels.append(updated_merged)
-            prev_sources = updated_merged
+            weights = F.softmax(logits, dim=-1) # [B, P, H, 1, 3]
+            # weights = self.dropout(weights)
 
-        # Concatenate and Project
-        Y_new = torch.cat(new_Y_levels, dim=1)
-        Y_new = self.out_proj_y(Y_new)
-        
-        return Y_new
+            # 6. Weighted Sum
+            # V_pool: [B, P, 3, H, Dh] -> [B, P, H, 3, Dh] (Permute to match weights)
+            v_vec = V_pool.permute(0, 1, 3, 2, 4)
+            
+            # [B, P, H, 1, 3] * [B, P, H, 3, Dh] -> [B, P, H, 1, Dh]
+            attn_out = torch.matmul(weights, v_vec)
+            
+            # 7. Merge Heads
+            # Remove the '1' dim, transpose back
+            # [B, P, H, 1, Dh] -> [B, P, H, Dh] -> [B, P, D]
+            attn_out = attn_out.squeeze(3).transpose(2, 3).reshape(B, parent_count, D)
+            
+            new_Y_levels.append(attn_out)
+            prev_sources = attn_out
+
+        return self.out_proj_y(torch.cat(new_Y_levels, dim=1))
 
     def update_X_from_Y(self, x, y, mask=None):
 
@@ -856,13 +912,19 @@ class HierarchicalSparseAttentionTriton(nn.Module):
             offsets.append(offsets[-1] + s)
         return sizes, offsets
 
-    def cross_update_Y(self, x, y_in):
+    def cross_update_Y_Triton(self, x, y_in):
         """
-        Optimized bottom-up update using Triton Kernel.
+        Optimized bottom-up update using Triton Kernel with Parent-Self Attention.
         
+        Logic:
+          - Pool = [Parent (Self), Child_Left, Child_Right]
+          - Q = Parent
+          - K, V = Pool
+          
         Key Optimization:
-        - Uses [Batch, Node, Head, Dim] layout to avoid transposes.
-        - Replaces the O(N) loop of reshaping/masking with a single fused kernel.
+          - Global projection of all Parents (Q, K, V) at once.
+          - Single fused kernel handles the 3-way attention and reduction.
+          - Maintains [Batch, Node, Head, Dim] layout to avoid transposes.
         """
         B, N, D = x.shape
         H, Dh = self.num_heads, self.head_dim
@@ -873,51 +935,55 @@ class HierarchicalSparseAttentionTriton(nn.Module):
         if self.sizes is None: self.sizes, self.offsets = self.build_level_info(N)
 
         # -------------------------------------------------------
-        # OPTIMIZATION 1: Global Query Projection (Layout Adjusted)
+        # OPTIMIZATION 1: Global Parent Projection
         # -------------------------------------------------------
-        # We project all Y tokens at once. 
-        # CRITICAL: We DO NOT transpose to [B, H, N, D]. 
-        # We keep it as [B, N, H, D] which is the native Linear output.
-        # This matches the stride logic of our new Triton kernel perfectly.
-        Q_all = self.Wq_y(y_in).view(B, -1, H, Dh) 
+        # We project ALL parents at once for Q, K, and V.
+        # This allows the parent to attend to itself (Parent-Self Attention).
+        # Layout: [B, Total_Parents, H, Dh] (Native Linear output, no transpose)
+        Q_p_all = self.Wq_y(y_in).view(B, -1, H, Dh)
+        K_p_all = self.Wk_y(y_in).view(B, -1, H, Dh)
+        V_p_all = self.Wv_y(y_in).view(B, -1, H, Dh)
         
         new_Y_levels = []
-        prev_sources = x # Starts as the leaves
+        prev_sources = x # Starts as the leaves (first layer children)
         
         for level, parent_count in enumerate(self.sizes):
             offset = self.offsets[level]
 
             # ---------------------------------------------------
-            # 1. Prepare Inputs (Zero-Copy Slicing)
+            # 1. Prepare Parents (Slicing)
             # ---------------------------------------------------
-            # Slice Q for this level. Shape: [B, Parent_Count, H, Dh]
-            Q = Q_all[:, offset : offset + parent_count, :, :]
+            # Slice Q, K, V for this specific level's parents
+            # Shape: [B, Parent_Count, H, Dh]
+            Q_p = Q_p_all[:, offset : offset + parent_count, :, :]
+            K_p = K_p_all[:, offset : offset + parent_count, :, :]
+            V_p = V_p_all[:, offset : offset + parent_count, :, :]
             
-            # Prepare Children (Keys/Values)
+            # ---------------------------------------------------
+            # 2. Prepare Children (Projection)
+            # ---------------------------------------------------
             useful_len = parent_count * 2
             # Slice strictly to useful length to ensure even pairs
             children_in = prev_sources[:, :useful_len, :]
             
-            # Project K and V
-            # Shape: [B, Child_Count, H, Dh]
-            # Again, NO transpose. We keep the native [B, N, H, D] layout.
-            K = self.Wk_y(children_in).view(B, -1, H, Dh)
-            V = self.Wv_y(children_in).view(B, -1, H, Dh)
-            V = self.dropout(V)
+            # Project Children Keys/Values (Must be done in loop as prev_sources changes)
+            # Shape: [B, 2*P, H, Dh]
+            K_c = self.Wk_y(children_in).view(B, -1, H, Dh)
+            V_c = self.Wv_y(children_in).view(B, -1, H, Dh)
+            V_c = self.dropout(V_c)
 
             # ---------------------------------------------------
-            # 2. Triton Kernel (Fused Reduction)
+            # 3. Triton Kernel (3-Way Attention)
             # ---------------------------------------------------
-            # Replaces: Reshape -> Dot -> Softmax -> Weighted Sum -> Reshape
-            # The kernel natively handles the tree structure (2 children -> 1 parent)
-            # Input:  [B, 2*P, H, D] (Children)
-            # Output: [B, P, H, D]   (Parents)
-            updated_heads = build_parent_nodes(Q, K, V)
+            # Replaces: Reshape -> Cat -> Dot -> Softmax -> Weighted Sum
+            # Input:  Parents (Q,K,V) and Children (K,V)
+            # Output: Updated Parents [B, P, H, Dh]
+            updated_heads = build_parent_nodes(Q_p, K_p, V_p, K_c, V_c)
 
             # ---------------------------------------------------
-            # 3. Merge Heads
+            # 4. Merge Heads
             # ---------------------------------------------------
-            # [B, P, H, Dh] -> [B, P, H*Dh] (i.e., [B, P, D])
+            # [B, P, H, Dh] -> [B, P, D]
             updated_merged = updated_heads.reshape(B, parent_count, D)
             
             new_Y_levels.append(updated_merged)
