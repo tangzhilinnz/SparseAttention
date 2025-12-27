@@ -318,7 +318,7 @@ class HierarchicalSparseAttention(nn.Module):
             offsets.append(offsets[-1] + s)
         return sizes, offsets
 
-        def cross_update_Y(self, x, y_in):
+    def cross_update_Y(self, x, y_in):
         """
         Architecture: Recursive Parent-Self Attention.
         
