@@ -632,7 +632,9 @@ class HierarchicalSparseAttention(nn.Module):
     def cross_update_Y(self, x, y_in):
         """
         Architecture: Recursive Parent-Self Attention.
-        FIXED: Removed incorrect transpose(2, 3) to match Standard Attention layout.
+        
+        Refactored Layout: (Batch, Heads, Sequence, Head_Dim) aka (B, H, N, Dh).
+        This matches standard PyTorch MultiheadAttention implementation details.
         """
         B, N, D = x.shape
         H, Dh = self.num_heads, self.head_dim
@@ -640,53 +642,86 @@ class HierarchicalSparseAttention(nn.Module):
 
         if self.sizes is None: self.sizes, self.offsets = self.build_level_info(N)
 
-        # Global Parent Projection
-        Q_p_all = self.Wq_y(y_in).view(B, -1, H, Dh)
-        K_p_all = self.Wk_y(y_in).view(B, -1, H, Dh)
-        V_p_all = self.Wv_y(y_in).view(B, -1, H, Dh)
+        # -------------------------------------------------------
+        # OPTIMIZATION: Global Parent Projection (Standard Layout)
+        # -------------------------------------------------------
+        # Input: (B, Total_Parents, D)
+        # 1. Project -> (B, Total_Parents, H, Dh)
+        # 2. Transpose -> (B, H, Total_Parents, Dh)
+        Q_p_all = self.Wq_y(y_in).view(B, -1, H, Dh).transpose(1, 2)
+        K_p_all = self.Wk_y(y_in).view(B, -1, H, Dh).transpose(1, 2)
+        V_p_all = self.Wv_y(y_in).view(B, -1, H, Dh).transpose(1, 2)
         
         new_Y_levels = []
         prev_sources = x 
 
         for level, parent_count in enumerate(self.sizes):
+            # ---------------------------------------------------
             # 1. Prepare Children
+            # ---------------------------------------------------
             useful_len = parent_count * 2
             children = prev_sources[:, :useful_len, :] 
             
-            K_c = self.Wk_y(children).view(B, -1, H, Dh)
-            V_c = self.Wv_y(children).view(B, -1, H, Dh)
+            # Project Children -> (B, H, 2*P, Dh)
+            K_c = self.Wk_y(children).view(B, -1, H, Dh).transpose(1, 2)
+            V_c = self.Wv_y(children).view(B, -1, H, Dh).transpose(1, 2)
             V_c = self.dropout(V_c)
 
+            # ---------------------------------------------------
             # 2. Reshape Children to Pairs
-            K_c_pairs = K_c.view(B, parent_count, 2, H, Dh)
-            V_c_pairs = V_c.view(B, parent_count, 2, H, Dh)
+            # ---------------------------------------------------
+            # Current: (B, H, 2*P, Dh)
+            # Target:  (B, H, P, 2, Dh)  <-- Group pairs together
+            K_c_pairs = K_c.view(B, H, parent_count, 2, Dh)
+            V_c_pairs = V_c.view(B, H, parent_count, 2, Dh)
 
+            # ---------------------------------------------------
             # 3. Slice Parents
+            # ---------------------------------------------------
+            # Current: (B, H, Total_Parents, Dh)
+            # Target:  (B, H, P, Dh)
             offset = self.offsets[level]
-            Q_p = Q_p_all[:, offset : offset + parent_count, :, :]
-            K_p = K_p_all[:, offset : offset + parent_count, :, :]
-            V_p = V_p_all[:, offset : offset + parent_count, :, :]
+            Q_p = Q_p_all[:, :, offset : offset + parent_count, :]
+            K_p = K_p_all[:, :, offset : offset + parent_count, :]
+            V_p = V_p_all[:, :, offset : offset + parent_count, :]
 
-            # 4. Form Pool
-            K_pool = torch.cat([K_p.unsqueeze(2), K_c_pairs], dim=2)
-            V_pool = torch.cat([V_p.unsqueeze(2), V_c_pairs], dim=2)
+            # ---------------------------------------------------
+            # 4. Form Attention Pool
+            # ---------------------------------------------------
+            # Parent (Self) needs to be unsqueezed to match Child pairs structure
+            # K_p: (B, H, P, Dh) -> (B, H, P, 1, Dh)
+            # Pool: Concat along the 'pair' dim -> (B, H, P, 3, Dh)
+            # Pool Order: [Parent(Self), Child_Left, Child_Right]
+            K_pool = torch.cat([K_p.unsqueeze(3), K_c_pairs], dim=3)
+            V_pool = torch.cat([V_p.unsqueeze(3), V_c_pairs], dim=3)
 
+            # ---------------------------------------------------
             # 5. Attention Scores
-            q_vec = Q_p.unsqueeze(2).transpose(2, 3) # [B, P, H, 1, Dh]
-            k_vec = K_pool.permute(0, 1, 3, 4, 2)    # [B, P, H, Dh, 3]
+            # ---------------------------------------------------
+            # Q: (B, H, P, Dh) -> (B, H, P, 1, Dh)
+            # K_pool: (B, H, P, 3, Dh) -> Transpose to (B, H, P, Dh, 3)
             
-            logits = torch.matmul(q_vec, k_vec) / math.sqrt(Dh)
-            weights = F.softmax(logits, dim=-1)
+            # Matmul: (B,H,P,1,Dh) @ (B,H,P,Dh,3) -> (B, H, P, 1, 3)
+            # This computes 3 scores per parent: Self, Left, Right
+            logits = torch.matmul(Q_p.unsqueeze(3), K_pool.transpose(-1, -2))
+            logits = logits / math.sqrt(Dh)
+            
+            weights = F.softmax(logits, dim=-1) # (B, H, P, 1, 3)
 
+            # ---------------------------------------------------
             # 6. Weighted Sum
-            v_vec = V_pool.permute(0, 1, 3, 2, 4)
-            attn_out = torch.matmul(weights, v_vec) # [B, P, H, 1, Dh]
+            # ---------------------------------------------------
+            # V_pool: (B, H, P, 3, Dh)
+            # Matmul: (B,H,P,1,3) @ (B,H,P,3,Dh) -> (B, H, P, 1, Dh)
+            attn_out = torch.matmul(weights, V_pool)
             
-            # 7. Merge Heads (FIXED)
-            # We simply squeeze the '1' dim. 
-            # Layout is now [B, P, H, Dh]. 
-            # We reshape to [B, P, H*Dh] directly.
-            attn_out = attn_out.squeeze(3).reshape(B, parent_count, D)
+            # ---------------------------------------------------
+            # 7. Merge Heads
+            # ---------------------------------------------------
+            # 1. Squeeze the '1' dim: (B, H, P, Dh)
+            # 2. Transpose back to Sequence First: (B, P, H, Dh)
+            # 3. Flatten/Reshape: (B, P, D)
+            attn_out = attn_out.squeeze(3).transpose(1, 2).contiguous().reshape(B, parent_count, D)
             
             new_Y_levels.append(attn_out)
             prev_sources = attn_out
