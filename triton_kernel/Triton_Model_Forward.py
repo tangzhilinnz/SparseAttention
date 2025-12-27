@@ -11,21 +11,30 @@ import triton
 import triton.language as tl
 import math
 
+import torch
+import triton
+import triton.language as tl
+import math
+
 # ------------------------------------------------------------------
 #                    Triton Kernel
 # ------------------------------------------------------------------
 @triton.jit
 def build_parent_self_attention_kernel(
-    Q_ptr,              # Parent Query [B, P, H, D]
-    Kp_ptr, Vp_ptr,     # Parent Key/Value (Self) [B, P, H, D]
-    Kc_ptr, Vc_ptr,     # Child Key/Value (Children) [B, 2*P, H, D]
-    Out_ptr,            # Output [B, P, H, D]
+    Q_ptr,              # Parent Query
+    Kp_ptr, Vp_ptr,     # Parent Key/Value (Self)
+    Kc_ptr, Vc_ptr,     # Child Key/Value (Children)
+    Out_ptr,            # Output
     # Strides (Q - Parent Query)
     sq_b, sq_n, sq_h, sq_d,
-    # Strides (Kp/Vp - Parent Self)
+    # Strides (Kp) - Parent Key
     skp_b, skp_n, skp_h, skp_d,
-    # Strides (Kc/Vc - Children)
+    # Strides (Vp) - Parent Value
+    svp_b, svp_n, svp_h, svp_d,
+    # Strides (Kc) - Child Key
     skc_b, skc_n, skc_h, skc_d,
+    # Strides (Vc) - Child Value
+    svc_b, svc_n, svc_h, svc_d,
     # Strides (Out)
     so_b, so_n, so_h, so_d,
     # Constants
@@ -48,7 +57,7 @@ def build_parent_self_attention_kernel(
     # 2. Base Pointers Setup
     # -----------------------------------------------------------
     # Parent (Self) pointers
-    q_base_ptr = Q_ptr + (b_idx * sq_b) + (node_idx * sq_n)
+    q_base_ptr  = Q_ptr  + (b_idx * sq_b)  + (node_idx * sq_n)
     kp_base_ptr = Kp_ptr + (b_idx * skp_b) + (node_idx * skp_n)
     
     # Child pointers (2 children per parent)
@@ -98,7 +107,12 @@ def build_parent_self_attention_kernel(
     score_c0   = score_c0 * sm_scale
     score_c1   = score_c1 * sm_scale
 
-    # Find Max for numerical stability
+    # Mask out padded heads to -inf so they don't affect softmax
+    score_self = tl.where(mask_h, score_self, -float('inf'))
+    score_c0   = tl.where(mask_h, score_c0,   -float('inf'))
+    score_c1   = tl.where(mask_h, score_c1,   -float('inf'))
+
+    # Numerical stability
     max_score = tl.maximum(score_self, tl.maximum(score_c0, score_c1))
     
     exp_self = tl.exp(score_self - max_score)
@@ -115,12 +129,11 @@ def build_parent_self_attention_kernel(
     # 5. Weighted Sum & Store
     # -----------------------------------------------------------
     out_base_ptr = Out_ptr + (b_idx * so_b) + (node_idx * so_n)
-    vp_base_ptr = Vp_ptr + (b_idx * skp_b) + (node_idx * skp_n)
     
-    # Values for children need separate base pointers (re-using child indices)
-    # Assuming Vc follows same indexing logic as Kc
-    vc0_base_ptr = Vc_ptr + (b_idx * skc_b) + (child0_idx * skc_n)
-    vc1_base_ptr = Vc_ptr + (b_idx * skc_b) + (child1_idx * skc_n)
+    # Base pointers for Values
+    vp_base_ptr  = Vp_ptr + (b_idx * svp_b) + (node_idx * svp_n)
+    vc0_base_ptr = Vc_ptr + (b_idx * svc_b) + (child0_idx * svc_n)
+    vc1_base_ptr = Vc_ptr + (b_idx * svc_b) + (child1_idx * svc_n)
 
     for off_d in range(0, D, BLOCK_SIZE):
         offs_d = off_d + tl.arange(0, BLOCK_SIZE)
@@ -128,9 +141,9 @@ def build_parent_self_attention_kernel(
         mask_op = mask_h[:, None] & mask_d[None, :]
         
         # Calculate Pointers for V
-        ptr_vp  = vp_base_ptr  + (offs_h[:, None] * skp_h) + (offs_d[None, :] * skp_d)
-        ptr_vc0 = vc0_base_ptr + (offs_h[:, None] * skc_h) + (offs_d[None, :] * skc_d)
-        ptr_vc1 = vc1_base_ptr + (offs_h[:, None] * skc_h) + (offs_d[None, :] * skc_d)
+        ptr_vp  = vp_base_ptr  + (offs_h[:, None] * svp_h) + (offs_d[None, :] * svp_d)
+        ptr_vc0 = vc0_base_ptr + (offs_h[:, None] * svc_h) + (offs_d[None, :] * svc_d)
+        ptr_vc1 = vc1_base_ptr + (offs_h[:, None] * svc_h) + (offs_d[None, :] * svc_d)
         ptr_out = out_base_ptr + (offs_h[:, None] * so_h) + (offs_d[None, :] * so_d)
         
         vp  = tl.load(ptr_vp, mask=mask_op, other=0.0)
@@ -141,6 +154,7 @@ def build_parent_self_attention_kernel(
         out_val = (w_self[:, None] * vp) + (w_c0[:, None] * vc0) + (w_c1[:, None] * vc1)
         
         tl.store(ptr_out, out_val, mask=mask_op)
+
 
 # ------------------------------------------------------------------
 #                    Python Wrapper
@@ -159,15 +173,23 @@ def build_parent_nodes(Q_p, K_p, V_p, K_c, V_c):
     C = K_c.shape[1]
     assert C == 2 * P, f"Child count {C} must be 2x Parent count {P}"
     
+    # -----------------------------------------------------------------
+    # CRITICAL: Enforce Contiguity
+    # Triton kernels often read garbage if strides are passed from 
+    # non-contiguous views (which commonly happens after .view() or .slice())
+    # -----------------------------------------------------------------
+    if not Q_p.is_contiguous(): Q_p = Q_p.contiguous()
+    if not K_p.is_contiguous(): K_p = K_p.contiguous()
+    if not V_p.is_contiguous(): V_p = V_p.contiguous()
+    if not K_c.is_contiguous(): K_c = K_c.contiguous()
+    if not V_c.is_contiguous(): V_c = V_c.contiguous()
+
     Out = torch.empty_like(Q_p)
     
     grid = (P, B)
     BLOCK_H = triton.next_power_of_2(H)
     BLOCK_SIZE = triton.next_power_of_2(D)
 
-    # We assume V has same strides as K for simplicity in python args, 
-    # but pass them explicitly if your memory layout is weird.
-    
     build_parent_self_attention_kernel[grid](
         # Pointers
         Q_p, 
@@ -176,10 +198,14 @@ def build_parent_nodes(Q_p, K_p, V_p, K_c, V_c):
         Out,
         # Strides Q
         Q_p.stride(0), Q_p.stride(1), Q_p.stride(2), Q_p.stride(3),
-        # Strides Parent K/V (Assuming K_p and V_p share layout or are contiguous)
+        # Strides Parent K
         K_p.stride(0), K_p.stride(1), K_p.stride(2), K_p.stride(3),
-        # Strides Child K/V
+        # Strides Parent V
+        V_p.stride(0), V_p.stride(1), V_p.stride(2), V_p.stride(3),
+        # Strides Child K
         K_c.stride(0), K_c.stride(1), K_c.stride(2), K_c.stride(3),
+        # Strides Child V
+        V_c.stride(0), V_c.stride(1), V_c.stride(2), V_c.stride(3),
         # Strides Out
         Out.stride(0), Out.stride(1), Out.stride(2), Out.stride(3),
         # Constants
@@ -1403,8 +1429,8 @@ def run_transformer_benchmark():
     DROPOUT = 0.0 # As requested
     
     # Batch config
-    B = 64   # Reduced slightly from 16 to ensure safety on standard VRAM with 12 layers
-    SEQ_LEN = 2048
+    B = 1   # Reduced slightly from 16 to ensure safety on standard VRAM with 12 layers
+    SEQ_LEN = 2048 * 32
     
     print(f"\n{'='*60}")
     print(f" TRANSFORMER LM BENCHMARK (B={B}, L={SEQ_LEN}, Layers={NUM_LAYERS})")
