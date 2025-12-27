@@ -1138,16 +1138,16 @@ class DecoderLayer(nn.Module):
         
     def forward(self, x, y, mask=None, return_attention=False):
  
-        # 1. Update Y (Hierarchy) with Residual + Norm
-        # We use 'norm_y(y)' as input to be safe, similar to Pre-LN for x
-        y_norm = self.norm_y(y)
-        
-        # Calculate the update (delta)
-        y_delta = self.self_attn.cross_update_Y(x, y_in=y_norm)
-        
-        # Apply Residual Connection to Y
-        y_next = y + self.dropout(y_delta)
-
+        ## 1. Update Y (Hierarchy) with Residual + Norm
+        ## We use 'norm_y(y)' as input to be safe, similar to Pre-LN for x
+        #y_norm = self.norm_y(y)
+        #
+        ## Calculate the update (delta)
+        #y_delta = self.self_attn.cross_update_Y(x, y_in=y_norm)
+        #
+        ## Apply Residual Connection to Y
+        #y_next = y + self.dropout(y_delta)
+        y_next = y
     
         # PRE-LAYER NORMALIZATION (Apply Norm BEFORE Attention)
         # This significantly improves stability and convergence speed
