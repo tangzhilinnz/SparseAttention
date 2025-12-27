@@ -912,7 +912,7 @@ class HierarchicalSparseAttentionTriton(nn.Module):
             offsets.append(offsets[-1] + s)
         return sizes, offsets
 
-    def cross_update_Y_Triton(self, x, y_in):
+    def cross_update_Y(self, x, y_in):
         """
         Optimized bottom-up update using Triton Kernel with Parent-Self Attention.
         
