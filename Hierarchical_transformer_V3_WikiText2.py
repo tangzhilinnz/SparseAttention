@@ -441,6 +441,8 @@ class HierarchicalSparseAttention(nn.Module):
 
         if y is None: return x
 
+        y_norm = self.ln(y)
+
         # Concatenate inputs once to allow unified K/V calculation
         XY = torch.cat([x, y], dim=1)
 
