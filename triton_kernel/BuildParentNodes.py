@@ -173,7 +173,7 @@ def build_parent_nodes_backward_kernel(
 
         dp_self += tl.sum(vp * do, axis=1)
         dp_c0   += tl.sum(vc0 * do, axis=1)
-        dp_c1   -= tl.sum(vc1 * do, axis=1)
+        dp_c1   += tl.sum(vc1 * do, axis=1)
 
     # 3. Compute dS
     sum_w_dp = (w_self * dp_self) + (w_c0 * dp_c0) + (w_c1 * dp_c1)
@@ -774,8 +774,8 @@ def run_full_suite():
     print(f"{'='*60}")
 
     # Config: Larger size to stress GPU
-    #B, N, D, H = 16, 2048, 1024, 8
-    B, N, D, H = 16, 4096, 2048, 16 # Uncomment for even heavier load
+    B, N, D, H = 16, 2048, 1024, 8
+    #B, N, D, H = 16, 4096, 2048, 16 # Uncomment for even heavier load
 
     dtype = torch.float16 
     print(f"Config: B={B}, N={N}, D={D}, H={H}, dtype={dtype}")
