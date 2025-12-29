@@ -231,7 +231,7 @@ class BuildParentNodesFunc(torch.autograd.Function):
         assert K_c.shape[1] == 2 * P, "Child count mismatch"
         
         Out = torch.empty_like(Q_p)
-        Weights = torch.empty((B, P, H, 3), device=Q_p.device, dtype=torch.float32)
+        Weights = torch.empty((B, P, H, 3), device=Q_p.device, dtype=Q_p.dtype)
         
         grid = (P, B)
         BLOCK_H = triton.next_power_of_2(H)
@@ -788,7 +788,7 @@ def run_full_suite():
     print(f"{'='*60}")
 
     # Config: Massive scale
-    B, N, D, H = 16, 2024, 768, 12 
+    B, N, D, H = 32, 2024, 768, 12 
     # B, N, D, H = 16, 4096, 1024, 16 # Alternative config
 
     print(f"Config: B={B}, N={N}, D={D}, H={H}, dtype={dtype}")
