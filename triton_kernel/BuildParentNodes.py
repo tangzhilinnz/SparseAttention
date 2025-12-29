@@ -844,8 +844,8 @@ import triton
 import math
 from torch.profiler import profile, record_function, ProfilerActivity
 
-# [Insert your Model Class, Triton Kernels, and Wrappers here]
-# ... (Assuming HierarchicalSparseAttentionTriton and kernels are defined above) ...
+# [Insert your HierarchicalSparseAttentionTriton class, Triton Kernels, and Wrappers here]
+# ... (Assuming they are defined in the same file above this script) ...
 
 def run_full_suite():
     print(f"{'='*60}")
@@ -862,9 +862,15 @@ def run_full_suite():
     
     # 3. Create Inputs
     x = torch.randn(B, N, dim, device='cuda', dtype=torch.float32)
+    
+    # SANITY CHECK: Y must be N-1 for a binary tree
+    # Level 1 (N/2) + Level 2 (N/4) ... + Root (1) = N-1
     y = torch.randn(B, N - 1, dim, device='cuda', dtype=torch.float32)
     
     print(f"Input Shapes -> X: {x.shape}, Y: {y.shape}")
+    
+    # Explicit Sanity Check
+    assert y.shape[1] == N - 1, f"Sanity Check Failed: Y dim {y.shape[1]} != N-1 ({N-1})"
 
     # -------------------------------------------------
     # 4. Run PyTorch Reference Path (Gradients)
@@ -909,87 +915,108 @@ def run_full_suite():
         return # Stop if correctness fails
 
     # ==========================================================================
-    # 2. PERFORMANCE BENCHMARK (Large Scale)
+    # 2. PERFORMANCE BENCHMARK (Forward + Backward)
     # ==========================================================================
     print(f"\n{'='*60}")
-    print("2. SPEED BENCHMARK (Large Scale)")
+    print("2. SPEED BENCHMARK (Forward + Backward)")
     print(f"{'='*60}")
 
     # Config: Larger size to stress GPU
-    B, N, D, H = 16, 2048, 128, 8
-    # B, N, D, H = 16, 4096, 128, 16 # Uncomment for even heavier load
-    
-    dtype = torch.float16 # Benchmarking usually done in fp16
+    B, N, D, H = 16, 2048, 1024, 8
+    # B, N, D, H = 16, 4096, 2048, 16 # Uncomment for even heavier load
+
+    dtype = torch.float16 
     print(f"Config: B={B}, N={N}, D={D}, H={H}, dtype={dtype}")
 
     # Re-init model in fp16
     model = HierarchicalSparseAttentionTriton(dim=D, num_heads=H, dropout=0.0).to('cuda').to(dtype)
-    model.eval() # Disable dropout overhead for pure kernel speed
+    model.eval() # Disable dropout overhead to benchmark pure kernel speed
 
-    # Create large inputs
-    x = torch.randn(B, N, D, device='cuda', dtype=dtype)
-    y_in = torch.randn(B, N-1, D, device='cuda', dtype=dtype)
+    # Create large inputs with REQUIRES_GRAD=True for backward pass
+    x = torch.randn(B, N, D, device='cuda', dtype=dtype, requires_grad=True)
+    y_in = torch.randn(B, N-1, D, device='cuda', dtype=dtype, requires_grad=True)
+    
+    # Sanity check again for large scale
+    assert y_in.shape[1] == N - 1, "Large Scale Sanity Check Failed"
 
-    # Reset cache once to avoid setup overhead in loop
+    # Reset cache once
     model.sizes = None
-    model.cross_update_Y(x, y_in) 
+    # Dry run to compile kernels/allocate buffers
+    out_warm = model.cross_update_Y(x, y_in)
+    out_warm.sum().backward()
+    model.zero_grad()
+    x.grad = None
+    y_in.grad = None
 
     # --- Timing Setup ---
-    num_warmup = 10
-    num_trials = 100
+    num_warmup = 5
+    num_trials = 50 
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
 
-    # A. Measure PyTorch Reference
-    print("  Running PyTorch Reference...")
+    # A. Measure PyTorch Reference (Forward + Backward)
+    print("  Running PyTorch Reference (FWD + BWD)...")
     # Warmup
     for _ in range(num_warmup): 
-        model.cross_update_Y_Ref(x, y_in)
-    
+        out = model.cross_update_Y_Ref(x, y_in)
+        out.sum().backward()
+        model.zero_grad(); x.grad = None; y_in.grad = None
+
     torch.cuda.synchronize()
     start.record()
     for _ in range(num_trials):
-        model.cross_update_Y_Ref(x, y_in)
+        out = model.cross_update_Y_Ref(x, y_in)
+        out.sum().backward()
+        # Reset grads to simulate distinct steps
+        model.zero_grad(); x.grad = None; y_in.grad = None
     end.record()
     torch.cuda.synchronize()
     ms_ref = start.elapsed_time(end)
 
-    # B. Measure Triton Kernel
-    print("  Running Triton Kernel...")
+    # B. Measure Triton Kernel (Forward + Backward)
+    print("  Running Triton Kernel (FWD + BWD)...")
     # Warmup
     for _ in range(num_warmup): 
-        model.cross_update_Y(x, y_in)
-    
+        out = model.cross_update_Y(x, y_in)
+        out.sum().backward()
+        model.zero_grad(); x.grad = None; y_in.grad = None
+
     torch.cuda.synchronize()
     start.record()
     for _ in range(num_trials):
-        model.cross_update_Y(x, y_in)
+        out = model.cross_update_Y(x, y_in)
+        out.sum().backward()
+        model.zero_grad(); x.grad = None; y_in.grad = None
     end.record()
     torch.cuda.synchronize()
     ms_opt = start.elapsed_time(end)
 
     # Results
     print("-" * 50)
-    print(f"  PyTorch Avg Time: {ms_ref/num_trials:.3f} ms")
-    print(f"  Triton  Avg Time: {ms_opt/num_trials:.3f} ms")
+    print(f"  PyTorch Avg Time (Fwd+Bwd): {ms_ref/num_trials:.3f} ms")
+    print(f"  Triton  Avg Time (Fwd+Bwd): {ms_opt/num_trials:.3f} ms")
     print(f"  >>> Speedup: {ms_ref/ms_opt:.2f}x")
     print("-" * 50)
 
     # ==========================================================================
-    # 3. PROFILER
+    # 3. PROFILER (Forward + Backward)
     # ==========================================================================
     print(f"\n{'='*60}")
-    print("3. DETAILED PROFILING (Triton Only)")
+    print("3. DETAILED PROFILING (Triton Fwd + Bwd)")
     print(f"{'='*60}")
-    
-    # Reduce size slightly for cleaner traces if needed, or keep same
+
     print("Profiling Triton Kernel Trace...")
-    
+
+    # Clean up before profiling
+    model.zero_grad(); x.grad = None; y_in.grad = None
+
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
-        with record_function("Triton_Cross_Update"):
-            for _ in range(10): # Run a few times
-                model.cross_update_Y(x, y_in)
-    
+        with record_function("Triton_Step"):
+            for _ in range(5): # Run a few times
+                out = model.cross_update_Y(x, y_in)
+                out.sum().backward()
+                model.zero_grad(); x.grad = None; y_in.grad = None
+
     print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=100))
 
 if __name__ == "__main__":
