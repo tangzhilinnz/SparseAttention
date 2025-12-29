@@ -990,7 +990,7 @@ def run_full_suite():
             for _ in range(10): # Run a few times
                 model.cross_update_Y(x, y_in)
     
-    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=15))
+    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=100))
 
 if __name__ == "__main__":
     run_full_suite()
