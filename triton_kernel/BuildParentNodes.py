@@ -361,7 +361,7 @@ class BuildParentNodesFunc(torch.autograd.Function):
             # Constants
             sm_scale=sm_scale,
             H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_SIZE=BLOCK_SIZE,
-            num_warps=8
+            num_warps=4
         )
         
         # 5. Save for Backward
@@ -413,7 +413,7 @@ class BuildParentNodesFunc(torch.autograd.Function):
             # Constants
             sm_scale=sm_scale,
             H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_SIZE=BLOCK_SIZE,
-            num_warps=8
+            num_warps=4
         )
         
         return dQ, dKp, dVp, dKc, dVc
