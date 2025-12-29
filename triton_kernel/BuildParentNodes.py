@@ -774,8 +774,8 @@ def run_full_suite():
     print(f"{'='*60}")
 
     # Config: Larger size to stress GPU
-    B, N, D, H = 16, 512, 1024, 8
-    #B, N, D, H = 16, 4096, 2048, 16 # Uncomment for even heavier load
+    #B, N, D, H = 16, 512, 1024, 8
+    B, N, D, H = 16, 4096 * 2, 2048, 16 # Uncomment for even heavier load
 
     dtype = torch.float16 
     print(f"Config: B={B}, N={N}, D={D}, H={H}, dtype={dtype}")
