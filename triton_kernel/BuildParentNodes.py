@@ -2,6 +2,10 @@ import torch
 import triton
 import triton.language as tl
 import math
+import torch.nn as nn
+import torch.nn.functional as F
+from torch import einsum
+
 
 # ------------------------------------------------------------------
 #  1. Forward Kernel (Standardized Argument Order)
