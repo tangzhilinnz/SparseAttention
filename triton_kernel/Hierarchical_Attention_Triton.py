@@ -11,7 +11,7 @@ import math
 #                    Triton Kernel
 # ------------------------------------------------------------------
 @triton.jit
-def build_parent_self_attention_kernel(
+def build_parent_nodes_kernel(
     Q_ptr,              # Parent Query [B, P, H, D]
     Kp_ptr, Vp_ptr,     # Parent Key/Value (Self) [B, P, H, D]
     Kc_ptr, Vc_ptr,     # Child Key/Value (Children) [B, 2*P, H, D]
@@ -164,7 +164,7 @@ def build_parent_nodes(Q_p, K_p, V_p, K_c, V_c):
     # We assume V has same strides as K for simplicity in python args, 
     # but pass them explicitly if your memory layout is weird.
     
-    build_parent_self_attention_kernel[grid](
+    build_parent_nodes_kernel[grid](
         # Pointers
         Q_p, 
         K_p, V_p, 

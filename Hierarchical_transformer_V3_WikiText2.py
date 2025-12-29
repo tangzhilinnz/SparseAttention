@@ -264,15 +264,8 @@ class HierarchicalSparseAttention(nn.Module):
         self.out_proj_x = nn.Linear(dim, dim)
 
         self.dropout = nn.Dropout(dropout)
-
-        # -----------------------------------------------------------
-        # NEW ADDITIONS for Gated Residual Architecture
-        # -----------------------------------------------------------
-        # 1. Learnable Gate: Controls how much 'Child Context' to mix into 'Parent'.
-        #    Initialized to 0.0 so the layer starts as a pure Identity (Parent Copy).
-        self.gate = nn.Parameter(torch.zeros(1)) 
         
-        # 2. Internal LayerNorm: Required for "Pre-Norm" architecture.
+        # Internal LayerNorm: Required for "Pre-Norm" architecture.
         #    We normalize inputs internally before calculating attention scores.
         self.ln = nn.LayerNorm(dim)
         # -----------------------------------------------------------
@@ -332,53 +325,53 @@ class HierarchicalSparseAttention(nn.Module):
 
     def cross_update_Y(self, x, y_in):
         """
-        Architecture: Pre-Norm Gated Residual (Pairwise)
-        Formula: 
-          Y_new = W_out( V_p(Y) + gate * Attention( Q(LN(Y)), K(LN(X)), V(LN(X)) ) )
-      
-        Where:
-          - V_p(Y): Un-normalized projection of Parent (Preserves Gradient Highway)
-          - LN(Y)/LN(X): LayerNorm applied for stable Query/Key matching
-          - gate: Learnable scalar initialized to 0 (Start as Identity)
+        Architecture: Stabilized 3-Way Recursive Attention.
+        
+        Logic:
+          - 3-Way Competition: Softmax(Parent, Child_Left, Child_Right)
+          - Internal Norm: Normalizes Q and K inputs to prevent score explosion.
+          - Identity Highway: Uses un-normalized V for Parent to preserve gradient flow.
         """
         B, N, D = x.shape
         H, Dh = self.num_heads, self.head_dim
         assert y_in is not None
 
+        # Reverted to your original static check (No dynamic cache)
         if self.sizes is None: self.sizes, self.offsets = self.build_level_info(N)
 
         # -------------------------------------------------------
-        # PRE-CALCULATION: Parent Projections
+        # OPTIMIZATION: Global Parent Projection
         # -------------------------------------------------------
-        # 1. Norm the input for Query (Stable scoring)
+        # 1. STABILITY: Norm the Parent input for Q and K (Stable routing)
         y_norm = self.ln(y_in)
-    
-        # 2. Project Q from Normalized Parent
+
+        # Project Q and K from NORMALIZED input
         Q_p_all = self.Wq_y(y_norm).view(B, -1, H, Dh).transpose(1, 2)
-    
-        # 3. Project V from RAW Parent (The Residual Highway)
-        # Note: We use Wv_y(y_in) as the 'Identity' base. 
-        # This preserves the gradient flow better than passing it through Norm.
+        K_p_all = self.Wk_y(y_norm).view(B, -1, H, Dh).transpose(1, 2)
+        
+        # 2. GRADIENT HIGHWAY: Project V from RAW input (Preserves signal magnitude)
         V_p_all = self.Wv_y(y_in).view(B, -1, H, Dh).transpose(1, 2)
-    
+        
         new_Y_levels = []
         prev_sources = x 
 
         for level, parent_count in enumerate(self.sizes):
             # ---------------------------------------------------
-            # 1. Prepare Children (Apply Norm)
+            # 1. Prepare Children
             # ---------------------------------------------------
             useful_len = parent_count * 2
-        
-            # Slice children
+            
+            # Slice Raw Children (for Value path)
             children_raw = prev_sources[:, :useful_len, :]
-        
-            # Norm children before projection
+            
+            # 3. RECURSIVE STABILITY: Norm Children for this level's Keys
             children_norm = self.ln(children_raw)
-        
-            # Project Children Keys/Values
+            
+            # Project Children Keys (from Normed)
             K_c = self.Wk_y(children_norm).view(B, -1, H, Dh).transpose(1, 2)
-            V_c = self.Wv_y(children_norm).view(B, -1, H, Dh).transpose(1, 2)
+            
+            # Project Children Values (from Raw - allow signal growth)
+            V_c = self.Wv_y(children_raw).view(B, -1, H, Dh).transpose(1, 2)
             V_c = self.dropout(V_c)
 
             # ---------------------------------------------------
@@ -392,44 +385,42 @@ class HierarchicalSparseAttention(nn.Module):
             # 3. Slice Parents
             # ---------------------------------------------------
             offset = self.offsets[level]
-            # Q_p: (B, H, P, Dh)
+            
+            # Safety Check
+            if offset + parent_count > Q_p_all.size(2): 
+                break 
+
             Q_p = Q_p_all[:, :, offset : offset + parent_count, :]
-            # V_p: (B, H, P, Dh) - This is our 'Self'
+            K_p = K_p_all[:, :, offset : offset + parent_count, :]
             V_p = V_p_all[:, :, offset : offset + parent_count, :]
 
             # ---------------------------------------------------
-            # 4. Attention Scores (Children Only)
+            # 4. Form Attention Pool (3-Way: Self, Left, Right)
             # ---------------------------------------------------
-            # Unsqueeze Q for broadcasting: (B, H, P, 1, Dh)
-            # K_c_pairs Transposed: (B, H, P, Dh, 2)
-            # Result: (B, H, P, 1, 2)
-            logits = torch.matmul(Q_p.unsqueeze(3), K_c_pairs.transpose(-1, -2))
-            logits = logits / math.sqrt(Dh)
-        
-            # Softmax over the 2 children ONLY
-            weights = F.softmax(logits, dim=-1) # (B, H, P, 1, 2)
+            # Pool Keys: [Parent(Self), Child_Left, Child_Right]
+            K_pool = torch.cat([K_p.unsqueeze(3), K_c_pairs], dim=3)
+            
+            # Pool Values
+            V_pool = torch.cat([V_p.unsqueeze(3), V_c_pairs], dim=3)
 
             # ---------------------------------------------------
-            # 5. Weighted Sum (Context)
+            # 5. Attention Scores
             # ---------------------------------------------------
-            # (B, H, P, 1, 2) @ (B, H, P, 2, Dh) -> (B, H, P, 1, Dh)
-            context = torch.matmul(weights, V_c_pairs)
-        
-            # Remove the extra dim: (B, H, P, Dh)
-            context = context.squeeze(3)
-        
+            # Q: (B, H, P, 1, Dh)
+            # K_pool Transposed: (B, H, P, Dh, 3)
+            logits = torch.matmul(Q_p.unsqueeze(3), K_pool.transpose(-1, -2))
+            logits = logits / math.sqrt(Dh)
+            
+            # Softmax over 3 elements
+            weights = F.softmax(logits, dim=-1) # (B, H, P, 1, 3)
+
             # ---------------------------------------------------
-            # 6. Gated Residual Update
+            # 6. Weighted Sum & Merge
             # ---------------------------------------------------
-            # Out = Self + Gate * Context
-            # Using V_p as the 'Self' representation
-            attn_out = V_p + (self.gate * context)
-        
-            # ---------------------------------------------------
-            # 7. Merge Heads
-            # ---------------------------------------------------
-            attn_out = attn_out.transpose(1, 2).contiguous().reshape(B, parent_count, D)
-        
+            attn_out = torch.matmul(weights, V_pool)
+            
+            attn_out = attn_out.squeeze(3).transpose(1, 2).contiguous().reshape(B, parent_count, D)
+            
             new_Y_levels.append(attn_out)
             prev_sources = attn_out
 
