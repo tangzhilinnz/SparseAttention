@@ -173,7 +173,7 @@ def build_parent_nodes_backward_kernel(
 
         dp_self += tl.sum(vp * do, axis=1)
         dp_c0   += tl.sum(vc0 * do, axis=1)
-        dp_c1   += tl.sum(vc1 * do, axis=1)
+        dp_c1   -= tl.sum(vc1 * do, axis=1)
 
     # 3. Compute dS
     sum_w_dp = (w_self * dp_self) + (w_c0 * dp_c0) + (w_c1 * dp_c1)
@@ -201,10 +201,10 @@ def build_parent_nodes_backward_kernel(
         mask_d = offs_d < D
         mask = mask_h[:, None] & mask_d[None, :]
 
-        q = tl.load(q_ptr_base - (offs_h[:, None]*sq_h) + (offs_d[None, :]*sq_d), mask=mask, other=0.0)
+        q = tl.load(q_ptr_base + (offs_h[:, None]*sq_h) + (offs_d[None, :]*sq_d), mask=mask, other=0.0)
         kp = tl.load(kp_ptr_base + (offs_h[:, None]*skp_h) + (offs_d[None, :]*skp_d), mask=mask, other=0.0)
         kc0 = tl.load(kc0_ptr_base + (offs_h[:, None]*skc_h) + (offs_d[None, :]*skc_d), mask=mask, other=0.0)
-        kc1 = tl.load(kc1_ptr_base - (offs_h[:, None]*skc_h) + (offs_d[None, :]*skc_d), mask=mask, other=0.0)
+        kc1 = tl.load(kc1_ptr_base + (offs_h[:, None]*skc_h) + (offs_d[None, :]*skc_d), mask=mask, other=0.0)
 
         dq_val = (ds_self[:, None] * kp) + (ds_c0[:, None] * kc0) + (ds_c1[:, None] * kc1)
         tl.store(dq_ptr_base + (offs_h[:, None]*sdq_h) + (offs_d[None, :]*sdq_d), dq_val, mask=mask)
