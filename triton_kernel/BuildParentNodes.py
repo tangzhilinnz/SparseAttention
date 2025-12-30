@@ -618,6 +618,7 @@ class HierarchicalSparseAttentionTriton(nn.Module):
                 # FAST PATH: Use pre-projected leaves
                 K_c = K_leaves
                 V_c = V_leaves
+                V_c = self.dropout(V_c)
             else:
                 # STANDARD PATH: Project output of previous level
                 # Must slice prev_sources because it is a changing reference
@@ -625,7 +626,7 @@ class HierarchicalSparseAttentionTriton(nn.Module):
                 
                 # Project Children Keys/Values
                 K_c = self.Wk_y(children_in).view(B, -1, H, Dh)
-                V_c = self.Wv_y(children_in).view(B, -1, H, Dh)
+                V_c = self.Wv_y(children_in).view(B, -1, H, Dh)      
                 V_c = self.dropout(V_c)
 
             # ---------------------------------------------------
