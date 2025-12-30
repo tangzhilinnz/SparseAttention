@@ -590,11 +590,6 @@ class HierarchicalSparseAttentionTriton(nn.Module):
         K_p_levels = torch.split(K_p_all, self.sizes, dim=1)
         V_p_levels = torch.split(V_p_all, self.sizes, dim=1)
         
-        # -------------------------------------------------------
-        # 2. Pre-allocate Output Buffer
-        # -------------------------------------------------------
-        # We pre-allocate Y_new to write results into.
-        # Y_new = torch.empty((B, N - 1, D), device=x.device, dtype=x.dtype)
         new_Y_levels = []
         
         prev_sources = x # Starts as the leaves (first layer children)
@@ -644,9 +639,6 @@ class HierarchicalSparseAttentionTriton(nn.Module):
             # ---------------------------------------------------
             updated_merged = updated_heads.reshape(B, parent_count, D)
             new_Y_levels.append(updated_merged)
-
-            # Write to buffer
-            #Y_new[:, offset : offset + parent_count, :] = updated_merged
             
             # Update pointer for next level
             prev_sources = updated_merged
@@ -834,7 +826,7 @@ def run_full_suite():
     print(f"{'='*60}")
 
     # Config: Massive scale
-    B, N, D, H = 32, 2048, 768, 12 
+    B, N, D, H = 8, 2048, 768, 12 
     # B, N, D, H = 16, 4096, 1024, 16 # Alternative config
 
     print(f"Config: B={B}, N={N}, D={D}, H={H}, dtype={dtype}")
