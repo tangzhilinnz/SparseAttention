@@ -1,9 +1,9 @@
 import os
-# ==========================================
-# CRITICAL FIX: GPU SELECTION MUST BE FIRST
-# ==========================================
-# Set this before importing torch or calling torch.cuda to avoid OOM
 os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+
+# 2. Tell PyTorch to use the "first and only" visible GPU
+# (Do NOT use "cuda:2" or "cuda:3" here, because Python re-indexes it to 0)
+device = "cuda:0"
 
 import torch
 import triton
