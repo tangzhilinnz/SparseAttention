@@ -221,28 +221,20 @@ def build_parent_nodes_backward_kernel(
 # ------------------------------------------------------------------
 #  Wrapper Class (Updates BLOCK_SIZE logic)
 # ------------------------------------------------------------------
-# ==========================================================================
-# 1. OPTIMIZED WRAPPER (Support In-Place Output)
-# ==========================================================================
 class BuildParentNodesFunc(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, Q_p, K_p, V_p, K_c, V_c, out_tensor):
-        # Checks
+    def forward(ctx, Q_p, K_p, V_p, K_c, V_c):
+        # 1. Enforce Contiguity
         Q_p = Q_p.contiguous(); K_p = K_p.contiguous(); V_p = V_p.contiguous()
         K_c = K_c.contiguous(); V_c = V_c.contiguous()
         
-        # We assume out_tensor is a view/slice of the final buffer
-        # We ensure it's contiguous so Triton can write to it efficiently
-        # Note: If out_tensor is a slice of a larger tensor, .contiguous() might create a copy.
-        # However, Y_new slices along dim 1 (rows) are usually contiguous in row-major memory.
-        if not out_tensor.is_contiguous():
-            # Fallback if slice isn't contiguous (rare for row slicing)
-            out_tensor = out_tensor.contiguous()
-            
         B, P, H, D = Q_p.shape
-        assert K_c.shape[1] == 2 * P, "Child count mismatch"
+        assert K_c.shape[1] == 2 * P
         
-        # Save Weights for backward (FP16/BF16)
+        # 2. Allocate Output (Safe way)
+        Out = torch.empty_like(Q_p)
+        
+        # 3. Weights (Use Q_p.dtype to support FP16/BF16 automatically)
         Weights = torch.empty((B, P, H, 3), device=Q_p.device, dtype=Q_p.dtype)
         
         grid = (P, B)
@@ -250,26 +242,21 @@ class BuildParentNodesFunc(torch.autograd.Function):
         BLOCK_SIZE = min(128, triton.next_power_of_2(D))
         sm_scale = 1.0 / math.sqrt(D)
 
-        # WRITE DIRECTLY TO OUT_TENSOR (No intermediate allocation)
+        # 4. Launch
         build_parent_nodes_forward_kernel[grid](
-            Q_p, K_p, V_p, K_c, V_c, out_tensor, Weights,
+            Q_p, K_p, V_p, K_c, V_c, Out, Weights,
             *Q_p.stride(), *K_p.stride(), *K_c.stride(),
-            *out_tensor.stride(), *Weights.stride(),
+            *Out.stride(), *Weights.stride(),
             sm_scale, H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_SIZE=BLOCK_SIZE,
             num_warps=4
         )
         
-        # Mark out_tensor as modified in-place so Autograd knows
-        ctx.mark_dirty(out_tensor)
-        
         ctx.save_for_backward(Q_p, K_p, V_p, K_c, V_c, Weights)
         ctx.constants = (sm_scale, H, BLOCK_H, D, BLOCK_SIZE)
-        
-        return out_tensor
+        return Out
 
     @staticmethod
     def backward(ctx, grad_output):
-        # Backward remains the same
         Q_p, K_p, V_p, K_c, V_c, Weights = ctx.saved_tensors
         sm_scale, H, BLOCK_H, D, BLOCK_SIZE = ctx.constants
         
@@ -277,7 +264,7 @@ class BuildParentNodesFunc(torch.autograd.Function):
         dQ = torch.empty_like(Q_p); dKp = torch.empty_like(K_p); dVp = torch.empty_like(V_p)
         dKc = torch.empty_like(K_c); dVc = torch.empty_like(V_c)
         
-        grid = (P, B) = (Q_p.shape[1], Q_p.shape[0])
+        grid = (Q_p.shape[1], Q_p.shape[0])
         
         build_parent_nodes_backward_kernel[grid](
             grad_output, Weights,
@@ -289,11 +276,10 @@ class BuildParentNodesFunc(torch.autograd.Function):
             sm_scale, H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_SIZE=BLOCK_SIZE,
             num_warps=4
         )
-        # Return grads matching forward args (last arg out_tensor has no grad input to it)
-        return dQ, dKp, dVp, dKc, dVc, None
+        return dQ, dKp, dVp, dKc, dVc
 
-def build_parent_nodes(Q_p, K_p, V_p, K_c, V_c, out=None):
-    return BuildParentNodesFunc.apply(Q_p, K_p, V_p, K_c, V_c, out)
+def build_parent_nodes(Q_p, K_p, V_p, K_c, V_c):
+    return BuildParentNodesFunc.apply(Q_p, K_p, V_p, K_c, V_c)
 
 
 def build_hierarchical_index_lookup_table(seq_len, device="cuda", dtype=torch.int32):
@@ -567,14 +553,14 @@ class HierarchicalSparseAttentionTriton(nn.Module):
         K_p_all = self.Wk_y(y_in).view(B, -1, H, Dh)
         V_p_all = self.Wv_y(y_in).view(B, -1, H, Dh)
     
-        # 2. Pre-allocate Output Buffer
-        # We will write directly into this buffer's slices
+        # 2. Output Buffer
         Y_new = torch.empty((B, N - 1, D), device=x.device, dtype=x.dtype)
     
         prev_sources = x 
     
-        # 3. Project Level 0 Leaves (OPTIMIZATION: Done outside loop)
-        # This removes projection overhead for 50% of the nodes!
+        # [OPTIMIZATION] Project Level 0 Leaves ONCE here.
+        # This removes the projection overhead for 50% of the total nodes.
+        # Prevents calling .view() and .Wk_y() inside the first loop iteration.
         K_leaves = self.Wk_y(prev_sources).view(B, -1, H, Dh)
         V_leaves = self.Wv_y(prev_sources).view(B, -1, H, Dh)
         V_leaves = self.dropout(V_leaves)
@@ -589,13 +575,11 @@ class HierarchicalSparseAttentionTriton(nn.Module):
         
             # B. Prepare Children (K_c, V_c)
             if level == 0:
-                # Special fast path for Level 0 (Uses pre-projected leaves)
+                # FAST PATH: Use pre-projected leaves
                 K_c = K_leaves
                 V_c = V_leaves
             else:
-                # Standard path for higher levels
-                # Note: We must re-project because prev_sources came from Attention output, not Linear
-                # Slice prev_sources (output of prev level)
+                # STANDARD PATH: Project output of previous level
                 useful_len = parent_count * 2
                 children_in = prev_sources[:, :useful_len, :]
             
@@ -603,18 +587,17 @@ class HierarchicalSparseAttentionTriton(nn.Module):
                 V_c = self.Wv_y(children_in).view(B, -1, H, Dh)
                 V_c = self.dropout(V_c)
 
-            # C. Prepare Output Slice (View as Heads)
-            # This view shares memory with Y_new. No copy.
-            out_slice = Y_new[:, offset : offset + parent_count, :].view(B, parent_count, H, Dh)
+            # C. Triton Kernel (Allocates new tensor)
+            updated_heads = build_parent_nodes(Q_p, K_p, V_p, K_c, V_c)
 
-            # D. Triton Kernel (Writes DIRECTLY to Y_new via out_slice)
-            # returns the modified out_slice (which is Y_new's memory)
-            updated_heads = build_parent_nodes(Q_p, K_p, V_p, K_c, V_c, out=out_slice)
-
-            # E. Update pointer for next iteration
-            # We need the flattened version [B, P, D] for the next loop's projection input
-            # We can just view the slice we just wrote to.
-            prev_sources = updated_heads.view(B, parent_count, D)
+            # D. Merge Heads
+            updated_merged = updated_heads.reshape(B, parent_count, D)
+        
+            # E. Store & Update Pointer
+            # We accept the copy cost here to ensure Graph Stability
+            Y_new[:, offset : offset + parent_count, :] = updated_merged
+        
+            prev_sources = updated_merged
 
         return self.out_proj_y(Y_new)
 
