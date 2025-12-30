@@ -945,7 +945,7 @@ best_model = TransformerLM(
     d_model=512,
     num_heads=8,        
     d_ff=2048,
-    num_layers=12,       
+    num_layers=8,       
     dropout=0.2
 )
 best_model.load_state_dict(checkpoint['model_state_dict'])
