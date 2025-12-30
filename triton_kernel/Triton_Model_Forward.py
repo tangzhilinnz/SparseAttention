@@ -1399,9 +1399,11 @@ def run_transformer_benchmark():
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
     
-    # To this:
-    device = "cuda:3" if torch.cuda.is_available() else "cpu"
-    torch.cuda.set_device(device) # Important to set the default context for Triton
+    # [FIX] Keep using cuda:0 inside the script
+    # The environment variable at the top handles the physical mapping.
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    
+    torch.cuda.set_device(device)
 
     if device == "cpu":
         print("Error: Triton requires a GPU. Exiting.")
