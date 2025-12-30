@@ -1,4 +1,5 @@
 import os
+# 1. Select Physical GPU 2
 os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 
 # 2. Tell PyTorch to use the "first and only" visible GPU
@@ -200,6 +201,7 @@ def build_parent_nodes(Q_p, K_p, V_p, K_c, V_c):
     
     return Out
 
+
 @triton.jit
 def hierarchical_fused_attention_kernel(
     # Pointers
@@ -227,109 +229,101 @@ def hierarchical_fused_attention_kernel(
     b_idx = tl.program_id(1)
 
     # -----------------------------------------------------------
-    # 1. Setup & Hints
+    # 1. Setup & Alignment
     # -----------------------------------------------------------
+    # FIXED: Padded H to power of 2
     h_idx = tl.arange(0, BLOCK_H)
     mask_h = h_idx < H
 
-    # Optimize: Offsets for D. If D <= BLOCK_D, we don't need a loop index.
     offs_d = tl.arange(0, BLOCK_D)
-    
     offs_lvl = tl.arange(0, BLOCK_LEVELS)
+    
+    # Pre-calculate Mask for Levels
     mask_lvl = offs_lvl < LEVELS
 
     # -----------------------------------------------------------
-    # 2. Load Topology (Indices)
+    # 2. Load Topology (The "Random Access" Part)
     # -----------------------------------------------------------
     off_lookup = node_idx * sl_n + offs_lvl * sl_lvl
     
-    # [Hint] Lookup_ptr is likely aligned if allocated via PyTorch
-    # neighbor_indices = tl.load(Lookup_ptr + off_lookup, mask=mask_lvl, other=0)
-    neighbor_indices = tl.load(
-        tl.multiple_of(Lookup_ptr + off_lookup, 1), # Hinting alignment 1 (safe fallback)
-        mask=mask_lvl, other=0
-    )
-
-    # Load Causal Mask
-    # Initialize with 0 (False) -> Visible
-    # If mask val is 1 (True) -> Masked out (Invisible)
-    mask_val_broadcast = (offs_lvl >= LEVELS) # Default mask for padding levels
+    # Load Indices
+    neighbor_indices = tl.load(Lookup_ptr + off_lookup, mask=mask_lvl, other=0)
     
+    # Load Causal Mask (Optimization: Skip if HAS_MASK is False at compile time)
+    neighbor_mask_val = tl.zeros([BLOCK_LEVELS], dtype=tl.int1)
     if HAS_MASK:
         val_int8 = tl.load(Mask_ptr + off_lookup, mask=mask_lvl, other=1).to(tl.int8)
-        mask_val_broadcast = mask_val_broadcast | (val_int8 != 0)
+        neighbor_mask_val = (val_int8 != 0)
 
     # -----------------------------------------------------------
-    # 3. Pre-calculate Base Pointers (Hoisting)
+    # 3. Base Pointers & Offset Pre-calculation
     # -----------------------------------------------------------
-    # Base pointers for Batch
-    # [Hint] Q, K, V pointers are typically 16-byte aligned
-    Q_ptr = tl.multiple_of(Q_ptr, 16)
-    K_ptr = tl.multiple_of(K_ptr, 16)
-    V_ptr = tl.multiple_of(V_ptr, 16)
-
+    # Optimization: Calculate the "Base Address" for every neighbor ONCE.
+    # K Base for this batch
     k_batch_base = K_ptr + b_idx * sk_b
     v_batch_base = V_ptr + b_idx * sk_b
-
-    # Offsets
+    
+    # Compute the fixed offset for "Self" and "Neighbors" (Node-level)
+    # Self Offset: [1]
     off_node_self = node_idx * sk_n
+    
+    # Neighbor Offsets: [BLOCK_LEVELS]
+    # We pre-multiply the neighbor index by the stride. 
+    # This vector stays in registers and is reused in the loop.
     off_node_cross = neighbor_indices * sk_n 
 
-    # [OPTIMIZATION] Pre-calculate the "Header" of the pointers (Batch + Node + Head)
-    # This leaves only the "Dim" offset to be added inside the loop/block.
-    
-    # Q Base: [BLOCK_H, 1]
-    q_base_ptr = Q_ptr + (b_idx * sq_b) + (node_idx * sq_n) + (h_idx[:, None] * sq_h)
-    
-    # K Self Base: [BLOCK_H, 1]
-    k_self_base_ptr = k_batch_base + off_node_self + (h_idx[:, None] * sk_h)
-    
-    # K Cross Base: [BLOCK_H, BLOCK_LEVELS, 1]
-    # Broadcast: H dim (0), Level dim (1), D dim (2)
-    k_cross_base_ptr = k_batch_base + \
-                       off_node_cross[None, :, None] + \
-                       (h_idx[:, None, None] * sk_h)
-
-    # V Self Base: [BLOCK_H, 1]
-    v_self_base_ptr = v_batch_base + off_node_self + (h_idx[:, None] * sk_h)
-    
-    # V Cross Base: [BLOCK_H, BLOCK_LEVELS, 1]
-    v_cross_base_ptr = v_batch_base + \
-                       off_node_cross[None, :, None] + \
-                       (h_idx[:, None, None] * sk_h)
-
-    # Out Base: [BLOCK_H, 1]
-    out_base_ptr = Out_ptr + (b_idx * so_b) + (node_idx * so_n) + (h_idx[:, None] * so_h)
+    # Prepare Q Pointer
+    q_ptr = Q_ptr + (b_idx * sq_b) + (node_idx * sq_n) + \
+            (h_idx[:, None] * sq_h) + (offs_d[None, :] * sq_d)
 
     # Accumulators
     acc_self = tl.zeros([BLOCK_H], dtype=tl.float32)
     acc_cross = tl.zeros([BLOCK_H, BLOCK_LEVELS], dtype=tl.float32)
 
     # -----------------------------------------------------------
-    # 4. Score Loop (Accumulate Q * K)
+    # 4. Score Loop
     # -----------------------------------------------------------
-    # [Hint] If D matches BLOCK_D, loop runs once. Compiler unrolls.
     for off_d_start in range(0, D, BLOCK_D):
+        # Update D offsets
+        # If D is Power of 2 (e.g. 64, 128), we can skip the mask check 
+        # But we keep it generic here.
         cur_offs_d = off_d_start + offs_d
         d_mask = cur_offs_d < D
         
-        # Load Q: [BLOCK_H, BLOCK_D]
-        q = tl.load(q_base_ptr + (cur_offs_d[None, :] * sq_d), 
-                    mask=mask_h[:, None] & d_mask[None, :], other=0.0)
+        # Load Q
+        # Pointer arithmetic is minimal here (just adding off_d_start)
+        mask_q = mask_h[:, None] & d_mask[None, :]
+        q = tl.load(q_ptr, mask=mask_q, other=0.0)
         
-        # Load K Self: [BLOCK_H, BLOCK_D]
-        k_self = tl.load(k_self_base_ptr + (cur_offs_d[None, :] * sk_d), 
-                         mask=mask_h[:, None] & d_mask[None, :], other=0.0)
+        # --- K SELF ---
+        # Reconstruct pointer using pre-calculated offsets
+        # Base + Node_Offset + Head_Offset + Dim_Offset
+        ptr_k_self = k_batch_base + off_node_self + \
+                     (h_idx[:, None] * sk_h) + (cur_offs_d[None, :] * sk_d)
         
-        # Load K Cross: [BLOCK_H, BLOCK_LEVELS, BLOCK_D]
-        # Using pre-calculated base, simply add dim offset
-        k_cross = tl.load(k_cross_base_ptr + (cur_offs_d[None, None, :] * sk_d), 
-                          mask=mask_h[:, None, None] & mask_lvl[None, :, None] & d_mask[None, None, :], 
-                          other=0.0)
-        
-        # Math
+        k_self = tl.load(ptr_k_self, mask=mask_q, other=0.0)
         acc_self += tl.sum(q * k_self, axis=1)
+
+        # --- K CROSS (Neighbors) ---
+        # Broadcast magic:
+        # off_node_cross is [BLOCK_LEVELS] -> broadcast to [1, LEVELS, 1]
+        # h_idx is [H] -> broadcast to [H, 1, 1]
+        # cur_offs_d is [BLOCK_D] -> broadcast to [1, 1, BLOCK_D]
+        
+        ptr_k_cross = k_batch_base + \
+                      off_node_cross[None, :, None] + \
+                      (h_idx[:, None, None] * sk_h) + \
+                      (cur_offs_d[None, None, :] * sk_d)
+        
+        # Mask: H & Levels & Dim
+        mask_k = mask_h[:, None, None] & mask_lvl[None, :, None] & d_mask[None, None, :]
+        k_cross = tl.load(ptr_k_cross, mask=mask_k, other=0.0)
+        
+        # Math: [H, 1, D] * [H, LEVELS, D]
         acc_cross += tl.sum(q[:, None, :] * k_cross, axis=2)
+        
+        # Advance Q ptr for next block
+        q_ptr += BLOCK_D * sq_d
 
     # -----------------------------------------------------------
     # 5. Softmax
@@ -337,53 +331,62 @@ def hierarchical_fused_attention_kernel(
     acc_self = acc_self * sm_scale
     acc_cross = acc_cross * sm_scale
     
-    # Apply Mask (Set to -inf)
-    acc_cross = tl.where(mask_val_broadcast[None, :], -float('inf'), acc_cross)
+    mask_broadcast = (offs_lvl >= LEVELS)
+    if HAS_MASK:
+        mask_broadcast = mask_broadcast | neighbor_mask_val
+        
+    acc_cross = tl.where(mask_broadcast[None, :], -float('inf'), acc_cross)
     
-    # Online Softmax Stability
     max_cross = tl.max(acc_cross, axis=1)
     max_all = tl.maximum(acc_self, max_cross)
     
+    # Fast math exp
     exp_self = tl.exp(acc_self - max_all)
     exp_cross = tl.exp(acc_cross - max_all[:, None])
     
     denom = exp_self + tl.sum(exp_cross, axis=1)
-    
-    # [OPTIMIZATION] Reciprocal math is faster than division
-    inv_denom = 1.0 / denom
-    w_self = exp_self * inv_denom
-    w_cross = exp_cross * inv_denom[:, None]
-
-    # Convert weights to fp16 for V multiplication if V is fp16? 
-    # Usually keep as fp32 for accumulation precision.
+    w_self = exp_self / denom 
+    w_cross = exp_cross / denom[:, None]
 
     # -----------------------------------------------------------
-    # 6. Weighted Sum Loop (Accumulate W * V)
+    # 6. Weighted Sum Loop
     # -----------------------------------------------------------
+    # Output Pointer Setup
+    out_base_ptr = Out_ptr + (b_idx * so_b) + (node_idx * so_n) + \
+                   (h_idx[:, None] * so_h) + (offs_d[None, :] * so_d)
+
     for off_d_start in range(0, D, BLOCK_D):
         cur_offs_d = off_d_start + offs_d
         d_mask = cur_offs_d < D
+        
         mask_op = mask_h[:, None] & d_mask[None, :]
 
-        # Load V Self: [BLOCK_H, BLOCK_D]
-        v_self = tl.load(v_self_base_ptr + (cur_offs_d[None, :] * sk_d), 
-                         mask=mask_op, other=0.0)
-        
-        # Accumulate Self
+        # --- V SELF ---
+        ptr_v_self = v_batch_base + off_node_self + \
+                     (h_idx[:, None] * sk_h) + (cur_offs_d[None, :] * sk_d)
+                      
+        v_self = tl.load(ptr_v_self, mask=mask_op, other=0.0)
         out_acc = w_self[:, None] * v_self
         
-        # Load V Cross: [BLOCK_H, BLOCK_LEVELS, BLOCK_D]
-        v_cross = tl.load(v_cross_base_ptr + (cur_offs_d[None, None, :] * sk_d), 
-                          mask=mask_h[:, None, None] & mask_lvl[None, :, None] & d_mask[None, None, :], 
-                          other=0.0)
+        # --- V CROSS ---
+        ptr_v_cross = v_batch_base + \
+                      off_node_cross[None, :, None] + \
+                      (h_idx[:, None, None] * sk_h) + \
+                      (cur_offs_d[None, None, :] * sk_d)
+                      
+        mask_v = mask_h[:, None, None] & mask_lvl[None, :, None] & d_mask[None, None, :]
+        v_cross = tl.load(ptr_v_cross, mask=mask_v, other=0.0)
         
-        # Accumulate Cross: [H, L, 1] * [H, L, D] -> sum(L) -> [H, D]
+        # Accumulate
         out_acc += tl.sum(w_cross[:, :, None] * v_cross, axis=1)
         
         # Store
-        tl.store(out_base_ptr + (cur_offs_d[None, :] * so_d), 
-                 out_acc.to(Out_ptr.dtype.element_ty), 
-                 mask=mask_op)
+        # ptr matches out_base_ptr structure
+        # FIXED: Mask store by H
+        tl.store(out_base_ptr, out_acc.to(Out_ptr.dtype.element_ty), mask=mask_op)
+        
+        # Advance Output Pointer
+        out_base_ptr += BLOCK_D * so_d
 
 def hierarchical_fused_attention(Q, K, V, idx_table, mask_table):
     B, N, H, Dh = Q.shape
@@ -1399,15 +1402,9 @@ def run_transformer_benchmark():
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
     
-    # [FIX] Keep using cuda:0 inside the script
-    # The environment variable at the top handles the physical mapping.
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     
     torch.cuda.set_device(device)
-
-    if device == "cpu":
-        print("Error: Triton requires a GPU. Exiting.")
-        return
 
     # Hyperparameters from request
     VOCAB_SIZE = 50000
