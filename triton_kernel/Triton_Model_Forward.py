@@ -1,3 +1,10 @@
+import os
+# ==========================================
+# CRITICAL FIX: GPU SELECTION MUST BE FIRST
+# ==========================================
+# Set this before importing torch or calling torch.cuda to avoid OOM
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+
 import torch
 import triton
 import torch.nn as nn
