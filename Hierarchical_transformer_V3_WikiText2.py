@@ -907,7 +907,7 @@ model = TransformerLM(
     d_model=512,        # INCREASED from 256
     num_heads=8,        
     d_ff=2048,          # INCREASED from 1024
-    num_layers=12,       
+    num_layers=8,       
     dropout=0.2         # CHANGED: Increased from 0.1 to 0.2 (Point 7)
 )
 
