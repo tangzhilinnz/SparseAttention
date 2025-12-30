@@ -224,25 +224,23 @@ def build_parent_nodes_backward_kernel(
 class BuildParentNodesFunc(torch.autograd.Function):
     @staticmethod
     def forward(ctx, Q_p, K_p, V_p, K_c, V_c):
-        # 1. Enforce Contiguity
         Q_p = Q_p.contiguous(); K_p = K_p.contiguous(); V_p = V_p.contiguous()
         K_c = K_c.contiguous(); V_c = V_c.contiguous()
         
         B, P, H, D = Q_p.shape
-        assert K_c.shape[1] == 2 * P
+        assert K_c.shape[1] == 2 * P, "Child count mismatch"
         
-        # 2. Allocate Output (Safe way)
         Out = torch.empty_like(Q_p)
-        
-        # 3. Weights (Use Q_p.dtype to support FP16/BF16 automatically)
         Weights = torch.empty((B, P, H, 3), device=Q_p.device, dtype=Q_p.dtype)
         
         grid = (P, B)
         BLOCK_H = triton.next_power_of_2(H)
+        
+        # [OPTIMIZATION] Cap BLOCK_SIZE to avoid register spilling for large D
+        # 128 is a safe sweet spot for shared memory usage.
         BLOCK_SIZE = min(128, triton.next_power_of_2(D))
         sm_scale = 1.0 / math.sqrt(D)
 
-        # 4. Launch
         build_parent_nodes_forward_kernel[grid](
             Q_p, K_p, V_p, K_c, V_c, Out, Weights,
             *Q_p.stride(), *K_p.stride(), *K_c.stride(),
@@ -264,7 +262,7 @@ class BuildParentNodesFunc(torch.autograd.Function):
         dQ = torch.empty_like(Q_p); dKp = torch.empty_like(K_p); dVp = torch.empty_like(V_p)
         dKc = torch.empty_like(K_c); dVc = torch.empty_like(V_c)
         
-        grid = (Q_p.shape[1], Q_p.shape[0])
+        grid = (P, B) = (Q_p.shape[1], Q_p.shape[0])
         
         build_parent_nodes_backward_kernel[grid](
             grad_output, Weights,
@@ -545,61 +543,72 @@ class HierarchicalSparseAttentionTriton(nn.Module):
         """
         B, N, D = x.shape
         H, Dh = self.num_heads, self.head_dim
-    
+        
+        assert y_in is not None, "y_in cannot be None"
+        assert y_in.size(1) == N - 1, f"y_in size {y_in.size(1)} mismatch! Expected N-1 ({N-1}) for N={N} leaves."
+
         if self.sizes is None: self.sizes, self.offsets = self.build_level_info(N)
 
-        # 1. Project Global Parents (Standard)
+        # -------------------------------------------------------
+        # OPTIMIZATION 1: Global Parent Projection
+        # -------------------------------------------------------
+        # We project ALL parents at once for Q, K, and V.
+        # This allows the parent to attend to itself (Parent-Self Attention).
+        # Layout: [B, Total_Parents, H, Dh] (Native Linear output, no transpose)
         Q_p_all = self.Wq_y(y_in).view(B, -1, H, Dh)
         K_p_all = self.Wk_y(y_in).view(B, -1, H, Dh)
         V_p_all = self.Wv_y(y_in).view(B, -1, H, Dh)
-    
-        # 2. Output Buffer
-        Y_new = torch.empty((B, N - 1, D), device=x.device, dtype=x.dtype)
-    
-        prev_sources = x 
-    
-        # [OPTIMIZATION] Project Level 0 Leaves ONCE here.
-        # This removes the projection overhead for 50% of the total nodes.
-        # Prevents calling .view() and .Wk_y() inside the first loop iteration.
-        K_leaves = self.Wk_y(prev_sources).view(B, -1, H, Dh)
-        V_leaves = self.Wv_y(prev_sources).view(B, -1, H, Dh)
-        V_leaves = self.dropout(V_leaves)
-
+        
+        new_Y_levels = []
+        prev_sources = x # Starts as the leaves (first layer children)
+        
         for level, parent_count in enumerate(self.sizes):
             offset = self.offsets[level]
 
-            # A. Prepare Parents
+            # ---------------------------------------------------
+            # 1. Prepare Parents (Slicing)
+            # ---------------------------------------------------
+            # Slice Q, K, V for this specific level's parents
+            # Shape: [B, Parent_Count, H, Dh]
             Q_p = Q_p_all[:, offset : offset + parent_count, :, :]
             K_p = K_p_all[:, offset : offset + parent_count, :, :]
             V_p = V_p_all[:, offset : offset + parent_count, :, :]
-        
-            # B. Prepare Children (K_c, V_c)
-            if level == 0:
-                # FAST PATH: Use pre-projected leaves
-                K_c = K_leaves
-                V_c = V_leaves
-            else:
-                # STANDARD PATH: Project output of previous level
-                useful_len = parent_count * 2
-                children_in = prev_sources[:, :useful_len, :]
             
-                K_c = self.Wk_y(children_in).view(B, -1, H, Dh)
-                V_c = self.Wv_y(children_in).view(B, -1, H, Dh)
-                V_c = self.dropout(V_c)
+            # ---------------------------------------------------
+            # 2. Prepare Children (Projection)
+            # ---------------------------------------------------
+            useful_len = parent_count * 2
+            # Slice strictly to useful length to ensure even pairs
+            children_in = prev_sources[:, :useful_len, :]
+            
+            # Project Children Keys/Values (Must be done in loop as prev_sources changes)
+            # Shape: [B, 2*P, H, Dh]
+            K_c = self.Wk_y(children_in).view(B, -1, H, Dh)
+            V_c = self.Wv_y(children_in).view(B, -1, H, Dh)
+            V_c = self.dropout(V_c)
 
-            # C. Triton Kernel (Allocates new tensor)
+            # ---------------------------------------------------
+            # 3. Triton Kernel (3-Way Attention)
+            # ---------------------------------------------------
+            # Replaces: Reshape -> Cat -> Dot -> Softmax -> Weighted Sum
+            # Input:  Parents (Q,K,V) and Children (K,V)
+            # Output: Updated Parents [B, P, H, Dh]
             updated_heads = build_parent_nodes(Q_p, K_p, V_p, K_c, V_c)
 
-            # D. Merge Heads
+            # ---------------------------------------------------
+            # 4. Merge Heads
+            # ---------------------------------------------------
+            # [B, P, H, Dh] -> [B, P, D]
             updated_merged = updated_heads.reshape(B, parent_count, D)
-        
-            # E. Store & Update Pointer
-            # We accept the copy cost here to ensure Graph Stability
-            Y_new[:, offset : offset + parent_count, :] = updated_merged
-        
+            
+            new_Y_levels.append(updated_merged)
             prev_sources = updated_merged
 
-        return self.out_proj_y(Y_new)
+        # Concatenate and Project
+        Y_new = torch.cat(new_Y_levels, dim=1)
+        Y_new = self.out_proj_y(Y_new)
+        
+        return Y_new
 
     def update_X_from_Y(self, x, y, mask=None):
         B, N, D = x.shape
