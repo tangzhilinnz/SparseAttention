@@ -850,7 +850,9 @@ def run_full_suite():
     # Results
     print("-" * 50)
     print(f"  PyTorch Avg Time (Fwd+Bwd): {ms_ref/num_trials:.3f} ms")
+    print(f"  PyTorch Tot Time (Fwd+Bwd): {ms_ref:.3f} ms")
     print(f"  Triton  Avg Time (Fwd+Bwd): {ms_opt/num_trials:.3f} ms")
+    print(f"  Triton  Tot Time (Fwd+Bwd): {ms_opt:.3f} ms")
     print(f"  >>> Speedup: {ms_ref/ms_opt:.2f}x")
     print("-" * 50)
 
