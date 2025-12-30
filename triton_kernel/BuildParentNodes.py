@@ -594,7 +594,8 @@ class HierarchicalSparseAttentionTriton(nn.Module):
         # 2. Pre-allocate Output Buffer
         # -------------------------------------------------------
         # We pre-allocate Y_new to write results into.
-        Y_new = torch.empty((B, N - 1, D), device=x.device, dtype=x.dtype)
+        # Y_new = torch.empty((B, N - 1, D), device=x.device, dtype=x.dtype)
+        new_Y_levels = []
         
         prev_sources = x # Starts as the leaves (first layer children)
         
@@ -642,13 +643,16 @@ class HierarchicalSparseAttentionTriton(nn.Module):
             # 4. Merge Heads
             # ---------------------------------------------------
             updated_merged = updated_heads.reshape(B, parent_count, D)
-            
+            new_Y_levels.append(updated_merged)
+
             # Write to buffer
-            Y_new[:, offset : offset + parent_count, :] = updated_merged
+            #Y_new[:, offset : offset + parent_count, :] = updated_merged
             
             # Update pointer for next level
             prev_sources = updated_merged
 
+        # Concatenate and Project
+        Y_new = torch.cat(new_Y_levels, dim=1)
         # Concatenate and Project
         return self.out_proj_y(Y_new)
 
