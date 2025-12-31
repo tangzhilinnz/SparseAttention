@@ -213,7 +213,7 @@ def hierarchical_attention_forward_kernel(
     sq_b, sq_n, sq_h, sq_d,
     # Strides (K)
     sk_b, sk_n, sk_h, sk_d,
-    # Strides (V) <--- [FIX]: Explicit V strides added
+    # Strides (V)
     sv_b, sv_n, sv_h, sv_d,
     # Strides (Topology)
     sl_n, sl_lvl,
@@ -387,9 +387,9 @@ def hierarchical_fused_attention(Q, K, V, idx_table, mask_table):
         Q, K, V, 
         idx_table, mask_ptr_safe, 
         Out,
-        Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
-        K.stride(0), K.stride(1), K.stride(2), K.stride(3),
-        V.stride(0), V.stride(1), V.stride(2), V.stride(3),
+        *Q.stride(),
+        *K.stride(), 
+        *V.stride(),
         idx_table.stride(0), idx_table.stride(1),
         Out.stride(0), Out.stride(1), Out.stride(2), Out.stride(3),
         sm_scale=1.0 / math.sqrt(Dh),
