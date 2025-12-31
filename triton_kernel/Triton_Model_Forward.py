@@ -204,120 +204,205 @@ def build_parent_nodes(Q_p, K_p, V_p, K_c, V_c):
 
 @triton.jit
 def hierarchical_attention_forward_kernel(
-    # ... pointers and strides same as before ...
-    Q_ptr, K_ptr, V_ptr, Out_ptr, W_ptr,
+    # Pointers
+    Q_ptr, K_ptr, V_ptr, 
+    Lookup_ptr,        # [CHANGED] Fused Index Table (contains signs)
+    Out_ptr, W_ptr, 
+    
+    # Strides (Q)
     sq_b, sq_n, sq_h, sq_d,
-    sk_b, sk_n, sk_w, sk_h, sk_d,
-    sv_b, sv_n, sv_w, sv_h, sv_d,
+    # Strides (K)
+    sk_b, sk_n, sk_h, sk_d,
+    # Strides (V)
+    sv_b, sv_n, sv_h, sv_d,
+    # Strides (Topology)
+    sl_n, sl_lvl,
+    # Strides (Out)
     so_b, so_n, so_h, so_d,
-    sw_b, sw_n, sw_h, sw_w,
+    # Strides (Weights)
+    sw_b, sw_n, sw_h, sw_lvl,
+    
+    # Constants
     sm_scale,
-    H: tl.constexpr, BLOCK_H: tl.constexpr,
-    D: tl.constexpr, BLOCK_D: tl.constexpr,
-    WINDOW: tl.constexpr,       # Real size (e.g., 7)
-    BLOCK_WINDOW: tl.constexpr  # Power of 2 (e.g., 8) <--- ADD THIS
+    H: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    D: tl.constexpr,
+    LEVELS: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_LEVELS: tl.constexpr
+    # [REMOVED] HAS_MASK, Mask_ptr
 ):
     node_idx = tl.program_id(0)
     b_idx = tl.program_id(1)
 
+    # 1. Setup
     h_idx = tl.arange(0, BLOCK_H)
     mask_h = h_idx < H
+    offs_d = tl.arange(0, BLOCK_D)
     
-    # [FIX] Use BLOCK_WINDOW for arange
-    w_idx = tl.arange(0, BLOCK_WINDOW)
-    # [FIX] Create mask for valid window indices
-    mask_w = w_idx < WINDOW
+    # The levels dimension now includes Self + Neighbors
+    offs_lvl = tl.arange(0, BLOCK_LEVELS)
+    mask_lvl = offs_lvl < LEVELS
 
-    # ... Pointers ...
-    q_base = Q_ptr + (b_idx * sq_b) + (node_idx * sq_n) + (h_idx[:, None] * sq_h)
-    k_base = K_ptr + (b_idx * sk_b) + (node_idx * sk_n) + (h_idx[:, None, None] * sk_h)
-    v_base = V_ptr + (b_idx * sv_b) + (node_idx * sv_n) + (h_idx[:, None, None] * sv_h)
+    # 2. Load Topology (Fused)
+    off_lookup = node_idx * sl_n + offs_lvl * sl_lvl
+    
+    # Load raw encoded values. 
+    # 'other=1' ensures padding defaults to (Index 0, Visible) to prevent pointer crashes
+    raw_encoded = tl.load(Lookup_ptr + off_lookup, mask=mask_lvl, other=1)
 
-    scores = tl.zeros([BLOCK_H, BLOCK_WINDOW], dtype=tl.float32) # Use BLOCK_WINDOW size
+    # --- DECODE ---
+    # Real Index = abs(raw) - 1
+    neighbor_indices = tl.abs(raw_encoded) - 1
+    
+    # Mask Status: If raw is negative, it's masked (Future)
+    is_masked_causal = (raw_encoded < 0)
 
-    # ... Score Loop ...
-    for off_d in range(0, D, BLOCK_D):
-        offs_d = off_d + tl.arange(0, BLOCK_D)
-        mask_d = offs_d < D
+    # 3. Base Pointers
+    # We calculate the base offsets for K and V batches
+    k_batch_base = K_ptr + b_idx * sk_b
+    v_batch_base = V_ptr + b_idx * sv_b
+    
+    # Q Pointer setup
+    q_ptr = Q_ptr + (b_idx * sq_b) + (node_idx * sq_n) + \
+            (h_idx[:, None] * sq_h) + (offs_d[None, :] * sq_d)
+
+    # Unified Accumulator (Covers Self + Cross)
+    acc = tl.zeros([BLOCK_H, BLOCK_LEVELS], dtype=tl.float32)
+
+    # 4. Score Loop (Compute Q * K^T)
+    for off_d_start in range(0, D, BLOCK_D):
+        cur_offs_d = off_d_start + offs_d
+        d_mask = cur_offs_d < D
+        mask_q = mask_h[:, None] & d_mask[None, :]
         
-        q = tl.load(q_base + (offs_d[None, :] * sq_d), mask=mask_h[:, None] & mask_d[None, :], other=0.0)
-        q_broad = q[:, None, :] 
-
-        # Load K using w_idx
-        k_ptr = k_base + (w_idx[None, :, None] * sk_w) + (offs_d[None, None, :] * sk_d)
+        q = tl.load(q_ptr, mask=mask_q, other=0.0)
         
-        # [FIX] Add mask_w to the load mask
-        mask_k_load = mask_h[:, None, None] & mask_w[None, :, None] & mask_d[None, None, :]
-        k = tl.load(k_ptr, mask=mask_k_load, other=0.0)
+        # --- UNIFIED K LOAD ---
+        # Calculate offsets for ALL items in the topology list at once
+        off_node_all = neighbor_indices * sk_n
         
-        scores += tl.sum(q_broad * k, axis=2)
+        ptr_k = k_batch_base + \
+                off_node_all[None, :, None] + \
+                (h_idx[:, None, None] * sk_h) + \
+                (cur_offs_d[None, None, :] * sk_d)
+        
+        mask_k = mask_h[:, None, None] & mask_lvl[None, :, None] & d_mask[None, None, :]
+        k = tl.load(ptr_k, mask=mask_k, other=0.0)
+        
+        # Dot Product
+        # Q: [BLOCK_H, BLOCK_D]
+        # K: [BLOCK_H, BLOCK_LEVELS, BLOCK_D]
+        # Result: [BLOCK_H, BLOCK_LEVELS]
+        acc += tl.sum(q[:, None, :] * k, axis=2)
+        
+        # Advance Q pointer
+        q_ptr += BLOCK_D * sq_d
 
-    # ... Softmax ...
-    # [FIX] Mask out padding indices before Softmax
-    scores = scores * sm_scale
-    scores = tl.where(mask_w[None, :], scores, -float('inf'))
-
-    max_score = tl.max(scores, axis=1)
-    exp_scores = tl.exp(scores - max_score[:, None])
-    sum_exp = tl.sum(exp_scores, axis=1)
-    weights = exp_scores / sum_exp[:, None]
+    # 5. Softmax
+    acc = acc * sm_scale
+    
+    # --- APPLY MASK ---
+    # Combine structural padding (offs_lvl >= LEVELS) AND our fused causal mask
+    mask_final = (offs_lvl >= LEVELS) | is_masked_causal
+    
+    acc = tl.where(mask_final[None, :], -float('inf'), acc)
+    
+    # Standard Softmax Logic
+    max_val = tl.max(acc, axis=1)
+    exp_val = tl.exp(acc - max_val[:, None])
+    denom = tl.sum(exp_val, axis=1)
+    weights = exp_val / denom[:, None]
 
     # Save Weights
-    w_ptr_base = W_ptr + (b_idx * sw_b) + (node_idx * sw_n) + (h_idx[:, None] * sw_h) + (w_idx[None, :] * sw_w)
-    # [FIX] Add mask_w to store
-    tl.store(w_ptr_base, weights, mask=mask_h[:, None] & mask_w[None, :])
+    w_base_ptr = W_ptr + (b_idx * sw_b) + (node_idx * sw_n) + (h_idx * sw_h)
+    w_ptr_offsets = w_base_ptr[:, None] + (offs_lvl[None, :] * sw_lvl)
+    tl.store(w_ptr_offsets, weights, mask=mask_h[:, None] & mask_lvl[None, :])
 
-    # ... Weighted Sum Loop ...
-    out_base = Out_ptr + (b_idx * so_b) + (node_idx * so_n) + (h_idx[:, None] * so_h)
-    
-    for off_d in range(0, D, BLOCK_D):
-        offs_d = off_d + tl.arange(0, BLOCK_D)
-        mask_d = offs_d < D
-        
-        v_ptr = v_base + (w_idx[None, :, None] * sv_w) + (offs_d[None, None, :] * sv_d)
-        # [FIX] Add mask_w to load
-        v = tl.load(v_ptr, mask=mask_h[:, None, None] & mask_w[None, :, None] & mask_d[None, None, :], other=0.0)
-        
-        # Weighted Sum (weights include zeros for padding due to softmax masking, so this is safe)
-        out_chunk = tl.sum(weights[:, :, None] * v, axis=1)
-        
-        tl.store(out_base + (offs_d[None, :] * so_d), out_chunk.to(Out_ptr.dtype.element_ty), mask=mask_h[:, None] & mask_d[None, :])
+    # 6. Weighted Sum Loop (Compute Weights * V)
+    out_base_ptr = Out_ptr + (b_idx * so_b) + (node_idx * so_n) + \
+                   (h_idx[:, None] * so_h) + (offs_d[None, :] * so_d)
 
+    for off_d_start in range(0, D, BLOCK_D):
+        cur_offs_d = off_d_start + offs_d
+        d_mask = cur_offs_d < D
+        mask_op = mask_h[:, None] & d_mask[None, :]
 
-def hierarchical_fused_attention(Q, K_gathered, V_gathered, idx_table):
+        # --- UNIFIED V LOAD ---
+        # Reuse decoded neighbor_indices, but apply V strides
+        off_node_all = neighbor_indices * sv_n 
+        
+        ptr_v = v_batch_base + \
+                off_node_all[None, :, None] + \
+                (h_idx[:, None, None] * sv_h) + \
+                (cur_offs_d[None, None, :] * sv_d)
+                      
+        mask_v = mask_h[:, None, None] & mask_lvl[None, :, None] & d_mask[None, None, :]
+        v = tl.load(ptr_v, mask=mask_v, other=0.0)
+        
+        # Weighted Sum
+        # Weights: [BLOCK_H, BLOCK_LEVELS]
+        # V:       [BLOCK_H, BLOCK_LEVELS, BLOCK_D]
+        # Out:     [BLOCK_H, BLOCK_D]
+        out_acc = tl.sum(weights[:, :, None] * v, axis=1)
+        
+        tl.store(out_base_ptr, out_acc.to(Out_ptr.dtype.element_ty), mask=mask_op)
+        out_base_ptr += BLOCK_D * so_d
+
+def hierarchical_fused_attention(Q, K, V, idx_table):
+    """
+    Args:
+        Q: [B, N, H, D]
+        K: [B, Total_Nodes, H, D]
+        V: [B, Total_Nodes, H, D]
+        idx_table: [N, LEVELS] (Int32) - Fused Table (Self + Neighbors)
+                   Contains sign-bit encoded masking info.
+    """
     B, N, H, Dh = Q.shape
-    WINDOW = K_gathered.shape[2]  # Real window size (e.g., 7)
     
-    # [FIX] Calculate next power of 2 for Triton arange
-    BLOCK_WINDOW = triton.next_power_of_2(WINDOW)
-
+    # The table width defines the attention span (Self + Hierarchy)
+    LEVELS = idx_table.shape[1] 
+    
     Out = torch.empty_like(Q)
-    Weights = torch.empty((B, N, H, WINDOW), device=Q.device, dtype=torch.float32)
 
-    assert Q.data_ptr() % 16 == 0
-    assert K_gathered.data_ptr() % 16 == 0
-    assert V_gathered.data_ptr() % 16 == 0
+    # Weights buffer shape matches table width exactly
+    Weights = torch.empty((B, N, H, LEVELS), device=Q.device, dtype=torch.float32)
+
+    # ------------------------------------------------------------------
+    # ALIGNMENT CHECKS
+    # ------------------------------------------------------------------
+    assert Q.data_ptr() % 16 == 0, "Q ptr not 16-byte aligned"
+    assert K.data_ptr() % 16 == 0, "K ptr not 16-byte aligned"
+    assert V.data_ptr() % 16 == 0, "V ptr not 16-byte aligned"
+    assert Out.data_ptr() % 16 == 0, "Out ptr not 16-byte aligned"
 
     grid = (N, B)
+
+    BLOCK_LEVELS = triton.next_power_of_2(LEVELS)
     BLOCK_H = triton.next_power_of_2(H)
     BLOCK_D = triton.next_power_of_2(Dh)
 
     hierarchical_attention_forward_kernel[grid](
-        Q, K_gathered, V_gathered, 
-        Out, Weights,
-        
+        Q, K, V, 
+        idx_table, # No mask table needed
+        Out,
+        Weights,
+        # Strides
         *Q.stride(),
-        *K_gathered.stride(),
-        *V_gathered.stride(),
-        *Out.stride(),
+        *K.stride(), 
+        *V.stride(),
+        idx_table.stride(0), idx_table.stride(1),
+        Out.stride(0), Out.stride(1), Out.stride(2), Out.stride(3),
         *Weights.stride(),
-        
+        # Constants
         sm_scale=1.0 / math.sqrt(Dh),
-        H=H, BLOCK_H=BLOCK_H,
-        D=Dh, BLOCK_D=BLOCK_D,
-        WINDOW=WINDOW,              # Pass real size for masking
-        BLOCK_WINDOW=BLOCK_WINDOW,  # Pass power-of-2 size for arange
-        num_warps=4
+        H=H, 
+        BLOCK_H=BLOCK_H, 
+        D=Dh, 
+        LEVELS=LEVELS,
+        BLOCK_D=BLOCK_D,
+        BLOCK_LEVELS=BLOCK_LEVELS,
+        num_warps=4 
     )
     return Out
 
@@ -391,52 +476,61 @@ def build_hierarchical_index_lookup_table_bak(seq_len, device="cuda", dtype=torc
     return idx_map, causal_mask
 
 
-def build_hierarchical_index_lookup_table(seq_len, device="cuda", dtype=torch.int32):
+def build_hierarchical_index_lookup_table(seq_len, is_causal=True, device="cuda", dtype=torch.int32):
     """
-    Vectorized version: Builds index table without Python loops over seq_len.
-    Drastically faster for large sequences.
+    Builds a FUSED index table with optional Causal Masking.
+    
+    Args:
+        seq_len (int): Sequence length (must be power of 2).
+        is_causal (bool): 
+            - If True: Future neighbors are encoded as Negative (Masked).
+            - If False: All valid neighbors are Positive (Visible/Bidirectional).
+            
+    Returns: 
+        idx_map: [seq_len, level_num + 1]
     """
     assert (seq_len & (seq_len - 1)) == 0, "seq_len must be a power of 2"
 
     total_nodes = 2 * seq_len - 1
     max_valid = total_nodes - 2
     level_num = int(math.log2(seq_len))
+    total_cols = level_num + 1
 
-    # Initialize Tensors
-    causal_mask = torch.zeros((seq_len, level_num), dtype=torch.bool, device=device)
-    idx_map = torch.full((seq_len, level_num), -1, dtype=dtype, device=device)
+    # Initialize with 1 (points to Node 0, Visible) to be safe for padding
+    idx_map = torch.ones((seq_len, total_cols), dtype=dtype, device=device)
 
-    # Start with the leaf nodes [0, 1, 2, ..., seq_len-1]
+    # 1. Setup Column 0 (Self Node) -> Always Visible (Positive)
+    # Stores (Index + 1)
     n_cur = torch.arange(seq_len, device=device, dtype=torch.int64)
+    idx_map[:, 0] = (n_cur + 1).to(dtype)
 
-    for lvl in range(level_num):
-        # Vectorized Logic
-        if lvl == 0:
+    # 2. Hierarchical Traversal
+    for lvl in range(1, total_cols):
+        if lvl == 1:
             n_next = n_cur ^ 1
             pair = n_cur
         else:
-            # Vectorized formula
             n_next = (n_cur // 2 + seq_len) ^ 1
             pair = (n_cur // 2 + seq_len)
 
-        # Boundary Check (Vectorized)
-        # We use a mask to prevent writing invalid indices, 
-        # effectively mimicking the 'break' in the loop
         valid_mask = n_next <= max_valid
         
-        # Causal Masking Logic (Vectorized)
-        # pair < n_next means neighbor is in the "future"
-        mask_step = (pair < n_next) & valid_mask
+        # Base value to store: (Index + 1)
+        val_to_store = n_next + 1
+        
+        # [CHANGE] Apply Causal Logic only if requested
+        if is_causal:
+            # Check if neighbor is in the "future" (pair < n_next)
+            should_mask = (pair < n_next) & valid_mask
+            # Flip sign to Negative if masked
+            val_to_store = torch.where(should_mask, -val_to_store, val_to_store)
 
-        # Update Tables (Batch assignment)
-        # We only update where valid_mask is True
-        idx_map[:, lvl] = torch.where(valid_mask, n_next.to(dtype), idx_map[:, lvl])
-        causal_mask[:, lvl] = torch.where(valid_mask, mask_step, causal_mask[:, lvl])
+        # Update Table: Only overwrite where valid
+        idx_map[:, lvl] = torch.where(valid_mask, val_to_store.to(dtype), idx_map[:, lvl])
 
-        # Climb up via the neighbor for the next iteration
         n_cur = n_next
 
-    return idx_map, causal_mask
+    return idx_map
 
 class HierarchicalSparseAttention(nn.Module):
     def __init__(self, dim, num_heads, dropout=0.1):
@@ -466,7 +560,7 @@ class HierarchicalSparseAttention(nn.Module):
         self.sizes = None
         self.offsets = None
 
-    def _get_lookup_table(self, L, device):
+    def _get_lookup_table(self, L, is_causal, device):
         """
         Smart retrieval: Returns cached table if L matches, otherwise recomputes.
         """
@@ -480,7 +574,7 @@ class HierarchicalSparseAttention(nn.Module):
             return self.cached_idx_table, self.cached_causal_mask
 
         # If not, recompute and update cache
-        idx_table, mask = build_hierarchical_index_lookup_table(L, device=device, dtype=torch.int64)
+        idx_table = build_hierarchical_index_lookup_table(L, is_causal=is_causal, device=device, dtype=torch.int64)
         
         self.cached_idx_table = idx_table
         self.cached_causal_mask = mask
@@ -757,7 +851,7 @@ class HierarchicalSparseAttentionTriton(nn.Module):
         self.sizes = None
         self.offsets = None
 
-    def _get_lookup_table(self, L, device):
+    def _get_lookup_table(self, L, is_causal, device):
         """
         Smart retrieval: Returns cached table if L matches, otherwise recomputes.
         """
@@ -771,7 +865,7 @@ class HierarchicalSparseAttentionTriton(nn.Module):
             return self.cached_idx_table, self.cached_causal_mask
 
         # If not, recompute and update cache
-        idx_table, mask = build_hierarchical_index_lookup_table(L, device=device, dtype=torch.int64)
+        idx_table = build_hierarchical_index_lookup_table(L, is_causal=is_causal, device=device, dtype=torch.int64)
         
         self.cached_idx_table = idx_table
         self.cached_causal_mask = mask
@@ -909,78 +1003,25 @@ class HierarchicalSparseAttentionTriton(nn.Module):
         
         # K, V: [B, Total_Nodes, H, Dh]
         # We project K and V separately using your existing layers
-        # Keep as [B, Total, H, D] for efficient gathering
         K_full = self.Wk_x(XY).view(B, -1, H, Dh)
         V_full = self.Wv_x(XY).view(B, -1, H, Dh)
         
         # Apply dropout to V
         V_full = self.dropout(V_full)
 
-        # 3. Get Topology (Original Method)
-        # idx_table: [N, Levels] (Contains indices of neighbors)
-        # neighbor_mask: [N, Levels] (True = Mask Out/Future)
-        idx_table, neighbor_mask = self._get_lookup_table(N, device=x.device)
+        # 3. Ensure Contiguity
+        # The Triton kernel does pointer arithmetic. While Linear() outputs are usually 
+        # contiguous, operations like Dropout or View can sometimes create strides 
+        # that break optimized kernels. We enforce it here to be safe.
+        if not K_full.is_contiguous(): K_full = K_full.contiguous()
+        if not V_full.is_contiguous(): V_full = V_full.contiguous()
 
-        # 4. Construct Gather Indices [N, Window]
-        # Window Size = 1 (Self) + Levels (Neighbors)
-        
-        # A. Self Indices (Column 0)
-        self_indices = torch.arange(N, device=x.device, dtype=idx_table.dtype).unsqueeze(1)
-        
-        # B. Neighbor Indices (Columns 1..L)
-        # [CRITICAL] Handle Masking via Indexing
-        # Since the kernel has NO mask logic, we must handle invalid neighbors here.
-        # Strategy: 
-        # 1. If neighbor_mask is True (Invalid/Future), we point the index to 0 (Self).
-        # 2. Later, we might want to zero-out the V for these duplicates to reduce noise,
-        #    but standard practice in mask-free kernels is often just redirecting to a valid node.
-        
-        # Ensure we don't crash on -1s if your table uses them
-        safe_neighbors = idx_table.clamp(min=0)
-        
-        if mask is not None:
-            # If causal masking is active, redirect masked neighbors to Self (index 0)
-            # This allows the kernel to run without a mask pointer.
-            safe_neighbors = torch.where(neighbor_mask, torch.zeros_like(safe_neighbors), safe_neighbors)
+        is_causal = True if mask is not None else False
 
-        # C. Combine -> [N, Levels+1]
-        gather_indices = torch.cat([self_indices, safe_neighbors], dim=1)
+        # Get Topology
+        idx_table = self._get_lookup_table(N, is_causal=is_causal, device=x.device)
 
-        # 5. Gather K and V [Pre-Kernel Optimization]
-        # K_full: [B, Total, H, D] -> Gather dim 1 -> [B, N, Window, H, D]
-        # This creates the contiguous "Dense Window" the kernel needs.
-        
-        # Expand indices for Batch/Head dimensions isn't needed if we use simple indexing
-        # K_full is [B, T, H, D]. We want to pick T based on [N, W].
-        # We use advanced indexing.
-        # dim 0 (B):   [:, None, None, None, None] (Implicit in broadcast) -> No, complex.
-        # Simplest PyTorch way: Flatten B*H or loop? No, use expansion:
-        
-        # Expand indices to [B, N, W] for gathering
-        # gather_indices is [N, W]. We need to apply it to every batch.
-        # K_full: [B, T, H, D]
-        # Output: [B, N, W, H, D]
-        
-        # Fast Gather Trick:
-        # 1. View K as [B, T, H*D]
-        # 2. Expand indices to [B, N, W]
-        # 3. Gather
-        
-        # Actually, simpler: Since gathering is on dim 1 (Nodes), and shared across B/H:
-        K_gathered = K_full[:, gather_indices, :, :] 
-        V_gathered = V_full[:, gather_indices, :, :]
-
-        # 6. Ensure Contiguity
-        if not K_gathered.is_contiguous(): K_gathered = K_gathered.contiguous()
-        if not V_gathered.is_contiguous(): V_gathered = V_gathered.contiguous()
-
-        # 7. Call Triton Kernel (Unified Forward)
-        # We pass idx_table only because your wrapper might expect it for shape extraction,
-        # but the kernel reads K_gathered/V_gathered directly.
-        output_leaf_heads = hierarchical_fused_attention(
-            Q, K_gathered, V_gathered, 
-            idx_table # Used for determining Levels count
-        )
+        output_leaf_heads = hierarchical_fused_attention( Q, K_full, V_full, idx_table)
     
         return output_leaf_heads.view(B, N, D)
 
