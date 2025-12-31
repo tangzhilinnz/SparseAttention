@@ -464,7 +464,7 @@ def hierarchical_attention_forward_kernel(
 #  Backward Kernel 1: Score Gradient (Computes dS)
 # ------------------------------------------------------------------
 @triton.jit
-def hierarchical_backward_score_kernel(
+def hierarchical_attention_backward_dS_kernel(
     DO_ptr, W_ptr, V_ptr, Lookup_ptr, DS_ptr,
     sdo_b, sdo_n, sdo_h, sdo_d,
     sw_b, sw_n, sw_h, sw_lvl,
@@ -530,7 +530,7 @@ def hierarchical_backward_score_kernel(
 #  Backward Kernel 2: Deterministic Gather (Computes dK, dV)
 # ------------------------------------------------------------------
 @triton.jit
-def hierarchical_gather_kernel_tiled(
+def hierarchical_attention_backward_dK_dV_kernel(
     DS_ptr, Q_ptr, W_ptr, DO_ptr, Gather_Table_ptr,
     DK_ptr, DV_ptr,
     sds_b, sds_n, sds_h, sds_lvl,
@@ -613,7 +613,7 @@ def hierarchical_gather_kernel_tiled(
 #  Backward Kernel 3: Compute dQ (Small Kernel)
 # ------------------------------------------------------------------
 @triton.jit
-def hierarchical_dq_kernel(
+def hierarchical_attention_backward_dQ_kernel(
     DS_ptr, K_ptr, Lookup_ptr, DQ_ptr,
     sds_b, sds_n, sds_h, sds_lvl,
     sk_b, sk_n, sk_h, sk_d,
@@ -719,9 +719,9 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         
         # 1. Compute dS (Gradient of Scores)
         DS = torch.empty_like(Weights)
-        grid_score = (N, B)
+        grid = (N, B)
         
-        hierarchical_backward_score_kernel[grid_score](
+        hierarchical_attention_backward_dS_kernel[grid](
             grad_output, Weights, V, idx_table, DS,
             *grad_output.stride(), *Weights.stride(), *V.stride(), *idx_table.stride(), *DS.stride(),
             sm_scale, H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS,
@@ -733,10 +733,10 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         dK = torch.empty_like(K)
         dV = torch.empty_like(V)
         total_nodes = gather_table.shape[0]
-        grid_gather = (total_nodes, B)
+        grid = (total_nodes, B)
         BLOCK_L = 32
         
-        hierarchical_gather_kernel_tiled[grid_gather](
+        hierarchical_attention_backward_dK_dV_kernel[grid](
             DS, Q, Weights, grad_output, gather_table,
             dK, dV,
             *DS.stride(), *Q.stride(), *Weights.stride(), *grad_output.stride(), *dK.stride(),
@@ -747,8 +747,8 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         
         # 3. Compute dQ
         dQ = torch.empty_like(Q)
-        grid_dq = (N, B)
-        hierarchical_dq_kernel[grid_dq](
+        grid = (N, B)
+        hierarchical_attention_backward_dQ_kernel[grid](
             DS, K, idx_table, dQ,
             *DS.stride(), *K.stride(), *idx_table.stride(), *dQ.stride(),
             H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS,

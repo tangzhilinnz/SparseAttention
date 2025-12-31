@@ -205,209 +205,133 @@ def build_parent_nodes(Q_p, K_p, V_p, K_c, V_c):
 @triton.jit
 def hierarchical_attention_forward_kernel(
     # Pointers
-    Q_ptr, K_ptr, V_ptr, 
-    Lookup_ptr, Mask_ptr, 
-    Out_ptr, W_ptr, 
+    Q_ptr, K_ptr, V_ptr,  # K and V are pre-gathered: [B, N, Window, H, D]
+    Out_ptr, W_ptr,       
     
-    # Strides (Q)
+    # Strides
     sq_b, sq_n, sq_h, sq_d,
-    # Strides (K)
-    sk_b, sk_n, sk_h, sk_d,
-    # Strides (V)
-    sv_b, sv_n, sv_h, sv_d,
-    # Strides (Topology)
-    sl_n, sl_lvl,
-    # Strides (Out)
+    sk_b, sk_n, sk_w, sk_h, sk_d, # Added Window Stride (sk_w)
+    sv_b, sv_n, sv_w, sv_h, sv_d, # Added Window Stride (sv_w)
     so_b, so_n, so_h, so_d,
-    # Strides (Weights)
-    sw_b, sw_n, sw_h, sw_lvl,
+    sw_b, sw_n, sw_h, sw_w,       # Weights have shape [B, N, H, Window]
     
     # Constants
     sm_scale,
-    H: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-    D: tl.constexpr,
-    LEVELS: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    BLOCK_LEVELS: tl.constexpr, 
-    HAS_MASK: tl.constexpr 
+    H: tl.constexpr, BLOCK_H: tl.constexpr,
+    D: tl.constexpr, BLOCK_D: tl.constexpr,
+    WINDOW: tl.constexpr  # Window Size = Levels + 1 (Self included)
 ):
     node_idx = tl.program_id(0)
     b_idx = tl.program_id(1)
 
-    # 1. Setup
     h_idx = tl.arange(0, BLOCK_H)
     mask_h = h_idx < H
-    offs_d = tl.arange(0, BLOCK_D)
-    offs_lvl = tl.arange(0, BLOCK_LEVELS)
-    mask_lvl = offs_lvl < LEVELS
-
-    # 2. Load Topology
-    off_lookup = node_idx * sl_n + offs_lvl * sl_lvl
-    neighbor_indices = tl.load(Lookup_ptr + off_lookup, mask=mask_lvl, other=0)
     
-    neighbor_mask_val = tl.zeros([BLOCK_LEVELS], dtype=tl.int1)
-    if HAS_MASK:
-        # User confirmed: 1 = Mask Out (Ignore), 0 = Valid (Keep)
-        val_int8 = tl.load(Mask_ptr + off_lookup, mask=mask_lvl, other=1).to(tl.int8)
-        neighbor_mask_val = (val_int8 != 0)
+    # Range for the window dimension (small enough to unroll fully)
+    w_idx = tl.arange(0, WINDOW)
 
-    # 3. Base Pointers
-    k_batch_base = K_ptr + b_idx * sk_b
+    # 1. Pointers
+    # Q: [B, N, H, D]
+    q_base = Q_ptr + (b_idx * sq_b) + (node_idx * sq_n) + (h_idx[:, None] * sq_h)
     
-    # [FIX]: Use V specific stride for batch
-    v_batch_base = V_ptr + b_idx * sv_b
+    # K/V: [B, N, Window, H, D]
+    # We fix B, N, H. Loop over D. Broadcast over Window.
+    k_base = K_ptr + (b_idx * sk_b) + (node_idx * sk_n) + (h_idx[:, None, None] * sk_h)
+    v_base = V_ptr + (b_idx * sv_b) + (node_idx * sv_n) + (h_idx[:, None, None] * sv_h)
+
+    # Accumulators
+    scores = tl.zeros([BLOCK_H, WINDOW], dtype=tl.float32)
+    output = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
+
+    # -----------------------------------------------------------
+    # 2. Score Loop (Reduce over D)
+    # -----------------------------------------------------------
+    for off_d in range(0, D, BLOCK_D):
+        offs_d = off_d + tl.arange(0, BLOCK_D)
+        mask_d = offs_d < D
+        
+        # Load Q [H, D] -> Broadcast to [H, 1, D]
+        q = tl.load(q_base + (offs_d[None, :] * sq_d), mask=mask_h[:, None] & mask_d[None, :], other=0.0)
+        q_broad = q[:, None, :] 
+
+        # Load K [H, Window, D]
+        # Ptr: Base + (Window * stride_W) + (D * stride_D)
+        k_ptr = k_base + (w_idx[None, :, None] * sk_w) + (offs_d[None, None, :] * sk_d)
+        k = tl.load(k_ptr, mask=mask_h[:, None, None] & mask_d[None, None, :], other=0.0)
+        
+        # Dot Product: [H, 1, D] * [H, W, D] -> Sum D -> [H, W]
+        scores += tl.sum(q_broad * k, axis=2)
+
+    # 3. Softmax
+    scores = scores * sm_scale
+    max_score = tl.max(scores, axis=1)
+    exp_scores = tl.exp(scores - max_score[:, None])
+    sum_exp = tl.sum(exp_scores, axis=1)
+    weights = exp_scores / sum_exp[:, None]
+
+    # Save Weights [B, N, H, Window]
+    w_ptr_base = W_ptr + (b_idx * sw_b) + (node_idx * sw_n) + (h_idx[:, None] * sw_h) + (w_idx[None, :] * sw_w)
+    tl.store(w_ptr_base, weights, mask=mask_h[:, None])
+
+    # -----------------------------------------------------------
+    # 4. Weighted Sum Loop (Reduce over D)
+    # -----------------------------------------------------------
+    # We re-iterate D to compute Output = Sum(Weights * V)
+    out_base = Out_ptr + (b_idx * so_b) + (node_idx * so_n) + (h_idx[:, None] * so_h)
     
-    off_node_self = node_idx * sk_n
-    off_node_cross = neighbor_indices * sk_n 
-
-    q_ptr = Q_ptr + (b_idx * sq_b) + (node_idx * sq_n) + \
-            (h_idx[:, None] * sq_h) + (offs_d[None, :] * sq_d)
-
-    acc_self = tl.zeros([BLOCK_H], dtype=tl.float32)
-    acc_cross = tl.zeros([BLOCK_H, BLOCK_LEVELS], dtype=tl.float32)
-
-    # 4. Score Loop
-    for off_d_start in range(0, D, BLOCK_D):
-        cur_offs_d = off_d_start + offs_d
-        d_mask = cur_offs_d < D
-        mask_q = mask_h[:, None] & d_mask[None, :]
+    for off_d in range(0, D, BLOCK_D):
+        offs_d = off_d + tl.arange(0, BLOCK_D)
+        mask_d = offs_d < D
         
-        q = tl.load(q_ptr, mask=mask_q, other=0.0)
+        # Load V [H, Window, D]
+        v_ptr = v_base + (w_idx[None, :, None] * sv_w) + (offs_d[None, None, :] * sv_d)
+        v = tl.load(v_ptr, mask=mask_h[:, None, None] & mask_d[None, None, :], other=0.0)
         
-        # --- K SELF ---
-        ptr_k_self = k_batch_base + off_node_self + \
-                     (h_idx[:, None] * sk_h) + (cur_offs_d[None, :] * sk_d)
-        k_self = tl.load(ptr_k_self, mask=mask_q, other=0.0)
-        acc_self += tl.sum(q * k_self, axis=1)
-
-        # --- K CROSS ---
-        ptr_k_cross = k_batch_base + \
-                      off_node_cross[None, :, None] + \
-                      (h_idx[:, None, None] * sk_h) + \
-                      (cur_offs_d[None, None, :] * sk_d)
+        # Weighted Sum: [H, W, 1] * [H, W, D] -> Sum W -> [H, D]
+        out_chunk = tl.sum(weights[:, :, None] * v, axis=1)
         
-        mask_k = mask_h[:, None, None] & mask_lvl[None, :, None] & d_mask[None, None, :]
-        k_cross = tl.load(ptr_k_cross, mask=mask_k, other=0.0)
-        
-        acc_cross += tl.sum(q[:, None, :] * k_cross, axis=2)
-        q_ptr += BLOCK_D * sq_d
+        # Store Output
+        tl.store(out_base + (offs_d[None, :] * so_d), out_chunk.to(Out_ptr.dtype.element_ty), mask=mask_h[:, None] & mask_d[None, :])
 
-    # 5. Softmax
-    acc_self = acc_self * sm_scale
-    acc_cross = acc_cross * sm_scale
-    
-    # Apply Masking (1 = Mask Out / -inf)
-    mask_broadcast = (offs_lvl >= LEVELS)
-    if HAS_MASK:
-        mask_broadcast = mask_broadcast | neighbor_mask_val
-        
-    acc_cross = tl.where(mask_broadcast[None, :], -float('inf'), acc_cross)
-    
-    max_cross = tl.max(acc_cross, axis=1)
-    max_all = tl.maximum(acc_self, max_cross)
-    
-    exp_self = tl.exp(acc_self - max_all)
-    exp_cross = tl.exp(acc_cross - max_all[:, None])
-    
-    denom = exp_self + tl.sum(exp_cross, axis=1)
-    w_self = exp_self / denom 
-    w_cross = exp_cross / denom[:, None]
 
-    # Save Weights
-    w_base_ptr = W_ptr + (b_idx * sw_b) + (node_idx * sw_n) + (h_idx * sw_h)
-    tl.store(w_base_ptr + (0 * sw_lvl), w_self, mask=mask_h)
-    
-    w_cross_ptr = w_base_ptr[:, None] + ((1 + offs_lvl[None, :]) * sw_lvl)
-    tl.store(w_cross_ptr, w_cross, mask=mask_h[:, None] & mask_lvl[None, :])
-
-    # 6. Weighted Sum Loop
-    out_base_ptr = Out_ptr + (b_idx * so_b) + (node_idx * so_n) + \
-                   (h_idx[:, None] * so_h) + (offs_d[None, :] * so_d)
-
-    for off_d_start in range(0, D, BLOCK_D):
-        cur_offs_d = off_d_start + offs_d
-        d_mask = cur_offs_d < D
-        mask_op = mask_h[:, None] & d_mask[None, :]
-
-        # --- V SELF ---
-        # [FIX]: Use sv_h and sv_d
-        ptr_v_self = v_batch_base + off_node_self + \
-                     (h_idx[:, None] * sv_h) + (cur_offs_d[None, :] * sv_d)
-        v_self = tl.load(ptr_v_self, mask=mask_op, other=0.0)
-        out_acc = w_self[:, None] * v_self
-        
-        # --- V CROSS ---
-        # [FIX]: Use sv_h and sv_d
-        ptr_v_cross = v_batch_base + \
-                      off_node_cross[None, :, None] + \
-                      (h_idx[:, None, None] * sv_h) + \
-                      (cur_offs_d[None, None, :] * sv_d)
-                      
-        mask_v = mask_h[:, None, None] & mask_lvl[None, :, None] & d_mask[None, None, :]
-        v_cross = tl.load(ptr_v_cross, mask=mask_v, other=0.0)
-        
-        out_acc += tl.sum(w_cross[:, :, None] * v_cross, axis=1)
-        
-        tl.store(out_base_ptr, out_acc.to(Out_ptr.dtype.element_ty), mask=mask_op)
-        out_base_ptr += BLOCK_D * so_d
-
-def hierarchical_fused_attention(Q, K, V, idx_table, mask_table):
+def hierarchical_fused_attention(Q, K_gathered, V_gathered, idx_table):
+    """
+    Inputs:
+      Q: [B, N, H, D]
+      K_gathered, V_gathered: [B, N, Window, H, D] (Where Window = Levels + 1)
+      idx_table: Used only for shape info here, actual gathering happened before.
+    """
     B, N, H, Dh = Q.shape
-    LEVELS = idx_table.shape[1]
-    Out = torch.empty_like(Q)
-
-    # 1. Allocate Dummy Weights Buffer
-    # The kernel needs a pointer to write attention weights (even if we don't use them).
-    # Shape: [B, N, H, 1 + LEVELS]
-    Weights = torch.empty((B, N, H, 1 + LEVELS), device=Q.device, dtype=torch.float32)
-
-    HAS_MASK = (mask_table is not None)
-    mask_ptr_safe = mask_table if HAS_MASK else Q 
-
-    # ------------------------------------------------------------------
-    # ALIGNMENT CHECKS (Safety for Vectorized Loads)
-    # ------------------------------------------------------------------
-    # 1. Check Base Pointers: Must be divisible by 16 bytes
-    #    This allows tl.multiple_of(ptr, 16) in the kernel.
-    assert Q.data_ptr() % 16 == 0, "Q ptr not 16-byte aligned"
-    assert K.data_ptr() % 16 == 0, "K ptr not 16-byte aligned"
-    assert V.data_ptr() % 16 == 0, "V ptr not 16-byte aligned"
-    assert Out.data_ptr() % 16 == 0, "Out ptr not 16-byte aligned"
-
-    # 2. Check Strides (Optional but recommended for max perf)
-    #    If the last dim stride is 1 (contiguous), we want the row stride 
-    #    (stride(2) for Head, or stride(3) for Dim) to be a multiple of 8 elements 
-    #    (assuming fp16: 8 elements * 2 bytes = 16 bytes).
-    #    This ensures every new row starts on an aligned address.
-    #    Since D=Dh (Head Dim), usually 64 or 128, this is naturally true.
+    WINDOW = K_gathered.shape[2] # Gathered dimension
     
-    grid = (N, B)
+    Out = torch.empty_like(Q)
+    # Weights: [B, N, H, Window]
+    Weights = torch.empty((B, N, H, WINDOW), device=Q.device, dtype=torch.float32)
 
-    BLOCK_LEVELS = triton.next_power_of_2(LEVELS)
+    # Alignment Checks
+    assert Q.data_ptr() % 16 == 0
+    assert K_gathered.data_ptr() % 16 == 0
+    assert V_gathered.data_ptr() % 16 == 0
+
+    grid = (N, B)
     BLOCK_H = triton.next_power_of_2(H)
     BLOCK_D = triton.next_power_of_2(Dh)
 
     hierarchical_attention_forward_kernel[grid](
-        Q, K, V, 
-        idx_table, mask_ptr_safe, 
-        Out,
-        Weights,           # <--- Pass dummy buffer
+        Q, K_gathered, V_gathered, 
+        Out, Weights,
+        
         *Q.stride(),
-        *K.stride(), 
-        *V.stride(),
-        idx_table.stride(0), idx_table.stride(1),
-        Out.stride(0), Out.stride(1), Out.stride(2), Out.stride(3),
-        *Weights.stride(),
+        *K_gathered.stride(), # Passes 5 strides
+        *V_gathered.stride(), # Passes 5 strides
+        *Out.stride(),
+        *Weights.stride(),    # Passes 4 strides
+        
         sm_scale=1.0 / math.sqrt(Dh),
-        H=H,
-        BLOCK_H=BLOCK_H, # Pass padded H
-        D=Dh,
-        LEVELS=LEVELS,
-        BLOCK_D=BLOCK_D,
-        BLOCK_LEVELS=BLOCK_LEVELS, 
-        HAS_MASK=HAS_MASK,
-        num_warps=4 # 4 is usually better than 8 for smaller workloads unless D > 128
+        H=H, BLOCK_H=BLOCK_H,
+        D=Dh, BLOCK_D=BLOCK_D,
+        WINDOW=WINDOW,
+        num_warps=4
     )
     return Out
 
@@ -999,30 +923,77 @@ class HierarchicalSparseAttentionTriton(nn.Module):
         
         # K, V: [B, Total_Nodes, H, Dh]
         # We project K and V separately using your existing layers
+        # Keep as [B, Total, H, D] for efficient gathering
         K_full = self.Wk_x(XY).view(B, -1, H, Dh)
         V_full = self.Wv_x(XY).view(B, -1, H, Dh)
         
         # Apply dropout to V
         V_full = self.dropout(V_full)
 
-        # 3. Ensure Contiguity
-        # The Triton kernel does pointer arithmetic. While Linear() outputs are usually 
-        # contiguous, operations like Dropout or View can sometimes create strides 
-        # that break optimized kernels. We enforce it here to be safe.
-        if not K_full.is_contiguous(): K_full = K_full.contiguous()
-        if not V_full.is_contiguous(): V_full = V_full.contiguous()
-
-        # Get Topology
+        # 3. Get Topology (Original Method)
+        # idx_table: [N, Levels] (Contains indices of neighbors)
+        # neighbor_mask: [N, Levels] (True = Mask Out/Future)
         idx_table, neighbor_mask = self._get_lookup_table(N, device=x.device)
 
-        # DECISION LOGIC:
-        # If the user passed a mask (indicating causality is on), use neighbor_mask.
-        # If mask is None (indicating full/bidirectional), pass None.
-        active_mask = neighbor_mask if mask is not None else None
+        # 4. Construct Gather Indices [N, Window]
+        # Window Size = 1 (Self) + Levels (Neighbors)
+        
+        # A. Self Indices (Column 0)
+        self_indices = torch.arange(N, device=x.device, dtype=idx_table.dtype).unsqueeze(1)
+        
+        # B. Neighbor Indices (Columns 1..L)
+        # [CRITICAL] Handle Masking via Indexing
+        # Since the kernel has NO mask logic, we must handle invalid neighbors here.
+        # Strategy: 
+        # 1. If neighbor_mask is True (Invalid/Future), we point the index to 0 (Self).
+        # 2. Later, we might want to zero-out the V for these duplicates to reduce noise,
+        #    but standard practice in mask-free kernels is often just redirecting to a valid node.
+        
+        # Ensure we don't crash on -1s if your table uses them
+        safe_neighbors = idx_table.clamp(min=0)
+        
+        if mask is not None:
+            # If causal masking is active, redirect masked neighbors to Self (index 0)
+            # This allows the kernel to run without a mask pointer.
+            safe_neighbors = torch.where(neighbor_mask, torch.zeros_like(safe_neighbors), safe_neighbors)
 
+        # C. Combine -> [N, Levels+1]
+        gather_indices = torch.cat([self_indices, safe_neighbors], dim=1)
+
+        # 5. Gather K and V [Pre-Kernel Optimization]
+        # K_full: [B, Total, H, D] -> Gather dim 1 -> [B, N, Window, H, D]
+        # This creates the contiguous "Dense Window" the kernel needs.
+        
+        # Expand indices for Batch/Head dimensions isn't needed if we use simple indexing
+        # K_full is [B, T, H, D]. We want to pick T based on [N, W].
+        # We use advanced indexing.
+        # dim 0 (B):   [:, None, None, None, None] (Implicit in broadcast) -> No, complex.
+        # Simplest PyTorch way: Flatten B*H or loop? No, use expansion:
+        
+        # Expand indices to [B, N, W] for gathering
+        # gather_indices is [N, W]. We need to apply it to every batch.
+        # K_full: [B, T, H, D]
+        # Output: [B, N, W, H, D]
+        
+        # Fast Gather Trick:
+        # 1. View K as [B, T, H*D]
+        # 2. Expand indices to [B, N, W]
+        # 3. Gather
+        
+        # Actually, simpler: Since gathering is on dim 1 (Nodes), and shared across B/H:
+        K_gathered = K_full[:, gather_indices, :, :] 
+        V_gathered = V_full[:, gather_indices, :, :]
+
+        # 6. Ensure Contiguity
+        if not K_gathered.is_contiguous(): K_gathered = K_gathered.contiguous()
+        if not V_gathered.is_contiguous(): V_gathered = V_gathered.contiguous()
+
+        # 7. Call Triton Kernel (Unified Forward)
+        # We pass idx_table only because your wrapper might expect it for shape extraction,
+        # but the kernel reads K_gathered/V_gathered directly.
         output_leaf_heads = hierarchical_fused_attention(
-            Q, K_full, V_full, 
-            idx_table, active_mask
+            Q, K_gathered, V_gathered, 
+            idx_table # Used for determining Levels count
         )
     
         return output_leaf_heads.view(B, N, D)
