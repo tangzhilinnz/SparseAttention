@@ -308,19 +308,26 @@ def build_parent_nodes(Q_p, K_p, V_p, K_c, V_c):
 ## ============================================================================================= ##
 ## ============================================================================================= ##
 
+
 @triton.jit
 def hierarchical_attention_forward_kernel(
     # Pointers
     Q_ptr, K_ptr, V_ptr, 
     Lookup_ptr, Mask_ptr, 
-    Out_ptr, W_ptr,  # <--- Added W_ptr for Context Saving
+    Out_ptr, W_ptr, 
     
-    # Strides
+    # Strides (Q)
     sq_b, sq_n, sq_h, sq_d,
+    # Strides (K)
     sk_b, sk_n, sk_h, sk_d,
+    # Strides (V) <--- [FIX]: Explicit V strides added
+    sv_b, sv_n, sv_h, sv_d,
+    # Strides (Topology)
     sl_n, sl_lvl,
+    # Strides (Out)
     so_b, so_n, so_h, so_d,
-    sw_b, sw_n, sw_h, sw_lvl, # <--- Strides for Weights
+    # Strides (Weights)
+    sw_b, sw_n, sw_h, sw_lvl,
     
     # Constants
     sm_scale,
@@ -335,32 +342,28 @@ def hierarchical_attention_forward_kernel(
     node_idx = tl.program_id(0)
     b_idx = tl.program_id(1)
 
-    # -----------------------------------------------------------
-    # 1. Setup & Alignment
-    # -----------------------------------------------------------
+    # 1. Setup
     h_idx = tl.arange(0, BLOCK_H)
     mask_h = h_idx < H
-
     offs_d = tl.arange(0, BLOCK_D)
     offs_lvl = tl.arange(0, BLOCK_LEVELS)
     mask_lvl = offs_lvl < LEVELS
 
-    # -----------------------------------------------------------
     # 2. Load Topology
-    # -----------------------------------------------------------
     off_lookup = node_idx * sl_n + offs_lvl * sl_lvl
     neighbor_indices = tl.load(Lookup_ptr + off_lookup, mask=mask_lvl, other=0)
     
     neighbor_mask_val = tl.zeros([BLOCK_LEVELS], dtype=tl.int1)
     if HAS_MASK:
+        # User confirmed: 1 = Mask Out (Ignore), 0 = Valid (Keep)
         val_int8 = tl.load(Mask_ptr + off_lookup, mask=mask_lvl, other=1).to(tl.int8)
         neighbor_mask_val = (val_int8 != 0)
 
-    # -----------------------------------------------------------
     # 3. Base Pointers
-    # -----------------------------------------------------------
     k_batch_base = K_ptr + b_idx * sk_b
-    v_batch_base = V_ptr + b_idx * sk_b
+    
+    # [FIX]: Use V specific stride for batch
+    v_batch_base = V_ptr + b_idx * sv_b
     
     off_node_self = node_idx * sk_n
     off_node_cross = neighbor_indices * sk_n 
@@ -371,14 +374,12 @@ def hierarchical_attention_forward_kernel(
     acc_self = tl.zeros([BLOCK_H], dtype=tl.float32)
     acc_cross = tl.zeros([BLOCK_H, BLOCK_LEVELS], dtype=tl.float32)
 
-    # -----------------------------------------------------------
-    # 4. Score Loop (Tiled)
-    # -----------------------------------------------------------
+    # 4. Score Loop
     for off_d_start in range(0, D, BLOCK_D):
         cur_offs_d = off_d_start + offs_d
         d_mask = cur_offs_d < D
-        
         mask_q = mask_h[:, None] & d_mask[None, :]
+        
         q = tl.load(q_ptr, mask=mask_q, other=0.0)
         
         # --- K SELF ---
@@ -399,12 +400,11 @@ def hierarchical_attention_forward_kernel(
         acc_cross += tl.sum(q[:, None, :] * k_cross, axis=2)
         q_ptr += BLOCK_D * sq_d
 
-    # -----------------------------------------------------------
-    # 5. Softmax & Save Weights
-    # -----------------------------------------------------------
+    # 5. Softmax
     acc_self = acc_self * sm_scale
     acc_cross = acc_cross * sm_scale
     
+    # Apply Masking (1 = Mask Out / -inf)
     mask_broadcast = (offs_lvl >= LEVELS)
     if HAS_MASK:
         mask_broadcast = mask_broadcast | neighbor_mask_val
@@ -421,21 +421,14 @@ def hierarchical_attention_forward_kernel(
     w_self = exp_self / denom 
     w_cross = exp_cross / denom[:, None]
 
-    # [CONTEXT SAVING] Store weights for Backward
-    # W shape: [B, N, H, 1 + LEVELS]. Index 0 is Self, 1..LEVELS is Cross.
+    # Save Weights
     w_base_ptr = W_ptr + (b_idx * sw_b) + (node_idx * sw_n) + (h_idx * sw_h)
-    
-    # Store Self (Index 0)
     tl.store(w_base_ptr + (0 * sw_lvl), w_self, mask=mask_h)
     
-    # Store Cross (Indices 1 to LEVELS)
-    # We map offs_lvl (0..BLOCK_LEVELS) to storage indices (1..1+BLOCK_LEVELS)
     w_cross_ptr = w_base_ptr[:, None] + ((1 + offs_lvl[None, :]) * sw_lvl)
     tl.store(w_cross_ptr, w_cross, mask=mask_h[:, None] & mask_lvl[None, :])
 
-    # -----------------------------------------------------------
     # 6. Weighted Sum Loop
-    # -----------------------------------------------------------
     out_base_ptr = Out_ptr + (b_idx * so_b) + (node_idx * so_n) + \
                    (h_idx[:, None] * so_h) + (offs_d[None, :] * so_d)
 
@@ -445,16 +438,18 @@ def hierarchical_attention_forward_kernel(
         mask_op = mask_h[:, None] & d_mask[None, :]
 
         # --- V SELF ---
+        # [FIX]: Use sv_h and sv_d
         ptr_v_self = v_batch_base + off_node_self + \
-                     (h_idx[:, None] * sk_h) + (cur_offs_d[None, :] * sk_d)
+                     (h_idx[:, None] * sv_h) + (cur_offs_d[None, :] * sv_d)
         v_self = tl.load(ptr_v_self, mask=mask_op, other=0.0)
         out_acc = w_self[:, None] * v_self
         
         # --- V CROSS ---
+        # [FIX]: Use sv_h and sv_d
         ptr_v_cross = v_batch_base + \
                       off_node_cross[None, :, None] + \
-                      (h_idx[:, None, None] * sk_h) + \
-                      (cur_offs_d[None, None, :] * sk_d)
+                      (h_idx[:, None, None] * sv_h) + \
+                      (cur_offs_d[None, None, :] * sv_d)
                       
         mask_v = mask_h[:, None, None] & mask_lvl[None, :, None] & d_mask[None, None, :]
         v_cross = tl.load(ptr_v_cross, mask=mask_v, other=0.0)
@@ -463,6 +458,7 @@ def hierarchical_attention_forward_kernel(
         
         tl.store(out_base_ptr, out_acc.to(Out_ptr.dtype.element_ty), mask=mask_op)
         out_base_ptr += BLOCK_D * so_d
+
 
 # ------------------------------------------------------------------
 #  Backward Kernel 1: Score Gradient (Computes dS)
@@ -667,7 +663,7 @@ def hierarchical_dq_kernel(
         tl.store(dq_base + (h_idx[:, None] * sdq_h) + (offs_d[None, :] * sdq_d), dq_val, mask=mask_op)
 
 
-class HierarchicalFusedAttentionFunc(torch.autograd.Function):
+class HierarchicalAttentionFunc(torch.autograd.Function):
     @staticmethod
     def forward(ctx, Q, K, V, idx_table, gather_table, mask_table=None):
         # Alignment checks
@@ -693,11 +689,12 @@ class HierarchicalFusedAttentionFunc(torch.autograd.Function):
         sm_scale = 1.0 / math.sqrt(D)
         
         hierarchical_attention_forward_kernel[grid](
-            Q, K, V, 
-            idx_table, mask_ptr_safe, 
+            Q, K, V,
+            idx_table, mask_ptr_safe,
             Out, Weights,
             *Q.stride(),
-            *K.stride(), 
+            *K.stride(),
+            *V.stride(),
             *idx_table.stride(),
             *Out.stride(), *Weights.stride(),
             sm_scale=sm_scale,
@@ -761,7 +758,7 @@ class HierarchicalFusedAttentionFunc(torch.autograd.Function):
         return dQ, dK, dV, None, None, None
 
 def hierarchical_fused_attention(Q, K, V, idx_table, gather_table, mask_table=None):
-    return HierarchicalFusedAttentionFunc.apply(Q, K, V, idx_table, gather_table, mask_table)
+    return HierarchicalAttentionFunc.apply(Q, K, V, idx_table, gather_table, mask_table)
 
 
 ## ============================================================================================= ##
