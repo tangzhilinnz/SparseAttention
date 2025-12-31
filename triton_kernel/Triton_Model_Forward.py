@@ -1271,7 +1271,7 @@ class TransformerLM(nn.Module):
         
         for layer in self.layers:
             if return_attention:
-                x, y, attention = layer(x, y, mask=trg_mask, return_attention=True)
+                x, y, attention = layer(x, y, mask=None, return_attention=True)
                 attentions.append(attention)
             else:
                 x, y = layer(x, y, mask=trg_mask)
