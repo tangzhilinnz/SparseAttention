@@ -398,6 +398,7 @@ def hierarchical_fused_attention(Q, K, V, idx_table, mask_table):
         *V.stride(),
         idx_table.stride(0), idx_table.stride(1),
         Out.stride(0), Out.stride(1), Out.stride(2), Out.stride(3),
+        *Weights.stride(),
         sm_scale=1.0 / math.sqrt(Dh),
         H=H,
         BLOCK_H=BLOCK_H, # Pass padded H
