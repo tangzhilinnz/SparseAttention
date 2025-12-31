@@ -552,35 +552,40 @@ class HierarchicalSparseAttention(nn.Module):
         self.out_proj_x = nn.Linear(dim, dim)
 
         self.dropout = nn.Dropout(dropout)
-        
+
         self.cached_idx_table = None
-        self.cached_causal_mask = None
         self.cached_seq_len = -1
+        self.cached_is_causal = None # Add this
 
         self.sizes = None
         self.offsets = None
 
     def _get_lookup_table(self, L, is_causal, device):
         """
-        Smart retrieval: Returns cached table if L matches, otherwise recomputes.
+        Smart retrieval: Returns cached fused table if (L, is_causal, device) match.
         """
         # Check if we can reuse the cache
-        # 1. Cache exists
-        # 2. Sequence length matches
-        # 3. Device matches (crucial for moving model CPU <-> GPU)
+        # We must ensure the cached table matches the requested causality (is_causal)
         if (self.cached_idx_table is not None and 
             self.cached_seq_len == L and 
-            self.cached_idx_table.device == device):
-            return self.cached_idx_table, self.cached_causal_mask
+            self.cached_idx_table.device == device and
+            getattr(self, 'cached_is_causal', None) == is_causal):
+            return self.cached_idx_table
 
         # If not, recompute and update cache
-        idx_table = build_hierarchical_index_lookup_table(L, is_causal=is_causal, device=device, dtype=torch.int64)
-        
+        # [CHANGE] Now returns only idx_table (mask is inside it)
+        idx_table = build_hierarchical_index_lookup_table(
+            L, 
+            is_causal=is_causal, 
+            device=device, 
+            dtype=torch.int32
+        )
+    
         self.cached_idx_table = idx_table
-        self.cached_causal_mask = mask
         self.cached_seq_len = L
-        
-        return idx_table, mask
+        self.cached_is_causal = is_causal # [CHANGE] Store causality state
+    
+        return idx_table
 
     @staticmethod
     def generate_span_input_Y(x):
@@ -845,33 +850,38 @@ class HierarchicalSparseAttentionTriton(nn.Module):
         self.dropout = nn.Dropout(dropout)
         
         self.cached_idx_table = None
-        self.cached_causal_mask = None
         self.cached_seq_len = -1
+        self.cached_is_causal = None
 
         self.sizes = None
         self.offsets = None
 
     def _get_lookup_table(self, L, is_causal, device):
         """
-        Smart retrieval: Returns cached table if L matches, otherwise recomputes.
+        Smart retrieval: Returns cached fused table if (L, is_causal, device) match.
         """
         # Check if we can reuse the cache
-        # 1. Cache exists
-        # 2. Sequence length matches
-        # 3. Device matches (crucial for moving model CPU <-> GPU)
+        # We must ensure the cached table matches the requested causality (is_causal)
         if (self.cached_idx_table is not None and 
             self.cached_seq_len == L and 
-            self.cached_idx_table.device == device):
-            return self.cached_idx_table, self.cached_causal_mask
+            self.cached_idx_table.device == device and
+            getattr(self, 'cached_is_causal', None) == is_causal):
+            return self.cached_idx_table
 
         # If not, recompute and update cache
-        idx_table = build_hierarchical_index_lookup_table(L, is_causal=is_causal, device=device, dtype=torch.int64)
-        
+        # [CHANGE] Now returns only idx_table (mask is inside it)
+        idx_table = build_hierarchical_index_lookup_table(
+            L, 
+            is_causal=is_causal, 
+            device=device, 
+            dtype=torch.int32
+        )
+    
         self.cached_idx_table = idx_table
-        self.cached_causal_mask = mask
         self.cached_seq_len = L
-        
-        return idx_table, mask
+        self.cached_is_causal = is_causal # [CHANGE] Store causality state
+    
+        return idx_table
 
     @staticmethod
     def generate_span_input_Y(x):
@@ -1431,8 +1441,8 @@ def run_transformer_benchmark():
     print("Pre-building lookup tables...")
     # Access the first layer -> self_attn -> call _get_lookup_table directly
     # We don't need update_X_from_Y, we just need to trigger the table build
-    model_opt.layers[0].self_attn._get_lookup_table(SEQ_LEN, device=device)
-    model_ref.layers[0].self_attn._get_lookup_table(SEQ_LEN, device=device)
+    model_opt.layers[0].self_attn._get_lookup_table(SEQ_LEN, is_causal=True, device=device)
+    model_ref.layers[0].self_attn._get_lookup_table(SEQ_LEN, is_causal=True, device=device)
     print("Tables built.")
 
     # In run_transformer_benchmark, before the sanity check loop:
