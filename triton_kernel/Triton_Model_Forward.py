@@ -718,73 +718,74 @@ class HierarchicalSparseAttention(nn.Module):
         return self.out_proj_y(torch.cat(new_Y_levels, dim=1))
 
     def update_X_from_Y(self, x, y, mask=None):
-
+        """
+        Python reference implementation using the Fused Index Table.
+        - Unifies Self + Cross attention into one Gather + Matmul operation.
+        - Decodes the sign-bit mask (Negative = Future) on the fly.
+        """
         B, N, D = x.shape
         H, Dh = self.num_heads, self.head_dim
 
         if y is None: return x
 
-        # Concatenate inputs once to allow unified K/V calculation
+        # 1. Combine Inputs (Leaves + Parents) & Project
+        #    Perform one large projection for efficiency
+        #    XY shape: [B, N + N-1, D] -> [B, Total_Nodes, D]
         XY = torch.cat([x, y], dim=1)
-
-        # --- Inline Split Heads ---
+        
+        # Q: Leaves only [B, H, N, Dh]
         Q = self.Wq_x(x).view(B, N, H, Dh).transpose(1, 2)
         
-        # Calculate K, V on combined input (Efficiency: one large matmul instead of two)
+        # K, V: All Nodes [B, H, Total_Nodes, Dh]
         kv_input = self.Wk_x(XY).view(B, -1, H, Dh).transpose(1, 2)
         v_input = self.Wv_x(XY).view(B, -1, H, Dh).transpose(1, 2)
-
+        
         K_full = kv_input
-        V_full = self.dropout(v_input) # Apply dropout to the projected values
+        V_full = self.dropout(v_input)
 
-        idx_table, neighbor_causal_mask = self._get_lookup_table(N, device=x.device)
-            
-        # Assert table validity
-        # assert (idx_table != -1).all(), "Index table contains invalid entries."
+        # 2. Get Fused Index Table
+        #    is_causal=True if mask is provided, else False (Bidirectional)
+        is_causal = (mask is not None)
+        idx_table_raw = self._get_lookup_table(N, is_causal=is_causal, device=x.device)
+        
+        # 3. Decode Table (Python side equivalent of Triton logic)
+        #    - Raw Table: Positive = Visible, Negative = Masked
+        #    - Real Indices: abs(raw) - 1
+        #    - Mask Boolean: raw < 0
+        
+        # [N, LEVELS] -> LongTensor for indexing
+        gather_indices = (idx_table_raw.abs() - 1).to(torch.long)
+        
+        # [1, 1, N, LEVELS] -> Boolean mask for broadcasting
+        mask_boolean = (idx_table_raw < 0).unsqueeze(0).unsqueeze(0)
 
-        # Self: The leaves attending to themselves (indices 0 to N-1)
-        K_self = K_full[:, :, :N, :]                 # [B, H, N, D]
-        V_self = V_full[:, :, :N, :]                 # [B, H, N, D]
+        # 4. Unified Gather (Self + Neighbors)
+        #    We gather from the 'Total_Nodes' dimension (dim 2)
+        #    K_full: [B, H, Total, Dh] -> K_selected: [B, H, N, LEVELS, Dh]
+        #    This automatically handles expansion for B and H dimensions
+        K_selected = K_full[:, :, gather_indices, :] 
+        V_selected = V_full[:, :, gather_indices, :]
 
-        # Gather neighbors using index table
-        # idx_table: [N, Levels]
-        gather_indices = idx_table
-            
-        # neighbors_k: [B, H, L, Levels, D]
-        neighbors_k = K_full[:, :, gather_indices, :] 
-        neighbors_v = V_full[:, :, gather_indices, :]
+        # 5. Compute Unified Attention Scores
+        #    Q: [B, H, N, 1, Dh]
+        #    K: [B, H, N, LEVELS, Dh] (transposed to [B, H, N, Dh, LEVELS])
+        #    Logits: [B, H, N, LEVELS]
+        logits = torch.matmul(Q.unsqueeze(3), K_selected.transpose(-1, -2)).squeeze(-2)
+        logits = logits / math.sqrt(Dh)
 
-        # Compute Self Logits (Leaf Q * Leaf K)
-        # [B, H, L, D] * [B, H, L, D] -> [B, H, L]
-        self_logits = torch.einsum('b h n d, b h n d -> b h n', Q, K_self) / math.sqrt(Dh)
+        # 6. Apply Causal Mask
+        #    Mask out 'Future' neighbors (where table value was negative)
+        if is_causal:
+            logits = logits.masked_fill(mask_boolean, float('-inf'))
 
-        # Compute Neighbor Logits (Leaf Q * Neighbor K)
-        # Q: [B, H, N, D] -> unsqueeze -> [B, H, N, 1, D]
-        # neighbors_k: [B, H, N, Levels, D]
-        # Result: [B, H, N, Levels]
-        neighbors_logits = torch.einsum('b h l x d, b h l n d -> b h l n', Q.unsqueeze(3), neighbors_k)
-        neighbors_logits = neighbors_logits / math.sqrt(Dh)
+        # 7. Weighted Sum
+        #    Weights: [B, H, N, LEVELS]
+        weights = torch.softmax(logits, dim=-1)
+        
+        #    Out: [B, H, N, LEVELS] * [B, H, N, LEVELS, Dh] -> sum(dim=3) -> [B, H, N, Dh]
+        output_leaf = torch.sum(weights.unsqueeze(-1) * V_selected, dim=3)
 
-        # Apply Causal Mask
-        if mask is not None:
-            # neighbor_causal_mask is [L, Levels]. 
-            # True means "future" (masked).
-            neighbors_logits = neighbors_logits.masked_fill(neighbor_causal_mask, float('-inf'))
-
-        # Concatenate (Self + Neighbors)
-        # V: [B, H, L, D] -> [B, H, L, 1, D]
-        # self_logits: [B, H, L] -> [B, H, L, 1]  
-        # Corrected: Use 'V_self' instead of 'V' (which is undefined in this scope)
-        all_v = torch.cat([V_self.unsqueeze(3), neighbors_v], dim=3)             # [B, H, L, Levels+1, Dh]
-        all_logits = torch.cat([self_logits.unsqueeze(3), neighbors_logits], dim=3) # [B, H, L, Levels+1]
-
-        # Attention Softmax & Weighted Sum
-        max_logits = all_logits.max(dim=-1, keepdim=True)[0]
-        weights = F.softmax(all_logits - max_logits, dim=-1)             # [B, H, L, Levels+1]
-            
-        output_leaf = torch.einsum('b h l n, b h l n d -> b h l d', weights, all_v)
-
-        # --- Inline Merge Heads ---
+        # 8. Merge Heads & Return
         return output_leaf.transpose(1, 2).reshape(B, N, D)
 
     def _standard_attention(self, Q, K, V, mask):
