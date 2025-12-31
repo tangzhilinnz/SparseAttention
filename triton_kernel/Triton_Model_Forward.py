@@ -357,6 +357,11 @@ def hierarchical_fused_attention(Q, K, V, idx_table, mask_table):
     LEVELS = idx_table.shape[1]
     Out = torch.empty_like(Q)
 
+    # 1. Allocate Dummy Weights Buffer
+    # The kernel needs a pointer to write attention weights (even if we don't use them).
+    # Shape: [B, N, H, 1 + LEVELS]
+    Weights = torch.empty((B, N, H, 1 + LEVELS), device=Q.device, dtype=torch.float32)
+
     HAS_MASK = (mask_table is not None)
     mask_ptr_safe = mask_table if HAS_MASK else Q 
 
@@ -387,6 +392,7 @@ def hierarchical_fused_attention(Q, K, V, idx_table, mask_table):
         Q, K, V, 
         idx_table, mask_ptr_safe, 
         Out,
+        Weights,           # <--- Pass dummy buffer
         *Q.stride(),
         *K.stride(), 
         *V.stride(),
