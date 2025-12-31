@@ -207,6 +207,7 @@ def hierarchical_attention_forward_kernel(
     # Pointers
     Q_ptr, K_ptr, V_ptr, 
     Lookup_ptr,        # [CHANGED] Fused Index Table (contains signs)
+    # [REMOVED] Mask_ptr, 
     Out_ptr, W_ptr, 
     
     # Strides (Q)
@@ -229,8 +230,8 @@ def hierarchical_attention_forward_kernel(
     D: tl.constexpr,
     LEVELS: tl.constexpr,
     BLOCK_D: tl.constexpr,
-    BLOCK_LEVELS: tl.constexpr
-    # [REMOVED] HAS_MASK, Mask_ptr
+    BLOCK_LEVELS: tl.constexpr 
+    # [REMOVED] HAS_MASK
 ):
     node_idx = tl.program_id(0)
     b_idx = tl.program_id(1)
@@ -239,12 +240,10 @@ def hierarchical_attention_forward_kernel(
     h_idx = tl.arange(0, BLOCK_H)
     mask_h = h_idx < H
     offs_d = tl.arange(0, BLOCK_D)
-    
-    # The levels dimension now includes Self + Neighbors
     offs_lvl = tl.arange(0, BLOCK_LEVELS)
     mask_lvl = offs_lvl < LEVELS
 
-    # 2. Load Topology (Fused)
+    # 2. Load Topology (Fused Sign-Bit Logic)
     off_lookup = node_idx * sl_n + offs_lvl * sl_lvl
     
     # Load raw encoded values. 
@@ -255,22 +254,24 @@ def hierarchical_attention_forward_kernel(
     # Real Index = abs(raw) - 1
     neighbor_indices = tl.abs(raw_encoded) - 1
     
-    # Mask Status: If raw is negative, it's masked (Future)
-    is_masked_causal = (raw_encoded < 0)
+    # Causal Mask: If raw is negative, it's masked (Future)
+    # This replaces the old 'val_int8' / Mask_ptr logic
+    neighbor_is_masked = (raw_encoded < 0)
 
     # 3. Base Pointers
-    # We calculate the base offsets for K and V batches
     k_batch_base = K_ptr + b_idx * sk_b
     v_batch_base = V_ptr + b_idx * sv_b
     
-    # Q Pointer setup
+    off_node_self = node_idx * sk_n
+    off_node_cross = neighbor_indices * sk_n 
+
     q_ptr = Q_ptr + (b_idx * sq_b) + (node_idx * sq_n) + \
             (h_idx[:, None] * sq_h) + (offs_d[None, :] * sq_d)
 
-    # Unified Accumulator (Covers Self + Cross)
-    acc = tl.zeros([BLOCK_H, BLOCK_LEVELS], dtype=tl.float32)
+    acc_self = tl.zeros([BLOCK_H], dtype=tl.float32)
+    acc_cross = tl.zeros([BLOCK_H, BLOCK_LEVELS], dtype=tl.float32)
 
-    # 4. Score Loop (Compute Q * K^T)
+    # 4. Score Loop
     for off_d_start in range(0, D, BLOCK_D):
         cur_offs_d = off_d_start + offs_d
         d_mask = cur_offs_d < D
@@ -278,48 +279,58 @@ def hierarchical_attention_forward_kernel(
         
         q = tl.load(q_ptr, mask=mask_q, other=0.0)
         
-        # --- UNIFIED K LOAD ---
-        # Calculate offsets for ALL items in the topology list at once
-        off_node_all = neighbor_indices * sk_n
-        
-        ptr_k = k_batch_base + \
-                off_node_all[None, :, None] + \
-                (h_idx[:, None, None] * sk_h) + \
-                (cur_offs_d[None, None, :] * sk_d)
+        # --- K SELF ---
+        ptr_k_self = k_batch_base + off_node_self + \
+                     (h_idx[:, None] * sk_h) + (cur_offs_d[None, :] * sk_d)
+        k_self = tl.load(ptr_k_self, mask=mask_q, other=0.0)
+        acc_self += tl.sum(q * k_self, axis=1)
+
+        # --- K CROSS ---
+        ptr_k_cross = k_batch_base + \
+                      off_node_cross[None, :, None] + \
+                      (h_idx[:, None, None] * sk_h) + \
+                      (cur_offs_d[None, None, :] * sk_d)
         
         mask_k = mask_h[:, None, None] & mask_lvl[None, :, None] & d_mask[None, None, :]
-        k = tl.load(ptr_k, mask=mask_k, other=0.0)
+        k_cross = tl.load(ptr_k_cross, mask=mask_k, other=0.0)
         
-        # Dot Product
-        # Q: [BLOCK_H, BLOCK_D]
-        # K: [BLOCK_H, BLOCK_LEVELS, BLOCK_D]
-        # Result: [BLOCK_H, BLOCK_LEVELS]
-        acc += tl.sum(q[:, None, :] * k, axis=2)
-        
-        # Advance Q pointer
+        acc_cross += tl.sum(q[:, None, :] * k_cross, axis=2)
         q_ptr += BLOCK_D * sq_d
 
-    # 5. Softmax
-    acc = acc * sm_scale
+    # 5. Softmax & Masking
+    acc_self = acc_self * sm_scale
+    acc_cross = acc_cross * sm_scale
     
-    # --- APPLY MASK ---
-    # Combine structural padding (offs_lvl >= LEVELS) AND our fused causal mask
-    mask_final = (offs_lvl >= LEVELS) | is_masked_causal
+    # --- UPDATED CAUSAL MASK LOGIC ---
+    # Combine structural padding (offs_lvl >= LEVELS) AND our fused sign-bit mask
+    mask_broadcast = (offs_lvl >= LEVELS) | neighbor_is_masked
+        
+    # Apply mask to Cross terms
+    acc_cross = tl.where(mask_broadcast[None, :], -float('inf'), acc_cross)
     
-    acc = tl.where(mask_final[None, :], -float('inf'), acc)
+    # Max/Exp trick for Softmax
+    max_cross = tl.max(acc_cross, axis=1)
+    max_all = tl.maximum(acc_self, max_cross)
     
-    # Standard Softmax Logic
-    max_val = tl.max(acc, axis=1)
-    exp_val = tl.exp(acc - max_val[:, None])
-    denom = tl.sum(exp_val, axis=1)
-    weights = exp_val / denom[:, None]
+    exp_self = tl.exp(acc_self - max_all)
+    exp_cross = tl.exp(acc_cross - max_all[:, None])
+    
+    denom = exp_self + tl.sum(exp_cross, axis=1)
+    w_self = exp_self / denom 
+    w_cross = exp_cross / denom[:, None]
 
     # Save Weights
     w_base_ptr = W_ptr + (b_idx * sw_b) + (node_idx * sw_n) + (h_idx * sw_h)
-    w_ptr_offsets = w_base_ptr[:, None] + (offs_lvl[None, :] * sw_lvl)
-    tl.store(w_ptr_offsets, weights, mask=mask_h[:, None] & mask_lvl[None, :])
+    
+    # Store Self weight at index 0
+    tl.store(w_base_ptr + (0 * sw_lvl), w_self, mask=mask_h)
+    
+    # Store Neighbor weights at indices 1..LEVELS
+    # We shift by 1 because the output weights buffer includes Self at the start
+    w_cross_ptr = w_base_ptr[:, None] + ((1 + offs_lvl[None, :]) * sw_lvl)
+    tl.store(w_cross_ptr, w_cross, mask=mask_h[:, None] & mask_lvl[None, :])
 
-    # 6. Weighted Sum Loop (Compute Weights * V)
+    # 6. Weighted Sum Loop
     out_base_ptr = Out_ptr + (b_idx * so_b) + (node_idx * so_n) + \
                    (h_idx[:, None] * so_h) + (offs_d[None, :] * so_d)
 
@@ -328,26 +339,26 @@ def hierarchical_attention_forward_kernel(
         d_mask = cur_offs_d < D
         mask_op = mask_h[:, None] & d_mask[None, :]
 
-        # --- UNIFIED V LOAD ---
-        # Reuse decoded neighbor_indices, but apply V strides
-        off_node_all = neighbor_indices * sv_n 
+        # --- V SELF ---
+        ptr_v_self = v_batch_base + off_node_self + \
+                     (h_idx[:, None] * sv_h) + (cur_offs_d[None, :] * sv_d)
+        v_self = tl.load(ptr_v_self, mask=mask_op, other=0.0)
+        out_acc = w_self[:, None] * v_self
         
-        ptr_v = v_batch_base + \
-                off_node_all[None, :, None] + \
-                (h_idx[:, None, None] * sv_h) + \
-                (cur_offs_d[None, None, :] * sv_d)
+        # --- V CROSS ---
+        ptr_v_cross = v_batch_base + \
+                      off_node_cross[None, :, None] + \
+                      (h_idx[:, None, None] * sv_h) + \
+                      (cur_offs_d[None, None, :] * sv_d)
                       
         mask_v = mask_h[:, None, None] & mask_lvl[None, :, None] & d_mask[None, None, :]
-        v = tl.load(ptr_v, mask=mask_v, other=0.0)
+        v_cross = tl.load(ptr_v_cross, mask=mask_v, other=0.0)
         
-        # Weighted Sum
-        # Weights: [BLOCK_H, BLOCK_LEVELS]
-        # V:       [BLOCK_H, BLOCK_LEVELS, BLOCK_D]
-        # Out:     [BLOCK_H, BLOCK_D]
-        out_acc = tl.sum(weights[:, :, None] * v, axis=1)
+        out_acc += tl.sum(w_cross[:, :, None] * v_cross, axis=1)
         
         tl.store(out_base_ptr, out_acc.to(Out_ptr.dtype.element_ty), mask=mask_op)
         out_base_ptr += BLOCK_D * so_d
+
 
 def hierarchical_fused_attention(Q, K, V, idx_table):
     """
@@ -355,18 +366,17 @@ def hierarchical_fused_attention(Q, K, V, idx_table):
         Q: [B, N, H, D]
         K: [B, Total_Nodes, H, D]
         V: [B, Total_Nodes, H, D]
-        idx_table: [N, LEVELS] (Int32) - Fused Table (Self + Neighbors)
-                   Contains sign-bit encoded masking info.
+        idx_table: [N, LEVELS] (Int32) - Fused Table (Neighbors ONLY)
     """
     B, N, H, Dh = Q.shape
     
-    # The table width defines the attention span (Self + Hierarchy)
+    # LEVELS = Number of Neighbors in the table
     LEVELS = idx_table.shape[1] 
     
     Out = torch.empty_like(Q)
 
-    # Weights buffer shape matches table width exactly
-    Weights = torch.empty((B, N, H, LEVELS), device=Q.device, dtype=torch.float32)
+    # [FIX 1] Weights must hold Self (1) + Neighbors (LEVELS)
+    Weights = torch.empty((B, N, H, LEVELS + 1), device=Q.device, dtype=torch.float32)
 
     # ------------------------------------------------------------------
     # ALIGNMENT CHECKS
@@ -378,13 +388,16 @@ def hierarchical_fused_attention(Q, K, V, idx_table):
 
     grid = (N, B)
 
-    BLOCK_LEVELS = triton.next_power_of_2(LEVELS)
+    # [FIX 2] Block size must cover Self + Neighbors
+    # If LEVELS=7, Total=8 -> Block=8. If LEVELS=8, Total=9 -> Block=16.
+    BLOCK_LEVELS = triton.next_power_of_2(LEVELS + 1)
+    
     BLOCK_H = triton.next_power_of_2(H)
     BLOCK_D = triton.next_power_of_2(Dh)
 
     hierarchical_attention_forward_kernel[grid](
         Q, K, V, 
-        idx_table, # No mask table needed
+        idx_table, 
         Out,
         Weights,
         # Strides
@@ -399,9 +412,9 @@ def hierarchical_fused_attention(Q, K, V, idx_table):
         H=H, 
         BLOCK_H=BLOCK_H, 
         D=Dh, 
-        LEVELS=LEVELS,
+        LEVELS=LEVELS, # Kernel loops this many times for the table
         BLOCK_D=BLOCK_D,
-        BLOCK_LEVELS=BLOCK_LEVELS,
+        BLOCK_LEVELS=BLOCK_LEVELS, # Memory allocation covers Self+Table
         num_warps=4 
     )
     return Out
@@ -476,9 +489,14 @@ def build_hierarchical_index_lookup_table_bak(seq_len, device="cuda", dtype=torc
     return idx_map, causal_mask
 
 
+import torch
+import math
+
 def build_hierarchical_index_lookup_table(seq_len, is_causal=True, device="cuda", dtype=torch.int32):
     """
-    Builds a FUSED index table with optional Causal Masking.
+    Builds a FUSED index table for CROSS-ATTENTION only (Excludes Self).
+    - Encodes Visible Neighbor as:  (Index + 1)
+    - Encodes Masked Neighbor as:  -(Index + 1)
     
     Args:
         seq_len (int): Sequence length (must be power of 2).
@@ -487,47 +505,52 @@ def build_hierarchical_index_lookup_table(seq_len, is_causal=True, device="cuda"
             - If False: All valid neighbors are Positive (Visible/Bidirectional).
             
     Returns: 
-        idx_map: [seq_len, level_num + 1]
+        idx_map: [seq_len, level_num] 
     """
     assert (seq_len & (seq_len - 1)) == 0, "seq_len must be a power of 2"
 
     total_nodes = 2 * seq_len - 1
     max_valid = total_nodes - 2
+    
+    # We strictly want neighbors only, so columns = log2(N)
     level_num = int(math.log2(seq_len))
-    total_cols = level_num + 1
 
     # Initialize with 1 (points to Node 0, Visible) to be safe for padding
-    idx_map = torch.ones((seq_len, total_cols), dtype=dtype, device=device)
+    # This prevents illegal memory access if a thread reads a padded slot
+    idx_map = torch.ones((seq_len, level_num), dtype=dtype, device=device)
 
-    # 1. Setup Column 0 (Self Node) -> Always Visible (Positive)
-    # Stores (Index + 1)
+    # Start the hierarchical traversal from the leaves
     n_cur = torch.arange(seq_len, device=device, dtype=torch.int64)
-    idx_map[:, 0] = (n_cur + 1).to(dtype)
 
-    # 2. Hierarchical Traversal
-    for lvl in range(1, total_cols):
-        if lvl == 1:
+    # Loop for each level of the hierarchy
+    for lvl in range(level_num):
+        if lvl == 0:
+            # Level 0: Immediate neighbor in the leaf layer
             n_next = n_cur ^ 1
             pair = n_cur
         else:
+            # Higher levels: Neighbor of the parent node
             n_next = (n_cur // 2 + seq_len) ^ 1
             pair = (n_cur // 2 + seq_len)
 
         valid_mask = n_next <= max_valid
         
-        # Base value to store: (Index + 1)
+        # Base value to store: (Index + 1) to handle Index 0 signing
         val_to_store = n_next + 1
         
-        # [CHANGE] Apply Causal Logic only if requested
+        # Apply Causal Logic if requested
         if is_causal:
-            # Check if neighbor is in the "future" (pair < n_next)
+            # Check if neighbor is in the "future"
+            # (If my parent 'pair' < neighbor 'n_next', the neighbor is to the right)
             should_mask = (pair < n_next) & valid_mask
+            
             # Flip sign to Negative if masked
             val_to_store = torch.where(should_mask, -val_to_store, val_to_store)
 
         # Update Table: Only overwrite where valid
         idx_map[:, lvl] = torch.where(valid_mask, val_to_store.to(dtype), idx_map[:, lvl])
 
+        # Move n_cur up to the neighbor for the next iteration's calculation
         n_cur = n_next
 
     return idx_map
@@ -720,72 +743,101 @@ class HierarchicalSparseAttention(nn.Module):
     def update_X_from_Y(self, x, y, mask=None):
         """
         Python reference implementation using the Fused Index Table.
-        - Unifies Self + Cross attention into one Gather + Matmul operation.
-        - Decodes the sign-bit mask (Negative = Future) on the fly.
+        - Fused Index Table contains NEIGHBORS only (Left, Right, Parents).
+        - SELF (Current Node) is extracted explicitly and prepended.
+        - Unifies Self + Neighbors into one attention operation.
         """
         B, N, D = x.shape
         H, Dh = self.num_heads, self.head_dim
 
         if y is None: return x
 
-        # 1. Combine Inputs (Leaves + Parents) & Project
-        #    Perform one large projection for efficiency
-        #    XY shape: [B, N + N-1, D] -> [B, Total_Nodes, D]
+        # -------------------------------------------------------------------------
+        # 1. Unified KV Projection (Leaves + Parents)
+        # -------------------------------------------------------------------------
+        # XY shape: [B, N + N_parents, D]
+        # Indices 0 to N-1 are Leaves (Self). Indices N to End are Parents.
         XY = torch.cat([x, y], dim=1)
         
-        # Q: Leaves only [B, H, N, Dh]
+        # Q: [B, H, N, Dh] (Queries are Leaves only)
         Q = self.Wq_x(x).view(B, N, H, Dh).transpose(1, 2)
         
-        # K, V: All Nodes [B, H, Total_Nodes, Dh]
+        # K, V: [B, H, Total_Nodes, Dh] (Keys/Values for Leaves + Parents)
         kv_input = self.Wk_x(XY).view(B, -1, H, Dh).transpose(1, 2)
-        v_input = self.Wv_x(XY).view(B, -1, H, Dh).transpose(1, 2)
+        v_input  = self.Wv_x(XY).view(B, -1, H, Dh).transpose(1, 2)
         
         K_full = kv_input
         V_full = self.dropout(v_input)
 
-        # 2. Get Fused Index Table
-        #    is_causal=True if mask is provided, else False (Bidirectional)
+        # -------------------------------------------------------------------------
+        # 2. Handle SELF (Explicitly)
+        # -------------------------------------------------------------------------
+        # Since XY[:N] is x, the first N elements of K_full are the 'Self' Keys.
+        # Shape: [B, H, N, Dh] -> unsqueeze to [B, H, N, 1, Dh] to act as "Neighbor 0"
+        K_self = K_full[:, :, :N, :].unsqueeze(3)
+        V_self = V_full[:, :, :N, :].unsqueeze(3)
+        
+        # Self is always visible (never masked in causal attention)
+        # Shape: [1, 1, N, 1]
+        mask_self = torch.zeros((1, 1, N, 1), dtype=torch.bool, device=x.device)
+
+        # -------------------------------------------------------------------------
+        # 3. Handle NEIGHBORS (From Lookup Table)
+        # -------------------------------------------------------------------------
         is_causal = (mask is not None)
+        
+        # Get table for neighbors only (Left, Right, Parents...)
+        # Shape: [N, NUM_NEIGHBORS]
         idx_table_raw = self._get_lookup_table(N, is_causal=is_causal, device=x.device)
         
-        # 3. Decode Table (Python side equivalent of Triton logic)
-        #    - Raw Table: Positive = Visible, Negative = Masked
-        #    - Real Indices: abs(raw) - 1
-        #    - Mask Boolean: raw < 0
+        # Decode Table:
+        # abs(val) - 1 converts 1-based signed index to 0-based index into XY
+        gather_indices = (idx_table_raw.abs() - 1).clamp(min=0).to(torch.long)
         
-        # [N, LEVELS] -> LongTensor for indexing
-        gather_indices = (idx_table_raw.abs() - 1).to(torch.long)
+        # Decode Mask:
+        # Negative sign = Future/Masked
+        # Shape: [1, 1, N, NUM_NEIGHBORS]
+        mask_neighbors = (idx_table_raw < 0).unsqueeze(0).unsqueeze(0)
+
+        # Gather Neighbors
+        # K_full: [B, H, Total, Dh] -> K_neighbors: [B, H, N, NUM_NEIGHBORS, Dh]
+        K_neighbors = K_full[:, :, gather_indices, :]
+        V_neighbors = V_full[:, :, gather_indices, :]
+
+        # -------------------------------------------------------------------------
+        # 4. Concatenate Self + Neighbors
+        # -------------------------------------------------------------------------
+        # Combine along dim 3 (the neighbor/sequence dimension for attention)
+        # K_combined: [B, H, N, 1 + NUM_NEIGHBORS, Dh]
+        K_combined = torch.cat([K_self, K_neighbors], dim=3)
+        V_combined = torch.cat([V_self, V_neighbors], dim=3)
         
-        # [1, 1, N, LEVELS] -> Boolean mask for broadcasting
-        mask_boolean = (idx_table_raw < 0).unsqueeze(0).unsqueeze(0)
+        # Combine Masks
+        # mask_combined: [1, 1, N, 1 + NUM_NEIGHBORS]
+        mask_combined = torch.cat([mask_self, mask_neighbors], dim=3)
 
-        # 4. Unified Gather (Self + Neighbors)
-        #    We gather from the 'Total_Nodes' dimension (dim 2)
-        #    K_full: [B, H, Total, Dh] -> K_selected: [B, H, N, LEVELS, Dh]
-        #    This automatically handles expansion for B and H dimensions
-        K_selected = K_full[:, :, gather_indices, :] 
-        V_selected = V_full[:, :, gather_indices, :]
-
-        # 5. Compute Unified Attention Scores
-        #    Q: [B, H, N, 1, Dh]
-        #    K: [B, H, N, LEVELS, Dh] (transposed to [B, H, N, Dh, LEVELS])
-        #    Logits: [B, H, N, LEVELS]
-        logits = torch.matmul(Q.unsqueeze(3), K_selected.transpose(-1, -2)).squeeze(-2)
+        # -------------------------------------------------------------------------
+        # 5. Compute Unified Attention
+        # -------------------------------------------------------------------------
+        # Q: [B, H, N, 1, Dh]
+        # K_combined.T: [B, H, N, Dh, Total_Window]
+        # Logits: [B, H, N, 1, Total_Window] -> squeeze -> [B, H, N, Total_Window]
+        logits = torch.matmul(Q.unsqueeze(3), K_combined.transpose(-1, -2)).squeeze(-2)
         logits = logits / math.sqrt(Dh)
 
-        # 6. Apply Causal Mask
-        #    Mask out 'Future' neighbors (where table value was negative)
+        # Apply Causal Mask
         if is_causal:
-            logits = logits.masked_fill(mask_boolean, float('-inf'))
+            logits = logits.masked_fill(mask_combined, float('-inf'))
 
-        # 7. Weighted Sum
-        #    Weights: [B, H, N, LEVELS]
+        # Softmax & Weighted Sum
         weights = torch.softmax(logits, dim=-1)
         
-        #    Out: [B, H, N, LEVELS] * [B, H, N, LEVELS, Dh] -> sum(dim=3) -> [B, H, N, Dh]
-        output_leaf = torch.sum(weights.unsqueeze(-1) * V_selected, dim=3)
+        # Sum over the window dimension (dim 3)
+        output_leaf = torch.sum(weights.unsqueeze(-1) * V_combined, dim=3)
 
-        # 8. Merge Heads & Return
+        # -------------------------------------------------------------------------
+        # 6. Final Projection
+        # -------------------------------------------------------------------------
         return output_leaf.transpose(1, 2).reshape(B, N, D)
 
     def _standard_attention(self, Q, K, V, mask):
