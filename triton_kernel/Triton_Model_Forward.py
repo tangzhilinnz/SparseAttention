@@ -204,22 +204,18 @@ def build_parent_nodes(Q_p, K_p, V_p, K_c, V_c):
 
 @triton.jit
 def hierarchical_attention_forward_kernel(
-    # Pointers
-    Q_ptr, K_ptr, V_ptr,  # K and V are pre-gathered: [B, N, Window, H, D]
-    Out_ptr, W_ptr,       
-    
-    # Strides
+    # ... pointers and strides same as before ...
+    Q_ptr, K_ptr, V_ptr, Out_ptr, W_ptr,
     sq_b, sq_n, sq_h, sq_d,
-    sk_b, sk_n, sk_w, sk_h, sk_d, # Added Window Stride (sk_w)
-    sv_b, sv_n, sv_w, sv_h, sv_d, # Added Window Stride (sv_w)
+    sk_b, sk_n, sk_w, sk_h, sk_d,
+    sv_b, sv_n, sv_w, sv_h, sv_d,
     so_b, so_n, so_h, so_d,
-    sw_b, sw_n, sw_h, sw_w,       # Weights have shape [B, N, H, Window]
-    
-    # Constants
+    sw_b, sw_n, sw_h, sw_w,
     sm_scale,
     H: tl.constexpr, BLOCK_H: tl.constexpr,
     D: tl.constexpr, BLOCK_D: tl.constexpr,
-    WINDOW: tl.constexpr  # Window Size = Levels + 1 (Self included)
+    WINDOW: tl.constexpr,       # Real size (e.g., 7)
+    BLOCK_WINDOW: tl.constexpr  # Power of 2 (e.g., 8) <--- ADD THIS
 ):
     node_idx = tl.program_id(0)
     b_idx = tl.program_id(1)
@@ -227,88 +223,77 @@ def hierarchical_attention_forward_kernel(
     h_idx = tl.arange(0, BLOCK_H)
     mask_h = h_idx < H
     
-    # Range for the window dimension (small enough to unroll fully)
-    w_idx = tl.arange(0, WINDOW)
+    # [FIX] Use BLOCK_WINDOW for arange
+    w_idx = tl.arange(0, BLOCK_WINDOW)
+    # [FIX] Create mask for valid window indices
+    mask_w = w_idx < WINDOW
 
-    # 1. Pointers
-    # Q: [B, N, H, D]
+    # ... Pointers ...
     q_base = Q_ptr + (b_idx * sq_b) + (node_idx * sq_n) + (h_idx[:, None] * sq_h)
-    
-    # K/V: [B, N, Window, H, D]
-    # We fix B, N, H. Loop over D. Broadcast over Window.
     k_base = K_ptr + (b_idx * sk_b) + (node_idx * sk_n) + (h_idx[:, None, None] * sk_h)
     v_base = V_ptr + (b_idx * sv_b) + (node_idx * sv_n) + (h_idx[:, None, None] * sv_h)
 
-    # Accumulators
-    scores = tl.zeros([BLOCK_H, WINDOW], dtype=tl.float32)
-    output = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
+    scores = tl.zeros([BLOCK_H, BLOCK_WINDOW], dtype=tl.float32) # Use BLOCK_WINDOW size
 
-    # -----------------------------------------------------------
-    # 2. Score Loop (Reduce over D)
-    # -----------------------------------------------------------
+    # ... Score Loop ...
     for off_d in range(0, D, BLOCK_D):
         offs_d = off_d + tl.arange(0, BLOCK_D)
         mask_d = offs_d < D
         
-        # Load Q [H, D] -> Broadcast to [H, 1, D]
         q = tl.load(q_base + (offs_d[None, :] * sq_d), mask=mask_h[:, None] & mask_d[None, :], other=0.0)
         q_broad = q[:, None, :] 
 
-        # Load K [H, Window, D]
-        # Ptr: Base + (Window * stride_W) + (D * stride_D)
+        # Load K using w_idx
         k_ptr = k_base + (w_idx[None, :, None] * sk_w) + (offs_d[None, None, :] * sk_d)
-        k = tl.load(k_ptr, mask=mask_h[:, None, None] & mask_d[None, None, :], other=0.0)
         
-        # Dot Product: [H, 1, D] * [H, W, D] -> Sum D -> [H, W]
+        # [FIX] Add mask_w to the load mask
+        mask_k_load = mask_h[:, None, None] & mask_w[None, :, None] & mask_d[None, None, :]
+        k = tl.load(k_ptr, mask=mask_k_load, other=0.0)
+        
         scores += tl.sum(q_broad * k, axis=2)
 
-    # 3. Softmax
+    # ... Softmax ...
+    # [FIX] Mask out padding indices before Softmax
     scores = scores * sm_scale
+    scores = tl.where(mask_w[None, :], scores, -float('inf'))
+
     max_score = tl.max(scores, axis=1)
     exp_scores = tl.exp(scores - max_score[:, None])
     sum_exp = tl.sum(exp_scores, axis=1)
     weights = exp_scores / sum_exp[:, None]
 
-    # Save Weights [B, N, H, Window]
+    # Save Weights
     w_ptr_base = W_ptr + (b_idx * sw_b) + (node_idx * sw_n) + (h_idx[:, None] * sw_h) + (w_idx[None, :] * sw_w)
-    tl.store(w_ptr_base, weights, mask=mask_h[:, None])
+    # [FIX] Add mask_w to store
+    tl.store(w_ptr_base, weights, mask=mask_h[:, None] & mask_w[None, :])
 
-    # -----------------------------------------------------------
-    # 4. Weighted Sum Loop (Reduce over D)
-    # -----------------------------------------------------------
-    # We re-iterate D to compute Output = Sum(Weights * V)
+    # ... Weighted Sum Loop ...
     out_base = Out_ptr + (b_idx * so_b) + (node_idx * so_n) + (h_idx[:, None] * so_h)
     
     for off_d in range(0, D, BLOCK_D):
         offs_d = off_d + tl.arange(0, BLOCK_D)
         mask_d = offs_d < D
         
-        # Load V [H, Window, D]
         v_ptr = v_base + (w_idx[None, :, None] * sv_w) + (offs_d[None, None, :] * sv_d)
-        v = tl.load(v_ptr, mask=mask_h[:, None, None] & mask_d[None, None, :], other=0.0)
+        # [FIX] Add mask_w to load
+        v = tl.load(v_ptr, mask=mask_h[:, None, None] & mask_w[None, :, None] & mask_d[None, None, :], other=0.0)
         
-        # Weighted Sum: [H, W, 1] * [H, W, D] -> Sum W -> [H, D]
+        # Weighted Sum (weights include zeros for padding due to softmax masking, so this is safe)
         out_chunk = tl.sum(weights[:, :, None] * v, axis=1)
         
-        # Store Output
         tl.store(out_base + (offs_d[None, :] * so_d), out_chunk.to(Out_ptr.dtype.element_ty), mask=mask_h[:, None] & mask_d[None, :])
 
 
 def hierarchical_fused_attention(Q, K_gathered, V_gathered, idx_table):
-    """
-    Inputs:
-      Q: [B, N, H, D]
-      K_gathered, V_gathered: [B, N, Window, H, D] (Where Window = Levels + 1)
-      idx_table: Used only for shape info here, actual gathering happened before.
-    """
     B, N, H, Dh = Q.shape
-    WINDOW = K_gathered.shape[2] # Gathered dimension
+    WINDOW = K_gathered.shape[2]  # Real window size (e.g., 7)
     
+    # [FIX] Calculate next power of 2 for Triton arange
+    BLOCK_WINDOW = triton.next_power_of_2(WINDOW)
+
     Out = torch.empty_like(Q)
-    # Weights: [B, N, H, Window]
     Weights = torch.empty((B, N, H, WINDOW), device=Q.device, dtype=torch.float32)
 
-    # Alignment Checks
     assert Q.data_ptr() % 16 == 0
     assert K_gathered.data_ptr() % 16 == 0
     assert V_gathered.data_ptr() % 16 == 0
@@ -322,15 +307,16 @@ def hierarchical_fused_attention(Q, K_gathered, V_gathered, idx_table):
         Out, Weights,
         
         *Q.stride(),
-        *K_gathered.stride(), # Passes 5 strides
-        *V_gathered.stride(), # Passes 5 strides
+        *K_gathered.stride(),
+        *V_gathered.stride(),
         *Out.stride(),
-        *Weights.stride(),    # Passes 4 strides
+        *Weights.stride(),
         
         sm_scale=1.0 / math.sqrt(Dh),
         H=H, BLOCK_H=BLOCK_H,
         D=Dh, BLOCK_D=BLOCK_D,
-        WINDOW=WINDOW,
+        WINDOW=WINDOW,              # Pass real size for masking
+        BLOCK_WINDOW=BLOCK_WINDOW,  # Pass power-of-2 size for arange
         num_warps=4
     )
     return Out
