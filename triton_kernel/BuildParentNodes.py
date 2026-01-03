@@ -1236,7 +1236,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             LEVELS=LEVELS, 
             HAS_MASK=HAS_MASK,
         
-            num_warps=4
+            num_warps=8
         )
 
         # Synchronize streams
