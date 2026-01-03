@@ -787,7 +787,7 @@ def hierarchical_attention_backward_dK_dV_level1_kernel(
 
 
 @triton.jit
-def hierarchical_attention_backward_dK_dV_level2_gather_kernel(
+def hierarchical_attention_backward_dK_dV_level2_kernel(
     DS_ptr, Q_ptr, W_ptr, DO_ptr, Gather_Table_ptr,
     DK_ptr, DV_ptr,
     # Strides
@@ -1369,7 +1369,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             # --- SPECIAL CASE: Level 1 (2 Children, Gather Optimized) ---
             if lvl == 1:
                 grid_lvl1 = (num_nodes_in_level, B)
-                hierarchical_attention_backward_dK_dV_level1_gather_kernel[grid_lvl1](
+                hierarchical_attention_backward_dK_dV_level1_kernel[grid_lvl1](
                     DS, Q, Weights, grad_output_4d, gather_table,
                     dK, dV,
                     *DS.stride(), *Q.stride(), *Weights.stride(),
@@ -1385,7 +1385,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             elif lvl == 2:
                 grid_lvl2 = (num_nodes_in_level, B)
                 # Assumes you defined this kernel from the previous turn
-                hierarchical_attention_backward_dK_dV_level2_gather_kernel[grid_lvl2](
+                hierarchical_attention_backward_dK_dV_level2_kernel[grid_lvl2](
                     DS, Q, Weights, grad_output_4d, gather_table,
                     dK, dV,
                     *DS.stride(), *Q.stride(), *Weights.stride(),
