@@ -1270,10 +1270,10 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             num_warps=4
         )
 
-    # Synchronize streams
-    main_stream.wait_stream(side_stream)
+        # Synchronize streams
+        main_stream.wait_stream(side_stream)
     
-    return dQ, dK, dV, None, None, None, None
+        return dQ, dK, dV, None, None, None, None
 
 def hierarchical_fused_attention(Q, K, V, idx_table, mask_table=None):
     """
