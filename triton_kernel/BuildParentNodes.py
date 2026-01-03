@@ -725,7 +725,7 @@ def hierarchical_attention_backward_dK_dV_internal_kernel(
     # Valid Node Logic
     leaf_end = tl.load(tab_ptr + 1)
     level_idx = tl.load(tab_ptr + 2)
-    w_idx = level_idx + 1
+    w_idx = level_idx
 
     # -----------------------------------------------------------
     # Loop over Dimension D (Outer Loop)
