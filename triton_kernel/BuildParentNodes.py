@@ -859,37 +859,20 @@ def hierarchical_attention_backward_dK_dV_atomic_kernel(
 
         off_out_self = b_idx * sdk_b + node_idx * sdk_n
 
-        #tl.atomic_add(
-        #    DK_ptr + off_out_self
-        #    + h_idx[:, None] * sdk_h
-        #    + offs_d[None, :] * sdk_d,
-        #    dk_self,
-        #    mask=mask_op,
-        #)
-        #
-        #tl.atomic_add(
-        #    DV_ptr + off_out_self
-        #    + h_idx[:, None] * sdk_h
-        #    + offs_d[None, :] * sdk_d,
-        #    dv_self,
-        #    mask=mask_op,
-        #)
-
-        # NEW: Faster Store
-        tl.store(
+        tl.atomic_add(
             DK_ptr + off_out_self
             + h_idx[:, None] * sdk_h
             + offs_d[None, :] * sdk_d,
             dk_self,
-            mask=mask_op
+            mask=mask_op,
         )
 
-        tl.store(
+        tl.atomic_add(
             DV_ptr + off_out_self
             + h_idx[:, None] * sdk_h
             + offs_d[None, :] * sdk_d,
             dv_self,
-            mask=mask_op
+            mask=mask_op,
         )
 
         # =========================================================
