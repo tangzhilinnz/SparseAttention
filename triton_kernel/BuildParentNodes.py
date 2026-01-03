@@ -463,166 +463,124 @@ def hierarchical_attention_forward_kernel(
 # ------------------------------------------------------------------
 #  Backward Kernel 1: Score Gradient (Computes dS)
 # ------------------------------------------------------------------
-import triton
-import triton.language as tl
-
 @triton.jit
 def hierarchical_attention_backward_dS_kernel(
     DO_ptr, W_ptr, V_ptr, Lookup_ptr, DS_ptr, Mask_ptr,
-    # Strides
+    # Strides for dO
     sdo_b, sdo_n, sdo_h, sdo_d,
+    # Strides for W
     sw_b, sw_n, sw_h, sw_lvl,
+    # Strides for V (Now separate from K)
     sv_b, sv_n, sv_h, sv_d,
+    # Strides for Lookup/Topology
     sl_n, sl_lvl,
+    # Strides for DS
     sds_b, sds_n, sds_h, sds_lvl,
     
     sm_scale,
     H: tl.constexpr, BLOCK_H: tl.constexpr,
-    D: tl.constexpr, 
-    BLOCK_D: tl.constexpr,      # <--- Keep small (e.g. 32)
-    LEVELS: tl.constexpr, 
-    BLOCK_LEVELS: tl.constexpr, # <--- Must be Power of 2 (e.g. 4, 8)
-    HAS_MASK: tl.constexpr
+    D: tl.constexpr, BLOCK_D: tl.constexpr,
+    LEVELS: tl.constexpr, BLOCK_LEVELS: tl.constexpr,
+    HAS_MASK: tl.constexpr # <--- Added Flag
 ):
     node_idx = tl.program_id(0)
     b_idx = tl.program_id(1)
 
     h_idx = tl.arange(0, BLOCK_H)
     mask_h = h_idx < H
+    offs_lvl = tl.arange(0, BLOCK_LEVELS)
+    
+    # -----------------------------------------------------------
+    # 1. Mask Logic & Topology Load
+    # -----------------------------------------------------------
+    # Boundary Check: Are we within the max levels?
+    mask_lvl_bounds = offs_lvl < LEVELS
+    off_lookup = node_idx * sl_n + offs_lvl * sl_lvl
+    
+    neighbor_indices = tl.load(Lookup_ptr + off_lookup, mask=mask_lvl_bounds, other=0)
+
+    # Combined Mask: (In Bounds) AND (Not Masked by User)
+    # Start with bounds
+    mask_valid_cross = mask_lvl_bounds
+    
+    if HAS_MASK:
+        # Load User Mask (1 = Ignore/Masked, 0 = Keep)
+        val_int8 = tl.load(Mask_ptr + off_lookup, mask=mask_lvl_bounds, other=1).to(tl.int8)
+        mask_valid_cross = mask_valid_cross & (val_int8 == 0)
 
     # -----------------------------------------------------------
-    # 1. Pre-calculate Base Pointers
+    # 2. Load Weights (W)
     # -----------------------------------------------------------
-    # dO Base: [Node, Head]
-    do_base = DO_ptr + (b_idx * sdo_b) + (node_idx * sdo_n) + (h_idx[:, None] * sdo_h)
-    
-    # W Base: [Node, Head]
     w_base = W_ptr + (b_idx * sw_b) + (node_idx * sw_n) + (h_idx * sw_h)
     
-    # V Batch Base
-    v_batch_base = V_ptr + b_idx * sv_b
+    # Self Weight
+    w_self = tl.load(w_base + (0 * sw_lvl), mask=mask_h, other=0.0)
     
-    # DS Base: [Node, Head]
-    ds_base = DS_ptr + (b_idx * sds_b) + (node_idx * sds_n) + (h_idx * sds_h)
+    # Cross Weight
+    # DEFENSIVE: Apply mask_valid_cross. If masked, w_cross becomes 0.0.
+    w_cross = tl.load(w_base[:, None] + ((1 + offs_lvl[None, :]) * sw_lvl), 
+                      mask=mask_h[:, None] & mask_valid_cross[None, :], other=0.0)
 
     # -----------------------------------------------------------
-    # 2. Compute dP_self (Self Attention Dot Product)
+    # 3. Compute dP = dot(dO, V)
     # -----------------------------------------------------------
-    # Initialize Accumulator
     dp_self = tl.zeros([BLOCK_H], dtype=tl.float32)
-    
-    # Pre-calc Self V Offset: [Node, Head]
-    off_v_self_base = (node_idx * sv_n) + (h_idx[:, None] * sv_h)
+    dp_cross = tl.zeros([BLOCK_H, BLOCK_LEVELS], dtype=tl.float32)
 
-    for off_d_start in range(0, D, BLOCK_D):
-        offs_d = off_d_start + tl.arange(0, BLOCK_D)
+    # Use explicit SV strides for V pointer calculation
+    v_batch_base = V_ptr + b_idx * sv_b
+    do_batch_base = DO_ptr + (b_idx * sdo_b) + (node_idx * sdo_n)
+    
+    off_node_self = node_idx * sv_n
+    off_node_cross = neighbor_indices * sv_n
+
+    for off_d in range(0, D, BLOCK_D):
+        offs_d = off_d + tl.arange(0, BLOCK_D)
         mask_d = offs_d < D
         mask_op = mask_h[:, None] & mask_d[None, :]
 
-        # Load dO [H, D]
-        do_val = tl.load(do_base + (offs_d[None, :] * sdo_d), mask=mask_op, other=0.0)
+        # Load dO
+        do = tl.load(do_batch_base + (h_idx[:, None]*sdo_h) + (offs_d[None, :]*sdo_d), 
+                     mask=mask_op, other=0.0)
         
-        # Load V Self [H, D]
-        v_self = tl.load(
-            v_batch_base + off_v_self_base + (offs_d[None, :] * sv_d),
-            mask=mask_op, other=0.0
-        )
+        # Load V Self (using sv strides)
+        ptr_v_self = v_batch_base + off_node_self + (h_idx[:, None]*sv_h) + (offs_d[None, :]*sv_d)
+        v_self = tl.load(ptr_v_self, mask=mask_op, other=0.0)
         
-        # Accumulate dot product
-        dp_self += tl.sum(do_val * v_self, axis=1)
+        # Load V Cross (using sv strides)
+        ptr_v_cross = v_batch_base + off_node_cross[None, :, None] + \
+                      (h_idx[:, None, None]*sv_h) + (offs_d[None, None, :]*sv_d)
+        
+        # DEFENSIVE: Apply mask_valid_cross to V load.
+        # This prevents loading 'NaNs' or garbage from padding tokens.
+        mask_v_cross = mask_h[:, None, None] & mask_valid_cross[None, :, None] & mask_d[None, None, :]
+        v_cross = tl.load(ptr_v_cross, mask=mask_v_cross, other=0.0)
 
-    # Load W Self
-    w_self = tl.load(w_base + (0 * sw_lvl), mask=mask_h, other=0.0)
+        dp_self += tl.sum(do * v_self, axis=1)
+        dp_cross += tl.sum(do[:, None, :] * v_cross, axis=2)
 
     # -----------------------------------------------------------
-    # 3. Compute Sum(W * dP) across all levels
+    # 4. Compute dS (Softmax Gradient)
     # -----------------------------------------------------------
-    sum_wdp = (w_self * dp_self)
-
-    # Buffers to hold dP and W for all levels.
-    # [FIX]: Must use BLOCK_LEVELS (power of 2) for shape allocation
-    dp_cross_all = tl.zeros([BLOCK_H, BLOCK_LEVELS], dtype=tl.float32)
-    w_cross_all  = tl.zeros([BLOCK_H, BLOCK_LEVELS], dtype=tl.float32)
-
-    for lvl_idx in range(LEVELS):
-        # 1. Topology & Mask
-        off_lookup = node_idx * sl_n + lvl_idx * sl_lvl
-        p_idx = tl.load(Lookup_ptr + off_lookup)
-        
-        is_valid = (p_idx != -1)
-        if HAS_MASK:
-            mask_val = tl.load(Mask_ptr + off_lookup).to(tl.int8)
-            is_valid = is_valid & (mask_val == 0)
-
-        # 2. Load Weight [H]
-        w_idx = lvl_idx + 1
-        mask_load = mask_h & is_valid
-        
-        w_val = tl.load(
-            w_base + (w_idx * sw_lvl), 
-            mask=mask_load, other=0.0
-        )
-        
-        # [FIX]: Use BLOCK_LEVELS for the range to match tensor shape
-        mask_this_lvl = (tl.arange(0, BLOCK_LEVELS) == lvl_idx)
-        
-        # Store W into the specific column for this level
-        w_cross_all += w_val[:, None] * mask_this_lvl[None, :].to(tl.float32)
-
-        # 3. Compute dP (Dot Product) for this level
-        dp_lvl = tl.zeros([BLOCK_H], dtype=tl.float32)
-        safe_p_idx = tl.where(is_valid, p_idx, 0)
-        
-        # Pointer to V for this parent
-        off_v_cross_base = (safe_p_idx * sv_n) + (h_idx * sv_h)
-
-        # Inner Loop D
-        for off_d_start in range(0, D, BLOCK_D):
-            offs_d = off_d_start + tl.arange(0, BLOCK_D)
-            mask_d = offs_d < D
-            mask_op = mask_h[:, None] & mask_d[None, :]
-
-            # Load dO
-            do_val = tl.load(do_base + (offs_d[None, :] * sdo_d), mask=mask_op, other=0.0)
-
-            # Load V Cross
-            mask_v = mask_load[:, None] & mask_d[None, :]
-            v_val = tl.load(
-                v_batch_base + off_v_cross_base[:, None] + (offs_d[None, :] * sv_d),
-                mask=mask_v, other=0.0
-            )
-
-            dp_lvl += tl.sum(do_val * v_val, axis=1)
-
-        # 4. Store dP into [H, L] buffer
-        dp_cross_all += dp_lvl[:, None] * mask_this_lvl[None, :].to(tl.float32)
-        
-        # 5. Accumulate into sum_wdp
-        sum_wdp += (w_val * dp_lvl)
-
-    # -----------------------------------------------------------
-    # 4. Compute & Store dS
-    # -----------------------------------------------------------
+    sum_wdp = (w_self * dp_self) + tl.sum(w_cross * dp_cross, axis=1)
     
-    # A. dS Self
     ds_self = w_self * (dp_self - sum_wdp) * sm_scale
-    tl.store(ds_base + (0 * sds_lvl), ds_self.to(DS_ptr.dtype.element_ty), mask=mask_h)
+    ds_cross = w_cross * (dp_cross - sum_wdp[:, None]) * sm_scale
 
-    # B. dS Cross (Loop to store)
-    for lvl_idx in range(LEVELS):
-        # [FIX]: Use BLOCK_LEVELS for indexing
-        mask_this_lvl = (tl.arange(0, BLOCK_LEVELS) == lvl_idx)
-        
-        # Extract cached values (Sum over L axis to pick the single column)
-        w_val = tl.sum(w_cross_all * mask_this_lvl[None, :], axis=1)
-        dp_val = tl.sum(dp_cross_all * mask_this_lvl[None, :], axis=1)
-        
-        # Softmax Gradient Formula
-        ds_val = w_val * (dp_val - sum_wdp) * sm_scale
-        
-        # Store
-        ds_ptr_lvl = ds_base + ((lvl_idx + 1) * sds_lvl)
-        tl.store(ds_ptr_lvl, ds_val.to(DS_ptr.dtype.element_ty), mask=mask_h)
+    # -----------------------------------------------------------
+    # 5. Store dS
+    # -----------------------------------------------------------
+    ds_base = DS_ptr + (b_idx * sds_b) + (node_idx * sds_n) + (h_idx * sds_h)
+    
+    tl.store(ds_base + (0 * sds_lvl), ds_self, mask=mask_h)
+    
+    ds_cross_ptr = ds_base[:, None] + ((1 + offs_lvl[None, :]) * sds_lvl)
+    
+    # SAFE STORE: We use mask_lvl_bounds (bounds only), NOT mask_valid_cross.
+    # Why? If a node is masked, ds_cross is 0.0 (because w_cross was 0.0).
+    # We WANT to write this 0.0 to memory to overwrite any garbage in uninitialized DS.
+    # If we masked the store, DS would retain random values from empty_like().
+    tl.store(ds_cross_ptr, ds_cross, mask=mask_h[:, None] & mask_lvl_bounds[None, :])
 
 
 # ==================================================================
