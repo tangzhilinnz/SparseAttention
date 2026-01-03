@@ -781,6 +781,139 @@ def hierarchical_attention_backward_dK_dV_internal_kernel(
 
 
 # ------------------------------------------------------------------
+#  Fused Backward Kernel (Atomic Add)
+# ------------------------------------------------------------------
+@triton.jit
+def hierarchical_attention_backward_dK_dV_atomic_kernel(
+    # Gradients (Inputs)
+    DS_ptr, DO_ptr, 
+    # Forward Context (Inputs)
+    Q_ptr, W_ptr, Lookup_ptr, Mask_ptr,
+    # Gradients (Outputs - destination for Atomic Adds)
+    DK_ptr, DV_ptr,
+    
+    # Strides
+    sds_b, sds_n, sds_h, sds_lvl,
+    sdo_b, sdo_n, sdo_h, sdo_d,
+    sq_b, sq_n, sq_h, sq_d,
+    sw_b, sw_n, sw_h, sw_lvl,
+    sl_n, sl_lvl,
+    sdk_b, sdk_n, sdk_h, sdk_d,
+    
+    # Constants
+    H: tl.constexpr, BLOCK_H: tl.constexpr,
+    D: tl.constexpr, BLOCK_D: tl.constexpr,
+    LEVELS: tl.constexpr, BLOCK_LEVELS: tl.constexpr,
+    HAS_MASK: tl.constexpr
+):
+    node_idx = tl.program_id(0) # This is the LEAF index
+    b_idx = tl.program_id(1)
+
+    # 1. Setup Offsets
+    h_idx = tl.arange(0, BLOCK_H)
+    mask_h = h_idx < H
+    
+    # 2. Pre-load Topology for this Leaf
+    # We load the entire row of parents for this leaf
+    offs_lvl = tl.arange(0, BLOCK_LEVELS)
+    mask_lvl = offs_lvl < LEVELS
+    
+    off_lookup = node_idx * sl_n + offs_lvl * sl_lvl
+    
+    # Load Parent Indices
+    parent_indices = tl.load(Lookup_ptr + off_lookup, mask=mask_lvl, other=-1)
+    
+    # Load Mask (User Mask)
+    parent_valid_mask = (parent_indices != -1)
+    if HAS_MASK:
+        val_int8 = tl.load(Mask_ptr + off_lookup, mask=mask_lvl, other=1).to(tl.int8)
+        parent_valid_mask = parent_valid_mask & (val_int8 == 0)
+
+    # 3. Base Pointers for this Leaf
+    q_base = Q_ptr + (b_idx * sq_b) + (node_idx * sq_n)
+    do_base = DO_ptr + (b_idx * sdo_b) + (node_idx * sdo_n)
+    
+    # Weights Base
+    w_base = W_ptr + (b_idx * sw_b) + (node_idx * sw_n) + (h_idx * sw_h)
+    
+    # DS Base
+    ds_base = DS_ptr + (b_idx * sds_b) + (node_idx * sds_n) + (h_idx * sds_h)
+
+    # 4. Loop over Dimension D (Tiling)
+    for off_d_start in range(0, D, BLOCK_D):
+        offs_d = off_d_start + tl.arange(0, BLOCK_D)
+        mask_d = offs_d < D
+        mask_op = mask_h[:, None] & mask_d[None, :]
+
+        # --- A. Load Leaf Data (Constant across levels) ---
+        # Q: [H, D]
+        q_val = tl.load(q_base + (h_idx[:, None] * sq_h) + (offs_d[None, :] * sq_d), 
+                       mask=mask_op, other=0.0)
+        # dO: [H, D]
+        do_val = tl.load(do_base + (h_idx[:, None] * sdo_h) + (offs_d[None, :] * sdo_d), 
+                        mask=mask_op, other=0.0)
+
+        # --- B. Process SELF (Optimization: Direct Store, No Atomic) ---
+        # Level 0 (Self) is always index 0 in Weights/DS. 
+        # The Leaf itself is the only one writing to DK_leaf/DV_leaf in this topology.
+        w_self = tl.load(w_base + (0 * sw_lvl), mask=mask_h, other=0.0)
+        ds_self = tl.load(ds_base + (0 * sds_lvl), mask=mask_h, other=0.0)
+        
+        dk_self = ds_self[:, None] * q_val
+        dv_self = w_self[:, None] * do_val
+        
+        # Store Self Gradients directly
+        off_out_self = (b_idx * sdk_b) + (node_idx * sdk_n)
+        tl.store(DK_ptr + off_out_self + (h_idx[:, None] * sdk_h) + (offs_d[None, :] * sdk_d), 
+                 dk_self, mask=mask_op)
+        tl.store(DV_ptr + off_out_self + (h_idx[:, None] * sdk_h) + (offs_d[None, :] * sdk_d), 
+                 dv_self, mask=mask_op)
+
+        # --- C. Process PARENTS (Loop Levels -> Atomic Add) ---
+        # Iterate through levels 0 to LEVELS-1 (Indices in topology are Level+1, but array index is 0..L)
+        # Note: The 'parent_indices' array maps: Column 0 -> Level 1 Parent, Column 1 -> Level 2 Parent...
+        
+        for lvl_idx in range(LEVELS):
+            # Check validity
+            p_idx = tl.load(Lookup_ptr + off_lookup + lvl_idx * sl_lvl)
+            
+            # Since we can't branch easily inside the D-loop without splitting blocks,
+            # we rely on the mask. If invalid, we just atomic_add zeros (safe but slightly wasteful),
+            # OR we check condition. Checking condition per scalar is tricky in vectorized code.
+            # Best way: Check if the *entire block* is invalid? No, topology is uniform.
+            # We just use mask logic.
+            
+            if p_idx != -1: # Scalar check (Uniform across block usually if tree is balanced)
+                # Load Mask for this specific level
+                # Topology Table Index i corresponds to Weight Column i+1
+                valid = parent_valid_mask[0, lvl_idx] # We loaded this into register earlier
+                
+                if valid:
+                    # Load W and DS for this connection
+                    # Weights[Self, L1, L2...] -> Index is lvl_idx + 1
+                    w_idx = lvl_idx + 1 
+                    
+                    w_cross = tl.load(w_base + (w_idx * sw_lvl), mask=mask_h, other=0.0)
+                    ds_cross = tl.load(ds_base + (w_idx * sds_lvl), mask=mask_h, other=0.0)
+                    
+                    # Compute Partial Gradients
+                    # dK_parent += dS_leaf_to_parent * Q_leaf
+                    dk_contrib = ds_cross[:, None] * q_val
+                    
+                    # dV_parent += W_leaf_to_parent * dO_leaf
+                    dv_contrib = w_cross[:, None] * do_val
+                    
+                    # Atomic Add to Parent Address
+                    off_out_parent = (b_idx * sdk_b) + (p_idx * sdk_n)
+                    
+                    tl.atomic_add(DK_ptr + off_out_parent + (h_idx[:, None] * sdk_h) + (offs_d[None, :] * sdk_d), 
+                                  dk_contrib, mask=mask_op)
+                    
+                    tl.atomic_add(DV_ptr + off_out_parent + (h_idx[:, None] * sdk_h) + (offs_d[None, :] * sdk_d), 
+                                  dv_contrib, mask=mask_op)
+
+
+# ------------------------------------------------------------------
 #  Backward Kernel 3: Compute dQ (Small Kernel)
 # ------------------------------------------------------------------
 @triton.jit
@@ -910,113 +1043,190 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         ctx.constants = (sm_scale, H, BLOCK_H, D, BLOCK_D, LEVELS, BLOCK_LEVELS)
         return Out
 
+    #@staticmethod
+    #def backward(ctx, grad_output):
+    #    # [UPDATE] Unpack mask_table
+    #    Q, K, V, idx_table, gather_table, Weights, mask_table = ctx.saved_tensors
+    #    sm_scale, H, BLOCK_H, D, BLOCK_D, LEVELS, BLOCK_LEVELS = ctx.constants
+    #    
+    #    grad_output = grad_output.contiguous()
+    #    B, N = Q.shape[0], Q.shape[1]
+    #    
+    #    # 1. Compute dS (Runs on Main Stream)
+    #    DS = torch.empty_like(Weights)
+    #    grid_ds = (N, B)
+    #    
+    #    # Handle Mask Pointer
+    #    HAS_MASK = (mask_table is not None)
+    #    mask_ptr_safe = mask_table if HAS_MASK else Weights # Dummy ptr
+    #    
+    #    # [UPDATE] Launch dS Kernel with Mask and Separate V Strides
+    #    hierarchical_attention_backward_dS_kernel[grid_ds](
+    #        # Pointers
+    #        grad_output, Weights, V, idx_table, DS, mask_ptr_safe,
+    #        
+    #        # Strides
+    #        *grad_output.stride(), # dO strides
+    #        *Weights.stride(),     # W strides
+    #        *V.stride(),           # V strides (Separated from K)
+    #        *idx_table.stride(),   # Lookup strides
+    #        *DS.stride(),          # DS strides
+    #        
+    #        # Constants
+    #        sm_scale, H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, 
+    #        LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS,
+    #        HAS_MASK=HAS_MASK,
+    #        num_warps=4
+    #    )
+    #
+    #    # --- SETUP PARALLELISM ---
+    #    dK = torch.empty_like(K)
+    #    dV = torch.empty_like(V)
+    #    dQ = torch.empty_like(Q)
+    #
+    #    main_stream = torch.cuda.current_stream()
+    #    side_stream = torch.cuda.Stream()
+    #    
+    #    # Ensure Side Stream waits for Kernel 1 (DS) to finish
+    #    side_stream.wait_stream(main_stream)
+    #
+    #    # --- BRANCH 1: dQ (Side Stream) ---
+    #    with torch.cuda.stream(side_stream):
+    #        grid_dq = (N, B)
+    #        hierarchical_attention_backward_dQ_kernel[grid_dq](
+    #            DS, K, idx_table, dQ, mask_ptr_safe, 
+    #            *DS.stride(), *K.stride(), *idx_table.stride(), *dQ.stride(),
+    #            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS,
+    #            HAS_MASK=HAS_MASK,
+    #            num_warps=4
+    #        )
+    #
+    #    # --- BRANCH 2: dK/dV Per Level (Main Stream) ---
+    #    
+    #    # Step A: Launch Specialized Leaf Kernel (Level 0)
+    #    # Covers Nodes 0 to N-1
+    #    grid_leaf = (N, B)
+    #    hierarchical_attention_backward_dK_dV_leaf_kernel[grid_leaf](
+    #        DS, Q, Weights, grad_output, gather_table,
+    #        dK, dV,
+    #        *DS.stride(), *Q.stride(), *Weights.stride(), *grad_output.stride(), *dK.stride(),
+    #        *gather_table.stride(),
+    #        H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
+    #        num_warps=4
+    #    )
+    #
+    #    # Step B: Launch Generic Internal Kernels (Levels 1 to N)
+    #    # These launches are asynchronous and will overlap if resources allow.
+    #    current_start_node = N  # Internal nodes start after leaves
+    #    
+    #    for lvl in range(1, LEVELS):
+    #        # Calculate properties for this level
+    #        num_nodes_in_level = N >> lvl  # e.g., 16 -> 8 -> 4 -> 2
+    #        gather_width = 1 << lvl        # e.g., 1 -> 2 -> 4 -> 8
+    #        
+    #        # Optimization: Use dynamic BLOCK_L to saturate threads for high levels
+    #        # while keeping low register pressure for mid levels.
+    #        BLOCK_L_DYNAMIC = min(128, triton.next_power_of_2(gather_width))
+    #        
+    #        grid_internal = (num_nodes_in_level, B)
+    #        
+    #        hierarchical_attention_backward_dK_dV_internal_kernel[grid_internal](
+    #            DS, Q, Weights, grad_output, gather_table,
+    #            dK, dV,
+    #            *DS.stride(), *Q.stride(), *Weights.stride(), *grad_output.stride(), *dK.stride(),
+    #            *gather_table.stride(),
+    #            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, 
+    #            
+    #            # Dynamic Values
+    #            BLOCK_L=BLOCK_L_DYNAMIC,
+    #            START_NODE_ID=current_start_node,
+    #            
+    #            num_warps=4
+    #        )
+    #        
+    #        # Advance to next level's node block
+    #        current_start_node += num_nodes_in_level
+    #
+    #    # --- REJOIN ---
+    #    main_stream.wait_stream(side_stream)
+    #    
+    #    return dQ, dK, dV, None, None, None
+
     @staticmethod
     def backward(ctx, grad_output):
-        # [UPDATE] Unpack mask_table
         Q, K, V, idx_table, gather_table, Weights, mask_table = ctx.saved_tensors
         sm_scale, H, BLOCK_H, D, BLOCK_D, LEVELS, BLOCK_LEVELS = ctx.constants
         
         grad_output = grad_output.contiguous()
         B, N = Q.shape[0], Q.shape[1]
         
-        # 1. Compute dS (Runs on Main Stream)
-        DS = torch.empty_like(Weights)
+        # 1. Compute dS (Still separate, requires gather-like read or scatter-write? 
+        # Actually dS is per-edge. The existing dS kernel is efficient and fine. Keep it.)
+        DS = torch.zeros_like(Weights)
         grid_ds = (N, B)
-        
-        # Handle Mask Pointer
         HAS_MASK = (mask_table is not None)
-        mask_ptr_safe = mask_table if HAS_MASK else Weights # Dummy ptr
-        
-        # [UPDATE] Launch dS Kernel with Mask and Separate V Strides
+        mask_ptr_safe = mask_table if HAS_MASK else Weights
+
         hierarchical_attention_backward_dS_kernel[grid_ds](
-            # Pointers
             grad_output, Weights, V, idx_table, DS, mask_ptr_safe,
-            
-            # Strides
-            *grad_output.stride(), # dO strides
-            *Weights.stride(),     # W strides
-            *V.stride(),           # V strides (Separated from K)
-            *idx_table.stride(),   # Lookup strides
-            *DS.stride(),          # DS strides
-            
-            # Constants
+            *grad_output.stride(), *Weights.stride(), *V.stride(),
+            *idx_table.stride(), *DS.stride(),
             sm_scale, H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, 
-            LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS,
-            HAS_MASK=HAS_MASK,
+            LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS, HAS_MASK=HAS_MASK,
             num_warps=4
         )
 
-        # --- SETUP PARALLELISM ---
-        dK = torch.empty_like(K)
-        dV = torch.empty_like(V)
+        # 2. Compute dQ (Can also be fused, but fine to keep separate for modularity)
         dQ = torch.empty_like(Q)
+        
+        # 3. Compute dK / dV using ATOMIC ADD
+        # [CRITICAL] Must be Zeros because we accumulate into it
+        dK = torch.zeros_like(K)
+        dV = torch.zeros_like(V)
 
+        # Stream management
         main_stream = torch.cuda.current_stream()
         side_stream = torch.cuda.Stream()
-        
-        # Ensure Side Stream waits for Kernel 1 (DS) to finish
         side_stream.wait_stream(main_stream)
-
-        # --- BRANCH 1: dQ (Side Stream) ---
+        
+        # Branch 1: dQ
         with torch.cuda.stream(side_stream):
             grid_dq = (N, B)
             hierarchical_attention_backward_dQ_kernel[grid_dq](
                 DS, K, idx_table, dQ, mask_ptr_safe, 
                 *DS.stride(), *K.stride(), *idx_table.stride(), *dQ.stride(),
                 H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS,
-                HAS_MASK=HAS_MASK,
-                num_warps=4
+                HAS_MASK=HAS_MASK, num_warps=4
             )
 
-        # --- BRANCH 2: dK/dV Per Level (Main Stream) ---
+        # Branch 2: dK / dV (Single Atomic Kernel)
+        # Grid is (N, B) -> We iterate leaves, and they update parents
+        grid_atomic = (N, B)
         
-        # Step A: Launch Specialized Leaf Kernel (Level 0)
-        # Covers Nodes 0 to N-1
-        grid_leaf = (N, B)
-        hierarchical_attention_backward_dK_dV_leaf_kernel[grid_leaf](
-            DS, Q, Weights, grad_output, gather_table,
+        hierarchical_attention_backward_dK_dV_atomic_kernel[grid_atomic](
+            # Gradients (In)
+            DS, grad_output,
+            # Context (In)
+            Q, Weights, idx_table, mask_ptr_safe,
+            # Gradients (Out - Atomic)
             dK, dV,
-            *DS.stride(), *Q.stride(), *Weights.stride(), *grad_output.stride(), *dK.stride(),
-            *gather_table.stride(),
-            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
+            
+            # Strides
+            *DS.stride(),
+            *grad_output.stride(),
+            *Q.stride(),
+            *Weights.stride(),
+            *idx_table.stride(),
+            *dK.stride(),
+            
+            # Constants
+            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, 
+            LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS,
+            HAS_MASK=HAS_MASK,
             num_warps=4
         )
 
-        # Step B: Launch Generic Internal Kernels (Levels 1 to N)
-        # These launches are asynchronous and will overlap if resources allow.
-        current_start_node = N  # Internal nodes start after leaves
-        
-        for lvl in range(1, LEVELS):
-            # Calculate properties for this level
-            num_nodes_in_level = N >> lvl  # e.g., 16 -> 8 -> 4 -> 2
-            gather_width = 1 << lvl        # e.g., 1 -> 2 -> 4 -> 8
-            
-            # Optimization: Use dynamic BLOCK_L to saturate threads for high levels
-            # while keeping low register pressure for mid levels.
-            BLOCK_L_DYNAMIC = min(128, triton.next_power_of_2(gather_width))
-            
-            grid_internal = (num_nodes_in_level, B)
-            
-            hierarchical_attention_backward_dK_dV_internal_kernel[grid_internal](
-                DS, Q, Weights, grad_output, gather_table,
-                dK, dV,
-                *DS.stride(), *Q.stride(), *Weights.stride(), *grad_output.stride(), *dK.stride(),
-                *gather_table.stride(),
-                H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, 
-                
-                # Dynamic Values
-                BLOCK_L=BLOCK_L_DYNAMIC,
-                START_NODE_ID=current_start_node,
-                
-                num_warps=4
-            )
-            
-            # Advance to next level's node block
-            current_start_node += num_nodes_in_level
-
-        # --- REJOIN ---
         main_stream.wait_stream(side_stream)
-        
         return dQ, dK, dV, None, None, None
 
 def hierarchical_fused_attention(Q, K, V, idx_table, gather_table, mask_table=None):
