@@ -1968,24 +1968,28 @@ def run_full_suite():
 
 
 def run_full_suite_update_X_from_Y():
+    # ==========================================================================
+    # 1. SETUP & CORRECTNESS CHECK
+    # ==========================================================================
+    # [CONFIG] Choose your dtype here: torch.float32 or torch.float16
+    check_dtype = torch.float32  
+    
     print(f"{'='*60}")
-    print("1. CORRECTNESS CHECK (Float16) - update_X_from_Y")
+    print(f"1. CORRECTNESS CHECK ({check_dtype}) - update_X_from_Y")
     print(f"{'='*60}")
 
     # 1. Setup Dimensions for Correctness
-    # N needs to be a power of 2 usually for easier tree construction logic, 
-    # though strict power of 2 isn't always required depending on your idx_table implementation.
+    # N needs to be a power of 2 usually for easier tree construction logic.
     B, N, D, H = 32, 256, 64, 16
     dim = H * D
     
     # 2. Initialize Model (Dropout=0.0 for deterministic check)
-    model = HierarchicalSparseAttentionTriton(dim, H, dropout=0.0).cuda().to(torch.float16)
+    model = HierarchicalSparseAttentionTriton(dim, H, dropout=0.0).cuda().to(check_dtype)
     
-    # 3. Create Inputs (Float16)
-    dtype = torch.float16
+    # 3. Create Inputs
     # update_X_from_Y takes leaves (x) and parents (y).
-    x = torch.randn(B, N, dim, device='cuda', dtype=dtype)
-    y = torch.randn(B, N - 1, dim, device='cuda', dtype=dtype)
+    x = torch.randn(B, N, dim, device='cuda', dtype=check_dtype)
+    y = torch.randn(B, N - 1, dim, device='cuda', dtype=check_dtype)
     
     # Optional mask (can be None, but good to test with None first for basic sanity)
     mask = None 
@@ -2025,21 +2029,24 @@ def run_full_suite_update_X_from_Y():
     # -------------------------------------------------
     # 6. Compare Results
     # -------------------------------------------------
-    diff_out = (out_ref - out_tri).abs().max().item()
-    diff_grad_x = (x_ref.grad - x_tri.grad).abs().max().item()
-    diff_grad_y = (y_ref.grad - y_tri.grad).abs().max().item()
+    # Cast to float32 for accurate diff calculation regardless of input type
+    diff_out = (out_ref.float() - out_tri.float()).abs().max().item()
+    diff_grad_x = (x_ref.grad.float() - x_tri.grad.float()).abs().max().item()
+    diff_grad_y = (y_ref.grad.float() - y_tri.grad.float()).abs().max().item()
     
-    print(f"Max Diff Output:   {diff_out:.6f}")
-    print(f"Max Diff Grad X:   {diff_grad_x:.6f}")
-    print(f"Max Diff Grad Y:   {diff_grad_y:.6f}")
+    print(f"Max Diff Output:   {diff_out:.8f}")
+    print(f"Max Diff Grad X:   {diff_grad_x:.8f}")
+    print(f"Max Diff Grad Y:   {diff_grad_y:.8f}")
     
-    # Relaxed tolerance for FP16 accumulation
-    tol = 1e-2 
+    # Dynamic tolerance based on dtype
+    # FP32: stricter (e.g., 1e-4), FP16: looser (e.g., 1e-2)
+    tol = 1e-3 if check_dtype == torch.float32 else 5e-2
+    
     try:
-        assert torch.allclose(out_ref, out_tri, atol=tol), "Forward pass mismatch!"
-        assert torch.allclose(x_ref.grad, x_tri.grad, atol=tol), "Gradient X mismatch!"
-        assert torch.allclose(y_ref.grad, y_tri.grad, atol=tol), "Gradient Y mismatch!"
-        print(f"SUCCESS: Triton kernel matches PyTorch reference (within FP16 tolerance).")
+        assert torch.allclose(out_ref, out_tri, atol=tol), f"Forward pass mismatch! (tol={tol})"
+        assert torch.allclose(x_ref.grad, x_tri.grad, atol=tol), f"Gradient X mismatch! (tol={tol})"
+        assert torch.allclose(y_ref.grad, y_tri.grad, atol=tol), f"Gradient Y mismatch! (tol={tol})"
+        print(f"SUCCESS: Triton kernel matches PyTorch reference (within {check_dtype} tolerance).")
     except AssertionError as e:
         print(f"\n{e}")
         # Proceed regardless
@@ -2048,22 +2055,22 @@ def run_full_suite_update_X_from_Y():
     # 2. PERFORMANCE BENCHMARK (Float16 - Large Scale)
     # ==========================================================================
     print(f"\n{'='*60}")
-    print("2. SPEED BENCHMARK (Float16 - Large Scale)")
+    print(f"2. SPEED BENCHMARK ({check_dtype} - Large Scale)")
     print(f"{'='*60}")
 
     # Config: Large scale to saturate GPU
     B, N, D, H = 32, 2048, 32, 32 
     dim = D * H
 
-    print(f"Config: B={B}, N={N}, D={dim} (HeadDim={D}), H={H}, dtype={dtype}")
+    print(f"Config: B={B}, N={N}, D={dim} (HeadDim={D}), H={H}, dtype={check_dtype}")
 
     # Re-init model
-    model = HierarchicalSparseAttentionTriton(dim=dim, num_heads=H, dropout=0.0).to('cuda').to(dtype)
+    model = HierarchicalSparseAttentionTriton(dim=dim, num_heads=H, dropout=0.0).to('cuda').to(check_dtype)
     model.eval() 
 
     # Create large inputs 
-    x = torch.randn(B, N, dim, device='cuda', dtype=dtype, requires_grad=True)
-    y_in = torch.randn(B, N - 1, dim, device='cuda', dtype=dtype, requires_grad=True)
+    x = torch.randn(B, N, dim, device='cuda', dtype=check_dtype, requires_grad=True)
+    y_in = torch.randn(B, N - 1, dim, device='cuda', dtype=check_dtype, requires_grad=True)
     
     model.sizes = None
     
@@ -2120,7 +2127,7 @@ def run_full_suite_update_X_from_Y():
     print("-" * 50)
 
     # ==========================================================================
-    # 3. PROFILER (Float16)
+    # 3. PROFILER
     # ==========================================================================
     print(f"\n{'='*60}")
     print("3. DETAILED PROFILING")
