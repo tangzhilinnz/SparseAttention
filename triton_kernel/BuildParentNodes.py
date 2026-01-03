@@ -1033,34 +1033,34 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        # [UPDATE] Unpack mask_table
+        # 1. Retrieve Tensors
         Q, K, V, idx_table, gather_table, Weights, mask_table = ctx.saved_tensors
         sm_scale, H, BLOCK_H, D, BLOCK_D, LEVELS, BLOCK_LEVELS = ctx.constants
         
+        # [CRITICAL FIX] View as 4D to generate 4 stride values
+        # grad_output comes in as [B, N, D], but kernels need [B, N, H, D] strides
         grad_output = grad_output.contiguous()
         B, N = Q.shape[0], Q.shape[1]
-        
-        # 1. Compute dS (Runs on Main Stream)
+        grad_output_4d = grad_output.view(B, N, H, D) 
+
+        # 2. Compute dS (Runs on Main Stream)
         DS = torch.empty_like(Weights)
         grid_ds = (N, B)
         
-        # Handle Mask Pointer
         HAS_MASK = (mask_table is not None)
-        mask_ptr_safe = mask_table if HAS_MASK else Weights # Dummy ptr
-        
-        # [UPDATE] Launch dS Kernel with Mask and Separate V Strides
+        mask_ptr_safe = mask_table if HAS_MASK else Weights
+
         hierarchical_attention_backward_dS_kernel[grid_ds](
-            # Pointers
-            grad_output, Weights, V, idx_table, DS, mask_ptr_safe,
+            # Pass the 4D view
+            grad_output_4d, Weights, V, idx_table, DS, mask_ptr_safe,
             
-            # Strides
-            *grad_output.stride(), # dO strides
-            *Weights.stride(),     # W strides
-            *V.stride(),           # V strides (Separated from K)
-            *idx_table.stride(),   # Lookup strides
-            *DS.stride(),          # DS strides
+            # Pass the 4D strides
+            *grad_output_4d.stride(), 
+            *Weights.stride(),           
+            *V.stride(),            
+            *idx_table.stride(),    
+            *DS.stride(),           
             
-            # Constants
             sm_scale, H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, 
             LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS,
             HAS_MASK=HAS_MASK,
@@ -1075,7 +1075,6 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         main_stream = torch.cuda.current_stream()
         side_stream = torch.cuda.Stream()
         
-        # Ensure Side Stream waits for Kernel 1 (DS) to finish
         side_stream.wait_stream(main_stream)
     
         # --- BRANCH 1: dQ (Side Stream) ---
@@ -1092,50 +1091,46 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         # --- BRANCH 2: dK/dV Per Level (Main Stream) ---
         
         # Step A: Launch Specialized Leaf Kernel (Level 0)
-        # Covers Nodes 0 to N-1
         grid_leaf = (N, B)
         hierarchical_attention_backward_dK_dV_leaf_kernel[grid_leaf](
-            DS, Q, Weights, grad_output, gather_table,
+            DS, Q, Weights, grad_output_4d, gather_table, # <--- Use 4D
             dK, dV,
-            *DS.stride(), *Q.stride(), *Weights.stride(), *grad_output.stride(), *dK.stride(),
+            *DS.stride(), *Q.stride(), *Weights.stride(), 
+            *grad_output_4d.stride(), # <--- Use 4D Strides
+            *dK.stride(),
             *gather_table.stride(),
             H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
             num_warps=4
         )
     
         # Step B: Launch Generic Internal Kernels (Levels 1 to N)
-        # These launches are asynchronous and will overlap if resources allow.
-        current_start_node = N  # Internal nodes start after leaves
+        current_start_node = N 
         
         for lvl in range(1, LEVELS):
-            # Calculate properties for this level
-            num_nodes_in_level = N >> lvl  # e.g., 16 -> 8 -> 4 -> 2
-            gather_width = 1 << lvl        # e.g., 1 -> 2 -> 4 -> 8
+            num_nodes_in_level = N >> lvl  
+            gather_width = 1 << lvl        
             
-            # Optimization: Use dynamic BLOCK_L to saturate threads for high levels
-            # while keeping low register pressure for mid levels.
             BLOCK_L_DYNAMIC = min(128, triton.next_power_of_2(gather_width))
             
             grid_internal = (num_nodes_in_level, B)
             
             hierarchical_attention_backward_dK_dV_internal_kernel[grid_internal](
-                DS, Q, Weights, grad_output, gather_table,
+                DS, Q, Weights, grad_output_4d, gather_table, # <--- Use 4D
                 dK, dV,
-                *DS.stride(), *Q.stride(), *Weights.stride(), *grad_output.stride(), *dK.stride(),
+                *DS.stride(), *Q.stride(), *Weights.stride(), 
+                *grad_output_4d.stride(), # <--- Use 4D Strides
+                *dK.stride(),
                 *gather_table.stride(),
                 H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, 
                 
-                # Dynamic Values
                 BLOCK_L=BLOCK_L_DYNAMIC,
                 START_NODE_ID=current_start_node,
                 
                 num_warps=4
             )
             
-            # Advance to next level's node block
             current_start_node += num_nodes_in_level
     
-        # --- REJOIN ---
         main_stream.wait_stream(side_stream)
         
         return dQ, dK, dV, None, None, None
