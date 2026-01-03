@@ -1224,7 +1224,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         for lvl in range(1, LEVELS):
             num_nodes_in_level = N >> lvl  
             
-            if lvl == 1 or lvl == 2 or lvl == 3 or lvl == 4 or lvl == 5 or lvl == 6 or lvl == 7 or lvl == 8 or lvl == 9:
+            if lvl == 1 or lvl == 2 or lvl == 3 or lvl == 4 or lvl == 5 or lvl == 6 or lvl == 7 or lvl == 8 or lvl == 9 or lvl == 10:
                 grid_lvl = (num_nodes_in_level, B)
     
                 hierarchical_attention_backward_dK_dV_kernel[grid_lvl](
@@ -2133,7 +2133,7 @@ def run_full_suite_update_X_from_Y():
     # 1. SETUP & CORRECTNESS CHECK
     # ==========================================================================
     # [CONFIG] Choose your dtype here: torch.float32 or torch.float16
-    check_dtype = torch.float32
+    check_dtype = torch.float16
     
     print(f"{'='*60}")
     print(f"1. CORRECTNESS CHECK ({check_dtype}) - update_X_from_Y")
