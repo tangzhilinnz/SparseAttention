@@ -463,8 +463,11 @@ def hierarchical_attention_forward_kernel(
 # ------------------------------------------------------------------
 #  Backward Kernel 1: Score Gradient (Computes dS)
 # ------------------------------------------------------------------
+import triton
+import triton.language as tl
+
 @triton.jit
-def hierarchical_attention_backward_dS_kernel(
+def hierarchical_attention_backward_dS_loop_kernel(
     DO_ptr, W_ptr, V_ptr, Lookup_ptr, DS_ptr, Mask_ptr,
     # Strides
     sdo_b, sdo_n, sdo_h, sdo_d,
@@ -478,6 +481,7 @@ def hierarchical_attention_backward_dS_kernel(
     D: tl.constexpr, 
     BLOCK_D: tl.constexpr,      # <--- Keep small (e.g. 32)
     LEVELS: tl.constexpr, 
+    BLOCK_LEVELS: tl.constexpr, # <--- Must be Power of 2 (e.g. 4, 8)
     HAS_MASK: tl.constexpr
 ):
     node_idx = tl.program_id(0)
@@ -533,73 +537,12 @@ def hierarchical_attention_backward_dS_kernel(
     # -----------------------------------------------------------
     # 3. Compute Sum(W * dP) across all levels
     # -----------------------------------------------------------
-    # We need "sum_wdp" to compute the Softmax Gradient later.
-    # sum_wdp = (w_self * dp_self) + sum(w_cross * dp_cross)
-    
     sum_wdp = (w_self * dp_self)
 
-    # We need to store dp_cross and w_cross values to compute ds_cross later.
-    # Since we can't store infinite history in registers, we will do TWO PASSES
-    # over levels if we want to save memory, OR we just compute sum_wdp first.
-    
-    # Actually, the most efficient way (Register-wise) is to:
-    # 1. Compute dP_self.
-    # 2. Iterate levels to compute dP_cross, store them temporarily in a buffer?
-    #    NO, that uses too much memory.
-    
-    # BETTER APPROACH:
-    # 1. Loop D to get dP_self.
-    # 2. Loop Levels -> Loop D to get dP_cross. Accumulate sum_wdp on the fly.
-    #    This requires recalculating dP_cross later or storing it.
-    
-    # Given the constraints, we will use a [BLOCK_H, LEVELS] tensor for dP_cross 
-    # IF LEVELS is small (e.g. < 8). If LEVELS is large, this will spill.
-    # Assuming LEVELS is moderate (~4-6), we can cache dP_cross in registers.
-    
-    # Buffer to hold dP for all levels: [BLOCK_H, LEVELS]
-    # We treat this as a list of vectors to avoid 2D tensor complexity if possible.
-    # But for simplicity, we'll iterate.
-    
-    # -----------------------------------------------------------
-    # PASS A: Compute dP_cross for all levels & Accumulate sum_wdp
-    # -----------------------------------------------------------
-    # We must store dP_cross values because dS calculation depends on the final sum_wdp.
-    # To avoid spilling, we assume LEVELS is small enough (e.g., 5).
-    # If LEVELS is large, we'd need to recompute or use shared memory.
-    
-    # Create a buffer in registers. 
-    # NOTE: Triton doesn't support dynamic lists easily. We usually vectorize levels here.
-    # IF YOU WANT TO LOOP, you have a dependency cycle: dS_i depends on Sum(W*dP).
-    
-    # Strategy: 
-    # Since dS calculation requires the Global Sum, we cannot fully stream the levels 
-    # independently without two passes or storage.
-    
-    # However, since you asked for a "LOOP" version to save registers *during the dot product*, 
-    # we can do the heavy lifting (dot product) in a loop, store the tiny result (scalar dP),
-    # and then do the final combine.
-    
-    # Let's verify: [BLOCK_H, LEVELS] floats is small (32 * 6 * 4 bytes = 768 bytes).
-    # This fits easily in registers! The problem was the [H, L, D] tensor (100x larger).
-    
-    # So we CAN store dP_cross[L] in registers.
-    
-    # -----------------------------------------------------------
-    
-    # Buffer for dP values (we will compute them one by one)
-    # Since Triton doesn't allow array indexing `dp[i] = val` easily inside a loop 
-    # without tensor ops, we might need a small scratchpad or just use a tensor.
-    # But wait, we are trying to avoid [H, L] vectorization logic overhead? 
-    # No, [H, L] is fine. [H, L, D] is bad.
-    
-    # Hybrid Approach:
-    # 1. Allocate dp_cross_all = zeros([H, LEVELS])
-    # 2. Loop Levels:
-    #      Compute dP_cross_lvl (Looping D) -> Result [H]
-    #      Store into dp_cross_all[:, lvl] (using masking/where)
-    
-    dp_cross_all = tl.zeros([BLOCK_H, LEVELS], dtype=tl.float32)
-    w_cross_all  = tl.zeros([BLOCK_H, LEVELS], dtype=tl.float32) # Need W for final calc
+    # Buffers to hold dP and W for all levels.
+    # [FIX]: Must use BLOCK_LEVELS (power of 2) for shape allocation
+    dp_cross_all = tl.zeros([BLOCK_H, BLOCK_LEVELS], dtype=tl.float32)
+    w_cross_all  = tl.zeros([BLOCK_H, BLOCK_LEVELS], dtype=tl.float32)
 
     for lvl_idx in range(LEVELS):
         # 1. Topology & Mask
@@ -612,7 +555,6 @@ def hierarchical_attention_backward_dS_kernel(
             is_valid = is_valid & (mask_val == 0)
 
         # 2. Load Weight [H]
-        # Offset W: level + 1
         w_idx = lvl_idx + 1
         mask_load = mask_h & is_valid
         
@@ -621,19 +563,10 @@ def hierarchical_attention_backward_dS_kernel(
             mask=mask_load, other=0.0
         )
         
-        # Store W for later
-        # We use a mask to insert this level's W into the [H, L] buffer
-        # (This is a bit tricky in Triton without tensor indexing, 
-        #  so we often use the 'offs_lvl' masking trick)
+        # [FIX]: Use BLOCK_LEVELS for the range to match tensor shape
+        mask_this_lvl = (tl.arange(0, BLOCK_LEVELS) == lvl_idx)
         
-        # Actually, for the "Loop" structure, computing dP one by one is easy, 
-        # but accumulating them into a tensor `dp_cross_all` requires
-        # generating a mask for the current level.
-        
-        # Current Level Mask: [LEVELS]
-        mask_this_lvl = (tl.arange(0, LEVELS) == lvl_idx)
-        
-        # Broadcast W to [H, L] and add to accumulator (only for this level)
+        # Store W into the specific column for this level
         w_cross_all += w_val[:, None] * mask_this_lvl[None, :].to(tl.float32)
 
         # 3. Compute dP (Dot Product) for this level
@@ -653,7 +586,6 @@ def hierarchical_attention_backward_dS_kernel(
             do_val = tl.load(do_base + (offs_d[None, :] * sdo_d), mask=mask_op, other=0.0)
 
             # Load V Cross
-            # Note: Mask V with 'mask_load' (valid edge) to avoid garbage
             mask_v = mask_load[:, None] & mask_d[None, :]
             v_val = tl.load(
                 v_batch_base + off_v_cross_base[:, None] + (offs_d[None, :] * sv_d),
@@ -677,23 +609,18 @@ def hierarchical_attention_backward_dS_kernel(
     tl.store(ds_base + (0 * sds_lvl), ds_self.to(DS_ptr.dtype.element_ty), mask=mask_h)
 
     # B. dS Cross (Loop to store)
-    # Now we iterate levels again to compute and write the final result.
-    # We read from our cached `dp_cross_all` and `w_cross_all`.
-    
     for lvl_idx in range(LEVELS):
-        # Extract cached values
-        mask_this_lvl = (tl.arange(0, LEVELS) == lvl_idx)
+        # [FIX]: Use BLOCK_LEVELS for indexing
+        mask_this_lvl = (tl.arange(0, BLOCK_LEVELS) == lvl_idx)
         
-        # Sum over the L dimension using the mask to pick 1 value
+        # Extract cached values (Sum over L axis to pick the single column)
         w_val = tl.sum(w_cross_all * mask_this_lvl[None, :], axis=1)
         dp_val = tl.sum(dp_cross_all * mask_this_lvl[None, :], axis=1)
         
         # Softmax Gradient Formula
-        # dS_i = w_i * (dP_i - Sum(w * dP))
         ds_val = w_val * (dp_val - sum_wdp) * sm_scale
         
         # Store
-        # Offset: level + 1
         ds_ptr_lvl = ds_base + ((lvl_idx + 1) * sds_lvl)
         tl.store(ds_ptr_lvl, ds_val.to(DS_ptr.dtype.element_ty), mask=mask_h)
 
@@ -1215,7 +1142,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             *DS.stride(),           
             
             sm_scale, H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, 
-            LEVELS=LEVELS, #BLOCK_LEVELS=BLOCK_LEVELS,
+            LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS,
             HAS_MASK=HAS_MASK,
             num_warps=4
         )
