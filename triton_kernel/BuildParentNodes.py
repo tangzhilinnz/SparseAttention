@@ -1119,7 +1119,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             num_nodes_in_level = N >> lvl  
             gather_width = 1 << lvl        
             
-            BLOCK_L_DYNAMIC = min(16, triton.next_power_of_2(gather_width))
+            BLOCK_L_DYNAMIC = min(64, triton.next_power_of_2(gather_width))
             
             grid_internal = (num_nodes_in_level, B)
             
