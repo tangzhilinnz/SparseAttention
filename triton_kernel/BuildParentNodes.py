@@ -849,7 +849,7 @@ def hierarchical_attention_backward_dK_dV_atomic_kernel(
         )
 
         # =========================================================
-        # SELF (level 0) — ATOMIC
+        # SELF (level 0) ATOMIC
         # =========================================================
         w_self = tl.load(w_base + 0 * sw_lvl, mask=mask_h, other=0.0)
         ds_self = tl.load(ds_base + 0 * sds_lvl, mask=mask_h, other=0.0)
