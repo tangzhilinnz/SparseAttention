@@ -691,77 +691,96 @@ def hierarchical_attention_backward_dK_dV_kernel(
     H: tl.constexpr, BLOCK_H: tl.constexpr,
     D: tl.constexpr, BLOCK_D: tl.constexpr,
     START_NODE_ID: tl.constexpr,
-    TARGET_LEVEL: tl.constexpr
+    TARGET_LEVEL: tl.constexpr,
+    SPLIT_K: tl.constexpr  # <--- NEW: Parallelism Factor (e.g., 1, 4, 8)
 ):
     pid = tl.program_id(0)
     b_idx = tl.program_id(1)
 
-    # 1. Constants derived from TARGET_LEVEL
+    # 1. Constants
     NUM_CHILDREN: tl.constexpr = 1 << TARGET_LEVEL
     W_IDX: tl.constexpr = TARGET_LEVEL + 1
-
-    # 2. Identify Parent
-    node_id = pid + START_NODE_ID
     
-    # Load starting child index
+    # 2. Identify Parent Node & Split ID
+    # Grid is now (NUM_NODES * SPLIT_K, B)
+    node_local_id = pid // SPLIT_K
+    split_id = pid % SPLIT_K
+    
+    node_id = node_local_id + START_NODE_ID
+    
+    # 3. Determine Child Range for this Split
+    # e.g., Children 0-1024 split by 4 -> [0-256], [256-512], ...
+    total_children = NUM_CHILDREN
+    children_per_split = total_children // SPLIT_K
+    
+    start_k = split_id * children_per_split
+    # Handle remainder if not perfectly divisible (though powers of 2 usually are)
+    if split_id == SPLIT_K - 1:
+        children_per_split = total_children - start_k
+        
+    # 4. Gather Logic
     tab_ptr = Gather_Table_ptr + (node_id * sg_node)
-    child_start = tl.load(tab_ptr + 0)
+    child_start_base = tl.load(tab_ptr + 0)
     
-    # Validity Check
-    has_children = (child_start != -1)
+    has_children = (child_start_base != -1)
 
     offs_h = tl.arange(0, BLOCK_H)
     mask_h = offs_h < H
 
-    # 3. Setup Loop over Dimension D
+    # 5. Loop over D
     off_out = (b_idx * sdk_b) + (node_id * sdk_node)
-
+    
+    # Pre-calc pointers invariant to D
+    # We only need base pointers here, offsets added in loop
+    
     for off_d_start in range(0, D, BLOCK_D):
         offs_d = off_d_start + tl.arange(0, BLOCK_D)
         mask_d = offs_d < D
         mask_op = mask_h[:, None] & mask_d[None, :]
 
-        # Accumulators [BLOCK_H, BLOCK_D]
         dk_acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
         dv_acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
 
         if has_children:
-            # Common Offsets for this chunk of D
             off_hq_d  = (offs_h[:, None] * sq_h)  + (offs_d[None, :] * sq_d)
             off_hdo_d = (offs_h[:, None] * sdo_h) + (offs_d[None, :] * sdo_d)
 
-            # --- INNER LOOP: Iterate over Children ---
-            # We load data for each child individually here.
-            # Since NUM_CHILDREN is a constexpr (e.g. 2 or 4), this unrolls completely.
-            for k in range(NUM_CHILDREN):
-                # Calculate Child ID
-                child_idx = child_start + k
+            # --- INNER LOOP: Iterate ONLY over this split's children ---
+            for k_offset in range(children_per_split):
+                # Actual child index relative to the start of the list
+                k = start_k + k_offset
+                
+                child_idx = child_start_base + k
                 
                 # --- A. Load Context (dS, W) ---
-                # Pointers for this specific child
                 off_ds_k = (b_idx * sds_b) + (child_idx * sds_n) + (W_IDX * sds_lvl)
                 off_w_k  = (b_idx * sw_b)  + (child_idx * sw_n)  + (W_IDX * sw_lvl)
 
-                # Load [BLOCK_H, 1]
                 ds_k = tl.load(DS_ptr + off_ds_k + (offs_h[:, None] * sds_h), mask=mask_h[:, None], other=0.0)
                 w_k  = tl.load(W_ptr  + off_w_k  + (offs_h[:, None] * sw_h),  mask=mask_h[:, None], other=0.0)
 
                 # --- B. Load Q and dO ---
-                # Pointers for this specific child
                 off_q_k  = (b_idx * sq_b)  + (child_idx * sq_n)
                 off_do_k = (b_idx * sdo_b) + (child_idx * sdo_n)
                 
-                # Load [BLOCK_H, BLOCK_D]
                 q_val  = tl.load(Q_ptr  + off_q_k  + off_hq_d,  mask=mask_op, other=0.0)
                 do_val = tl.load(DO_ptr + off_do_k + off_hdo_d, mask=mask_op, other=0.0)
 
-                # --- C. Accumulate ---
                 dk_acc += ds_k * q_val
                 dv_acc += w_k  * do_val
 
-        # 4. Store Result
-        tl.store(DK_ptr + off_out + (offs_h[:, None] * sdk_h) + (offs_d[None, :] * sdk_d), dk_acc, mask=mask_op)
-        tl.store(DV_ptr + off_out + (offs_h[:, None] * sdk_h) + (offs_d[None, :] * sdk_d), dv_acc, mask=mask_op)
+        # 6. Store Result
+        # CRITICAL: If SPLIT_K > 1, multiple blocks write to the same node -> Atomic Add
+        # If SPLIT_K == 1, we are the only owner -> Store (Faster)
+        ptr_dk = DK_ptr + off_out + (offs_h[:, None] * sdk_h) + (offs_d[None, :] * sdk_d)
+        ptr_dv = DV_ptr + off_out + (offs_h[:, None] * sdk_h) + (offs_d[None, :] * sdk_d)
+
+        if SPLIT_K > 1:
+            tl.atomic_add(ptr_dk, dk_acc, mask=mask_op)
+            tl.atomic_add(ptr_dv, dv_acc, mask=mask_op)
+        else:
+            tl.store(ptr_dk, dk_acc, mask=mask_op)
+            tl.store(ptr_dv, dv_acc, mask=mask_op)
 
 
 # ==================================================================
@@ -1224,45 +1243,32 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         for lvl in range(1, LEVELS):
             num_nodes_in_level = N >> lvl  
             
-            if lvl == 1 or lvl == 2 or lvl == 3 or lvl == 4 or lvl == 5 or lvl == 6 or lvl == 7 or lvl == 8 or lvl == 9:
-                grid_lvl = (num_nodes_in_level, B)
-    
-                hierarchical_attention_backward_dK_dV_kernel[grid_lvl](
-                    DS, Q, Weights, grad_output_4d, gather_table,
-                    dK, dV,
-                    *DS.stride(), *Q.stride(), *Weights.stride(),
-                    *grad_output_4d.stride(),
-                    *dK.stride(),
-                    *gather_table.stride(),
-                    H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
-        
-                    START_NODE_ID=current_start_node,
-                    TARGET_LEVEL=lvl, # <--- Pass 1 or 2 here
-        
-                    num_warps=4
-                )
-            
-            # --- GENERIC CASE: Level 3+ (Standard Internal Kernel) ---
+            if lvl < 7:
+                current_split_k = 1
+            elif lvl < 10:
+                current_split_k = 4
             else:
-                gather_width = 1 << lvl        
-                BLOCK_L_DYNAMIC = min(64, triton.next_power_of_2(gather_width))
-                
-                grid_internal = (num_nodes_in_level, B)
-                
-                hierarchical_attention_backward_dK_dV_internal_kernel[grid_internal](
-                    DS, Q, Weights, grad_output_4d, gather_table, 
-                    dK, dV,
-                    *DS.stride(), *Q.stride(), *Weights.stride(), 
-                    *grad_output_4d.stride(),
-                    *dK.stride(),
-                    *gather_table.stride(),
-                    H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, 
-                    
-                    BLOCK_L=BLOCK_L_DYNAMIC,
-                    START_NODE_ID=current_start_node,
-                    
-                    num_warps=4
-                )
+                current_split_k = 16
+
+            # Calculate Grid
+            # Multiply node count by split factor to launch more blocks
+            grid_lvl = (num_nodes_in_level * current_split_k, B)
+        
+            hierarchical_attention_backward_dK_dV_gather_unified_split_kernel[grid_lvl](
+                DS, Q, Weights, grad_output_4d, gather_table,
+                dK, dV,
+                *DS.stride(), *Q.stride(), *Weights.stride(),
+                *grad_output_4d.stride(),
+                *dK.stride(),
+                *gather_table.stride(),
+                H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
+            
+                START_NODE_ID=current_start_node,
+                TARGET_LEVEL=lvl,
+                SPLIT_K=current_split_k, # <--- Pass the split factor
+            
+                num_warps=4
+            )
             
             # Update offset for the next level
             current_start_node += num_nodes_in_level
