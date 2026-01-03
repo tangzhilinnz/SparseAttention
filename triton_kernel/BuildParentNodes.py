@@ -1175,100 +1175,100 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
     #     return dQ, dK, dV, None, None, None
 
     @staticmethod
-def backward(ctx, grad_output):
-    # 1. Retrieve Tensors
-    Q, K, V, idx_table, Weights, mask_table = ctx.saved_tensors
-    sm_scale, H, BLOCK_H, D, BLOCK_D, LEVELS, BLOCK_LEVELS = ctx.constants
+    def backward(ctx, grad_output):
+        # 1. Retrieve Tensors
+        Q, K, V, idx_table, Weights, mask_table = ctx.saved_tensors
+        sm_scale, H, BLOCK_H, D, BLOCK_D, LEVELS, BLOCK_LEVELS = ctx.constants
     
-    # [CRITICAL FIX] View as 4D to generate 4 stride values
-    # grad_output comes in as [B, N, D], but kernels need [B, N, H, D] strides
-    grad_output = grad_output.contiguous()
-    B, N = Q.shape[0], Q.shape[1]
-    grad_output_4d = grad_output.view(B, N, H, D) 
+        # [CRITICAL FIX] View as 4D to generate 4 stride values
+        # grad_output comes in as [B, N, D], but kernels need [B, N, H, D] strides
+        grad_output = grad_output.contiguous()
+        B, N = Q.shape[0], Q.shape[1]
+        grad_output_4d = grad_output.view(B, N, H, D) 
 
-    # 2. Compute dS (Runs on Main Stream)
-    DS = torch.empty_like(Weights)
-    grid_ds = (N, B)
+        # 2. Compute dS (Runs on Main Stream)
+        DS = torch.empty_like(Weights)
+        grid_ds = (N, B)
     
-    HAS_MASK = (mask_table is not None)
-    mask_ptr_safe = mask_table if HAS_MASK else Weights
+        HAS_MASK = (mask_table is not None)
+        mask_ptr_safe = mask_table if HAS_MASK else Weights
 
-    # (Assumes dS kernel exists in scope)
-    hierarchical_attention_backward_dS_kernel[grid_ds](
-        # Pass the 4D view
-        grad_output_4d, Weights, V, idx_table, DS, mask_ptr_safe,
+        # (Assumes dS kernel exists in scope)
+        hierarchical_attention_backward_dS_kernel[grid_ds](
+            # Pass the 4D view
+            grad_output_4d, Weights, V, idx_table, DS, mask_ptr_safe,
         
-        # Pass the 4D strides
-        *grad_output_4d.stride(), 
-        *Weights.stride(),            
-        *V.stride(),            
-        *idx_table.stride(),    
-        *DS.stride(),            
+            # Pass the 4D strides
+            *grad_output_4d.stride(), 
+            *Weights.stride(),            
+            *V.stride(),            
+            *idx_table.stride(),    
+            *DS.stride(),            
         
-        sm_scale, H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, 
-        LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS,
-        HAS_MASK=HAS_MASK,
-        num_warps=4
-    )
-
-    # --- SETUP PARALLELISM ---
-    # Initialize dK/dV to Zeros for Atomic Accumulation
-    dK = torch.zeros_like(K)
-    dV = torch.zeros_like(V)
-    dQ = torch.empty_like(Q)
-
-    main_stream = torch.cuda.current_stream()
-    side_stream = torch.cuda.Stream()
-    
-    side_stream.wait_stream(main_stream)
-
-    # --- BRANCH 1: dQ (Side Stream) ---
-    with torch.cuda.stream(side_stream):
-        grid_dq = (N, B)
-        # (Assumes dQ kernel exists in scope)
-        hierarchical_attention_backward_dQ_kernel[grid_dq](
-            DS, K, idx_table, dQ, mask_ptr_safe, 
-            *DS.stride(), *K.stride(), *idx_table.stride(), *dQ.stride(),
-            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS,
+            sm_scale, H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, 
+            LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS,
             HAS_MASK=HAS_MASK,
             num_warps=4
         )
 
-    # --- BRANCH 2: dK/dV (Main Stream - Vectorized Atomic) ---
-    # Replaced the scalar loop kernel with the vectorized kernel.
-    grid_atomic = (N, B)
+        # --- SETUP PARALLELISM ---
+        # Initialize dK/dV to Zeros for Atomic Accumulation
+        dK = torch.zeros_like(K)
+        dV = torch.zeros_like(V)
+        dQ = torch.empty_like(Q)
+
+        main_stream = torch.cuda.current_stream()
+        side_stream = torch.cuda.Stream()
     
-    # Use the VECTORIZED Kernel
-    hierarchical_attention_backward_dK_dV_atomic_kernel[grid_atomic](
-        # Inputs
-        DS,              # DS_ptr
-        grad_output_4d,  # DO_ptr
-        Q,               # Q_ptr
-        Weights,         # W_ptr
-        idx_table,       # Lookup_ptr
-        mask_ptr_safe,   # Mask_ptr
+        side_stream.wait_stream(main_stream)
+
+        # --- BRANCH 1: dQ (Side Stream) ---
+        with torch.cuda.stream(side_stream):
+            grid_dq = (N, B)
+            # (Assumes dQ kernel exists in scope)
+            hierarchical_attention_backward_dQ_kernel[grid_dq](
+                DS, K, idx_table, dQ, mask_ptr_safe, 
+                *DS.stride(), *K.stride(), *idx_table.stride(), *dQ.stride(),
+                H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS,
+                HAS_MASK=HAS_MASK,
+                num_warps=4
+            )
+
+        # --- BRANCH 2: dK/dV (Main Stream - Vectorized Atomic) ---
+        # Replaced the scalar loop kernel with the vectorized kernel.
+        grid_atomic = (N, B)
+    
+        # Use the VECTORIZED Kernel
+        hierarchical_attention_backward_dK_dV_atomic_kernel[grid_atomic](
+            # Inputs
+            DS,              # DS_ptr
+            grad_output_4d,  # DO_ptr
+            Q,               # Q_ptr
+            Weights,         # W_ptr
+            idx_table,       # Lookup_ptr
+            mask_ptr_safe,   # Mask_ptr
         
-        # Outputs (Accumulators)
-        dK,              # DK_ptr
-        dV,              # DV_ptr
+            # Outputs (Accumulators)
+            dK,              # DK_ptr
+            dV,              # DV_ptr
         
-        # Strides
-        *DS.stride(),             # sds_b, sds_n, sds_h, sds_lvl
-        *grad_output_4d.stride(), # sdo_b, sdo_n, sdo_h, sdo_d
-        *Q.stride(),              # sq_b, sq_n, sq_h, sq_d
-        *Weights.stride(),        # sw_b, sw_n, sw_h, sw_lvl
-        *idx_table.stride(),      # sl_n, sl_lvl (Assumes [N, LEVELS])
-        *dK.stride(),             # sdk_b, sdk_n, sdk_h, sdk_d
+            # Strides
+            *DS.stride(),             # sds_b, sds_n, sds_h, sds_lvl
+            *grad_output_4d.stride(), # sdo_b, sdo_n, sdo_h, sdo_d
+            *Q.stride(),              # sq_b, sq_n, sq_h, sq_d
+            *Weights.stride(),        # sw_b, sw_n, sw_h, sw_lvl
+            *idx_table.stride(),      # sl_n, sl_lvl (Assumes [N, LEVELS])
+            *dK.stride(),             # sdk_b, sdk_n, sdk_h, sdk_d
         
-        # Constants
-        H=H, BLOCK_H=BLOCK_H,
-        D=D, BLOCK_D=BLOCK_D,
-        LEVELS=LEVELS, 
-        BLOCK_LEVELS=BLOCK_LEVELS, # <--- Added this required argument
-        HAS_MASK=HAS_MASK,
+            # Constants
+            H=H, BLOCK_H=BLOCK_H,
+            D=D, BLOCK_D=BLOCK_D,
+            LEVELS=LEVELS, 
+            BLOCK_LEVELS=BLOCK_LEVELS, # <--- Added this required argument
+            HAS_MASK=HAS_MASK,
         
-        num_warps=4
-    )
+            num_warps=4
+        )
 
     # Synchronize streams
     main_stream.wait_stream(side_stream)
