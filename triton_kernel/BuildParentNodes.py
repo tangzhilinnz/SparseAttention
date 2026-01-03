@@ -2025,7 +2025,7 @@ def run_full_suite_update_X_from_Y():
     # 1. SETUP & CORRECTNESS CHECK
     # ==========================================================================
     # [CONFIG] Choose your dtype here: torch.float32 or torch.float16
-    check_dtype = torch.float32
+    check_dtype = torch.float16
     
     print(f"{'='*60}")
     print(f"1. CORRECTNESS CHECK ({check_dtype}) - update_X_from_Y")
@@ -2112,7 +2112,7 @@ def run_full_suite_update_X_from_Y():
     print(f"{'='*60}")
 
     # Config: Large scale to saturate GPU
-    B, N, D, H = 32, 2048, 32, 32 
+    B, N, D, H = 32, 2048, 64, 8 
     dim = D * H
 
     print(f"Config: B={B}, N={N}, D={dim} (HeadDim={D}), H={H}, dtype={check_dtype}")
