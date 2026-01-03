@@ -676,6 +676,117 @@ def hierarchical_attention_backward_dK_dV_leaf_kernel(
         tl.store(DV_ptr + off_out + (offs_h[:, None] * sdk_h) + (offs_d[None, :] * sdk_d), dv_acc, mask=mask_op)
 
 
+@triton.jit
+def hierarchical_attention_backward_dK_dV_level1_kernel(
+    DS_ptr, Q_ptr, W_ptr, DO_ptr, Gather_Table_ptr,
+    DK_ptr, DV_ptr,
+    # Strides
+    sds_b, sds_n, sds_h, sds_lvl,
+    sq_b, sq_n, sq_h, sq_d,
+    sw_b, sw_n, sw_h, sw_lvl,
+    sdo_b, sdo_n, sdo_h, sdo_d,
+    sdk_b, sdk_node, sdk_h, sdk_d,
+    sg_node, sg_dim,
+    # Constants
+    H: tl.constexpr, BLOCK_H: tl.constexpr,
+    D: tl.constexpr, BLOCK_D: tl.constexpr,
+    START_NODE_ID: tl.constexpr
+):
+    pid = tl.program_id(0)
+    b_idx = tl.program_id(1)
+    
+    # 1. Identify Parent Node
+    # (Adjust pid by START_NODE_ID to get the actual parent index in the global list)
+    node_id = pid + START_NODE_ID
+
+    offs_h = tl.arange(0, BLOCK_H)
+    mask_h = offs_h < H
+
+    # -----------------------------------------------------------
+    # 2. Identify Children (Gather Strategy)
+    # -----------------------------------------------------------
+    # Load the starting child index from the table
+    tab_ptr = Gather_Table_ptr + (node_id * sg_node)
+    child_0 = tl.load(tab_ptr + 0)
+    
+    # As requested: Child 1 is sequentially next to Child 0
+    child_1 = child_0 + 1
+
+    # Logic to check if we should compute attending
+    # (If child_0 is -1, this parent has no children)
+    has_children = (child_0 != -1)
+
+    # -----------------------------------------------------------
+    # 3. Pre-Load Context (dS, W) for Level 1
+    # -----------------------------------------------------------
+    # We use w_idx = 2 as requested for Level 1 connections
+    w_idx = 2 
+
+    # --- Child 0 Context ---
+    ds_c0 = tl.zeros([BLOCK_H, 1], dtype=tl.float32)
+    w_c0 = tl.zeros([BLOCK_H, 1], dtype=tl.float32)
+    
+    if has_children:
+        off_ds_0 = (b_idx * sds_b) + (child_0 * sds_n) + (w_idx * sds_lvl)
+        off_w_0  = (b_idx * sw_b)  + (child_0 * sw_n)  + (w_idx * sw_lvl)
+        
+        ds_c0 = tl.load(DS_ptr + off_ds_0 + (offs_h[:, None] * sds_h), mask=mask_h[:, None], other=0.0)
+        w_c0  = tl.load(W_ptr  + off_w_0  + (offs_h[:, None] * sw_h),  mask=mask_h[:, None], other=0.0)
+
+    # --- Child 1 Context ---
+    ds_c1 = tl.zeros([BLOCK_H, 1], dtype=tl.float32)
+    w_c1 = tl.zeros([BLOCK_H, 1], dtype=tl.float32)
+    
+    if has_children:
+        off_ds_1 = (b_idx * sds_b) + (child_1 * sds_n) + (w_idx * sds_lvl)
+        off_w_1  = (b_idx * sw_b)  + (child_1 * sw_n)  + (w_idx * sw_lvl)
+        
+        ds_c1 = tl.load(DS_ptr + off_ds_1 + (offs_h[:, None] * sds_h), mask=mask_h[:, None], other=0.0)
+        w_c1  = tl.load(W_ptr  + off_w_1  + (offs_h[:, None] * sw_h),  mask=mask_h[:, None], other=0.0)
+
+    # -----------------------------------------------------------
+    # 4. Loop over Dimension D (Accumulate Gradients)
+    # -----------------------------------------------------------
+    off_q_0  = (b_idx * sq_b)  + (child_0 * sq_n)
+    off_do_0 = (b_idx * sdo_b) + (child_0 * sdo_n)
+    
+    off_q_1  = (b_idx * sq_b)  + (child_1 * sq_n)
+    off_do_1 = (b_idx * sdo_b) + (child_1 * sdo_n)
+
+    off_out = (b_idx * sdk_b) + (node_id * sdk_node)
+
+    for off_d_start in range(0, D, BLOCK_D):
+        offs_d = off_d_start + tl.arange(0, BLOCK_D)
+        mask_d = offs_d < D
+        mask_op = mask_h[:, None] & mask_d[None, :]
+
+        # Initialize Accumulators
+        dk_acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
+        dv_acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
+
+        if has_children:
+            # --- Process Child 0 ---
+            q_0  = tl.load(Q_ptr  + off_q_0  + (offs_h[:, None]*sq_h)  + (offs_d[None, :]*sq_d),  mask=mask_op, other=0.0)
+            do_0 = tl.load(DO_ptr + off_do_0 + (offs_h[:, None]*sdo_h) + (offs_d[None, :]*sdo_d), mask=mask_op, other=0.0)
+            
+            dk_acc += ds_c0 * q_0
+            dv_acc += w_c0 * do_0
+
+            # --- Process Child 1 ---
+            q_1  = tl.load(Q_ptr  + off_q_1  + (offs_h[:, None]*sq_h)  + (offs_d[None, :]*sq_d),  mask=mask_op, other=0.0)
+            do_1 = tl.load(DO_ptr + off_do_1 + (offs_h[:, None]*sdo_h) + (offs_d[None, :]*sdo_d), mask=mask_op, other=0.0)
+            
+            dk_acc += ds_c1 * q_1
+            dv_acc += w_c1 * do_1
+
+        # --- Store Result ---
+        # Note: We use 'tl.store' (overwrite) because Level 1 parents are processed 
+        # by a unique thread block in this gather kernel. No atomic needed.
+        tl.store(DK_ptr + off_out + (offs_h[:, None] * sdk_h) + (offs_d[None, :] * sdk_d), dk_acc, mask=mask_op)
+        tl.store(DV_ptr + off_out + (offs_h[:, None] * sdk_h) + (offs_d[None, :] * sdk_d), dv_acc, mask=mask_op)
+
+
+
 # ==================================================================
 #  BACKWARD KERNEL 2b: GENERIC INTERNAL KERNEL (Levels 1+)
 # ==================================================================
@@ -1143,34 +1254,52 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         # Step B: Launch Generic Internal Kernels (Levels 1 to N)
         current_start_node = N 
         
+        # Step B: Loop Over Internal Levels
         for lvl in range(1, LEVELS):
             num_nodes_in_level = N >> lvl  
-            gather_width = 1 << lvl        
             
-            BLOCK_L_DYNAMIC = min(64, triton.next_power_of_2(gather_width))
+            # --- SPECIAL CASE: Level 1 (2 Children, Gather Optimized) ---
+            if lvl == 1:
+                grid_lvl1 = (num_nodes_in_level, B)
+                hierarchical_attention_backward_dK_dV_level1_kernel[grid_lvl1](
+                    DS, Q, Weights, grad_output_4d, gather_table,
+                    dK, dV,
+                    *DS.stride(), *Q.stride(), *Weights.stride(),
+                    *grad_output_4d.stride(),
+                    *dK.stride(),
+                    *gather_table.stride(),
+                    H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
+                    START_NODE_ID=current_start_node, # Offset for this level
+                    num_warps=4
+                )
             
-            grid_internal = (num_nodes_in_level, B)
-            
-            hierarchical_attention_backward_dK_dV_internal_kernel[grid_internal](
-                DS, Q, Weights, grad_output_4d, gather_table, # <--- Use 4D
-                dK, dV,
-                *DS.stride(), *Q.stride(), *Weights.stride(), 
-                *grad_output_4d.stride(), # <--- Use 4D Strides
-                *dK.stride(),
-                *gather_table.stride(),
-                H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, 
+            # --- GENERIC CASE: Level 2+ (Standard Internal Kernel) ---
+            else:
+                gather_width = 1 << lvl        
+                BLOCK_L_DYNAMIC = min(64, triton.next_power_of_2(gather_width))
                 
-                BLOCK_L=BLOCK_L_DYNAMIC,
-                START_NODE_ID=current_start_node,
+                grid_internal = (num_nodes_in_level, B)
                 
-                num_warps=4
-            )
+                # Assumes you have a generic internal kernel for lvl >= 2
+                hierarchical_attention_backward_dK_dV_internal_kernel[grid_internal](
+                    DS, Q, Weights, grad_output_4d, gather_table, 
+                    dK, dV,
+                    *DS.stride(), *Q.stride(), *Weights.stride(), 
+                    *grad_output_4d.stride(),
+                    *dK.stride(),
+                    *gather_table.stride(),
+                    H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, 
+                    
+                    BLOCK_L=BLOCK_L_DYNAMIC,
+                    START_NODE_ID=current_start_node,
+                    
+                    num_warps=4
+                )
             
+            # Update offset for the next level
             current_start_node += num_nodes_in_level
     
-        #main_stream.wait_stream(side_stream)
-        
-        return dQ, dK, dV, None, None, None
+        return dQ, dK, dV, None, None, None, None
 
     #@staticmethod
     #def backward(ctx, grad_output):
@@ -2056,7 +2185,7 @@ def run_full_suite_update_X_from_Y():
     y = torch.randn(B, N - 1, dim, device='cuda', dtype=check_dtype)
     
     # Optional mask (can be None, but good to test with None first for basic sanity)
-    mask = True 
+    mask = None 
 
     print(f"Input Shapes -> X: {x.shape}, Y: {y.shape}, Dtype: {x.dtype}")
 
