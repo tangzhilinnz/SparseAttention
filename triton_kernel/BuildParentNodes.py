@@ -676,8 +676,11 @@ def hierarchical_attention_backward_dK_dV_leaf_kernel(
         tl.store(DV_ptr + off_out + (offs_h[:, None] * sdk_h) + (offs_d[None, :] * sdk_d), dv_acc, mask=mask_op)
 
 
+# ==================================================================
+#  BACKWARD KERNEL 2b: GENERIC INTERNAL KERNEL (Levels 1+)
+# ==================================================================
 @triton.jit
-def hierarchical_attention_backward_dK_dV_kernel(
+def hierarchical_attention_backward_dK_dV_internal_kernel(
     DS_ptr, Q_ptr, W_ptr, DO_ptr, Gather_Table_ptr,
     DK_ptr, DV_ptr,
     # Strides
@@ -781,242 +784,6 @@ def hierarchical_attention_backward_dK_dV_kernel(
         else:
             tl.store(ptr_dk, dk_acc, mask=mask_op)
             tl.store(ptr_dv, dv_acc, mask=mask_op)
-
-
-# ==================================================================
-#  BACKWARD KERNEL 2b: GENERIC INTERNAL KERNEL (Levels 1+)
-# ==================================================================
-@triton.jit
-def hierarchical_attention_backward_dK_dV_internal_kernel(
-    DS_ptr, Q_ptr, W_ptr, DO_ptr, Gather_Table_ptr,
-    DK_ptr, DV_ptr,
-    sds_b, sds_n, sds_h, sds_lvl,
-    sq_b, sq_n, sq_h, sq_d,
-    sw_b, sw_n, sw_h, sw_lvl,
-    sdo_b, sdo_n, sdo_h, sdo_d,
-    sdk_b, sdk_node, sdk_h, sdk_d,
-    sg_node, sg_dim,
-    H: tl.constexpr, BLOCK_H: tl.constexpr,
-    D: tl.constexpr, BLOCK_D: tl.constexpr,
-    BLOCK_L: tl.constexpr, 
-    START_NODE_ID: tl.constexpr
-):
-    pid = tl.program_id(0)
-    b_idx = tl.program_id(1)
-    
-    node_id = START_NODE_ID + pid
-    offs_h = tl.arange(0, BLOCK_H)
-    mask_h = offs_h < H
-
-    tab_ptr = Gather_Table_ptr + (node_id * sg_node)
-    leaf_start = tl.load(tab_ptr + 0)
-    
-    # -----------------------------------------------------------
-    # Early Exit: If leaf_start == -1, write zeros and exit
-    # -----------------------------------------------------------
-    if leaf_start == -1:
-        for off_d_start in range(0, D, BLOCK_D):
-            offs_d = off_d_start + tl.arange(0, BLOCK_D)
-            mask_d = offs_d < D
-            mask_op = mask_h[:, None] & mask_d[None, :]
-            off_out = (b_idx * sdk_b) + (node_id * sdk_node)
-            # Safe to write 0.0 in whatever dtype
-            zero_acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
-            tl.store(DK_ptr + off_out + (offs_h[:, None] * sdk_h) + (offs_d[None, :] * sdk_d), zero_acc, mask=mask_op)
-            tl.store(DV_ptr + off_out + (offs_h[:, None] * sdk_h) + (offs_d[None, :] * sdk_d), zero_acc, mask=mask_op)
-        return
-
-    # Valid Node Logic
-    leaf_end = tl.load(tab_ptr + 1)
-    level_idx = tl.load(tab_ptr + 2)
-    w_idx = level_idx + 1
-
-    # -----------------------------------------------------------
-    # Loop over Dimension D (Outer Loop)
-    # -----------------------------------------------------------
-    for off_d_start in range(0, D, BLOCK_D):
-        offs_d = off_d_start + tl.arange(0, BLOCK_D)
-        mask_d = offs_d < D
-        mask_op = mask_h[:, None] & mask_d[None, :]
-        
-        # [CRITICAL FIX 1] Initialize Accumulators as FP32
-        # Even if inputs are FP16, we accumulate in FP32
-        dk_acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
-        dv_acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
-
-        # -----------------------------------------------------------
-        # Loop over Neighbors (Inner Loop)
-        # -----------------------------------------------------------
-        for start_idx in range(leaf_start, leaf_end, BLOCK_L):
-            offs_l = start_idx + tl.arange(0, BLOCK_L)
-            mask_l = offs_l < leaf_end
-            
-            # --- Load DS ---
-            off_ds_base = (b_idx * sds_b) + (offs_l[:, None] * sds_n) + (w_idx * sds_lvl)
-            ds_val = tl.load(DS_ptr + off_ds_base + (offs_h[None, :] * sds_h), 
-                           mask=mask_l[:, None] & mask_h[None, :], other=0.0)
-
-            # --- Load Q ---
-            off_q_base = (b_idx * sq_b) + (offs_l[:, None, None] * sq_n)
-            q_val = tl.load(Q_ptr + off_q_base + (offs_h[None, :, None] * sq_h) + (offs_d[None, None, :] * sq_d), 
-                          mask=mask_l[:, None, None] & mask_op[None, :, :], other=0.0)
-            
-            dk_acc += tl.sum(ds_val[:, :, None] * q_val, axis=0)
-
-            # --- Load W ---
-            off_w_base = (b_idx * sw_b) + (offs_l[:, None] * sw_n) + (w_idx * sw_lvl)
-            w_val = tl.load(W_ptr + off_w_base + (offs_h[None, :] * sw_h), 
-                          mask=mask_l[:, None] & mask_h[None, :], other=0.0)
-
-            # --- Load dO ---
-            off_do_base = (b_idx * sdo_b) + (offs_l[:, None, None] * sdo_n)
-            do_val = tl.load(DO_ptr + off_do_base + (offs_h[None, :, None] * sdo_h) + (offs_d[None, None, :] * sdo_d), 
-                           mask=mask_l[:, None, None] & mask_op[None, :, :], other=0.0)
-             
-            dv_acc += tl.sum(w_val[:, :, None] * do_val, axis=0)
-
-        # -----------------------------------------------------------
-        # Store Chunk
-        # -----------------------------------------------------------
-        # tl.store will automatically cast our FP32 accumulators back to 
-        # the pointer's dtype (FP16) if needed.
-        off_out = (b_idx * sdk_b) + (node_id * sdk_node)
-        tl.store(DK_ptr + off_out + (offs_h[:, None] * sdk_h) + (offs_d[None, :] * sdk_d), dk_acc, mask=mask_op)
-        tl.store(DV_ptr + off_out + (offs_h[:, None] * sdk_h) + (offs_d[None, :] * sdk_d), dv_acc, mask=mask_op)
-
-
-# ------------------------------------------------------------------
-#  Fused Backward Kernel (Atomic Add)
-# ------------------------------------------------------------------
-@triton.jit
-def hierarchical_attention_backward_dK_dV_atomic_kernel(
-    # Gradients (Inputs)
-    DS_ptr, DO_ptr,
-    # Forward Context (Inputs)
-    Q_ptr, W_ptr, Lookup_ptr, Mask_ptr,
-    # Gradients (Outputs)
-    DK_ptr, DV_ptr,
-
-    # Strides
-    sds_b, sds_n, sds_h, sds_lvl,
-    sdo_b, sdo_n, sdo_h, sdo_d,
-    sq_b, sq_n, sq_h, sq_d,
-    sw_b, sw_n, sw_h, sw_lvl,
-    sl_n, sl_lvl,
-    sdk_b, sdk_n, sdk_h, sdk_d,
-
-    # Constants
-    H: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-    D: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    LEVELS: tl.constexpr,
-    HAS_MASK: tl.constexpr,
-):
-    # ------------------------------------------------------------
-    # Grid & Indices
-    # ------------------------------------------------------------
-    node_idx = tl.program_id(0)
-    b_idx = tl.program_id(1)
-
-    h_idx = tl.arange(0, BLOCK_H)
-    mask_h = h_idx < H
-
-    # ------------------------------------------------------------
-    # Base pointers (Node Specific)
-    # ------------------------------------------------------------
-    # Pre-calculate base offsets to avoid re-doing math in the loop
-    q_base = Q_ptr + b_idx * sq_b + node_idx * sq_n
-    do_base = DO_ptr + b_idx * sdo_b + node_idx * sdo_n
-    
-    # We will offset these by level/head inside the loops
-    w_node_base = W_ptr + b_idx * sw_b + node_idx * sw_n
-    ds_node_base = DS_ptr + b_idx * sds_b + node_idx * sds_n
-    
-    # Pre-calculate Lookup Pointers
-    lookup_base = Lookup_ptr + node_idx * sl_n
-    mask_ptr_base = Mask_ptr + node_idx * sl_n
-
-    # ------------------------------------------------------------
-    # Loop over D (Split Feature Dim to save registers)
-    # ------------------------------------------------------------
-    for off_d_start in range(0, D, BLOCK_D):
-        offs_d = off_d_start + tl.arange(0, BLOCK_D)
-        mask_d = offs_d < D
-        mask_op = mask_h[:, None] & mask_d[None, :]
-
-        # 1. Load Q and dO (reused across all levels)
-        q_val = tl.load(
-            q_base + h_idx[:, None] * sq_h + offs_d[None, :] * sq_d,
-            mask=mask_op, other=0.0
-        )
-        do_val = tl.load(
-            do_base + h_idx[:, None] * sdo_h + offs_d[None, :] * sdo_d,
-            mask=mask_op, other=0.0
-        )
-
-        # ---------------------------------------------------------
-        # 2. SELF (Level 0) - Atomic
-        # ---------------------------------------------------------
-        w_self = tl.load(w_node_base + (0 * sw_lvl) + (h_idx * sw_h), mask=mask_h, other=0.0)
-        ds_self = tl.load(ds_node_base + (0 * sds_lvl) + (h_idx * sds_h), mask=mask_h, other=0.0)
-        
-        # Compute & Write immediately to free registers
-        dk_self = ds_self[:, None] * q_val
-        dv_self = w_self[:, None] * do_val
-        
-        off_out_self = b_idx * sdk_b + node_idx * sdk_n
-        off_hd = h_idx[:, None] * sdk_h + offs_d[None, :] * sdk_d
-        
-        tl.atomic_add(DK_ptr + off_out_self + off_hd, dk_self, mask=mask_op)
-        tl.atomic_add(DV_ptr + off_out_self + off_hd, dv_self, mask=mask_op)
-
-        # ---------------------------------------------------------
-        # 3. PARENTS (Loop) - Minimizes Register Pressure
-        # ---------------------------------------------------------
-        # We process one level at a time.
-        for lvl_idx in range(LEVELS):
-            # A. Load Topology
-            # Note: No 'mask=' needed for lookup, bounds are safe
-            p_idx = tl.load(lookup_base + lvl_idx * sl_lvl)
-
-            # B. Check Validity
-            is_valid_edge = p_idx != -1
-            if HAS_MASK:
-                mask_val = tl.load(mask_ptr_base + lvl_idx * sl_lvl).to(tl.int8)
-                is_valid_edge = is_valid_edge & (mask_val == 0)
-
-            # C. Early Exit Logic (Masking)
-            # We construct a mask for loads. If edge is invalid, we load 0s.
-            mask_load_cross = mask_h & is_valid_edge
-            
-            # Safe Parent Index
-            safe_p_idx = tl.where(is_valid_edge, p_idx, 0)
-
-            # D. Load Weights/DS (Level + 1)
-            w_idx = lvl_idx + 1
-            w_cross = tl.load(
-                w_node_base + (w_idx * sw_lvl) + (h_idx * sw_h), 
-                mask=mask_load_cross, other=0.0
-            )
-            ds_cross = tl.load(
-                ds_node_base + (w_idx * sds_lvl) + (h_idx * sds_h), 
-                mask=mask_load_cross, other=0.0
-            )
-
-            # E. Compute Gradient contribution
-            # Registers used: [BLOCK_H, BLOCK_D]. 
-            # This overwrites the previous level's data, keeping usage low.
-            dk_contrib = ds_cross[:, None] * q_val
-            dv_contrib = w_cross[:, None] * do_val
-            
-            # F. Atomic Add
-            off_out_p = b_idx * sdk_b + safe_p_idx * sdk_n
-            mask_store = mask_load_cross[:, None] & mask_d[None, :]
-            
-            tl.atomic_add(DK_ptr + off_out_p + off_hd, dk_contrib, mask=mask_store)
-            tl.atomic_add(DV_ptr + off_out_p + off_hd, dv_contrib, mask=mask_store)
-
 
 # ------------------------------------------------------------------
 #  Backward Kernel 3: Compute dQ (Small Kernel)
@@ -1262,7 +1029,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             # Multiply node count by split factor to launch more blocks
             grid_lvl = (num_nodes_in_level * current_split_k, B)
         
-            hierarchical_attention_backward_dK_dV_kernel[grid_lvl](
+            hierarchical_attention_backward_dK_dV_internal_kernel[grid_lvl](
                 DS, Q, Weights, grad_output_4d, gather_table,
                 dK, dV,
                 *DS.stride(), *Q.stride(), *Weights.stride(),
