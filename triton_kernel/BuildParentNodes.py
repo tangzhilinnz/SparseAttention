@@ -1254,7 +1254,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             # Multiply node count by split factor to launch more blocks
             grid_lvl = (num_nodes_in_level * current_split_k, B)
         
-            hierarchical_attention_backward_dK_dV_gather_unified_split_kernel[grid_lvl](
+            hierarchical_attention_backward_dK_dV_kernel[grid_lvl](
                 DS, Q, Weights, grad_output_4d, gather_table,
                 dK, dV,
                 *DS.stride(), *Q.stride(), *Weights.stride(),
