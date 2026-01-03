@@ -698,25 +698,22 @@ def hierarchical_attention_backward_dK_dV_internal_kernel(
     b_idx = tl.program_id(1)
     
     node_id = START_NODE_ID + pid
-
     offs_h = tl.arange(0, BLOCK_H)
     mask_h = offs_h < H
 
     tab_ptr = Gather_Table_ptr + (node_id * sg_node)
     leaf_start = tl.load(tab_ptr + 0)
     
-    # Optimization: Early exit if invalid
+    # -----------------------------------------------------------
+    # Early Exit: If leaf_start == -1, write zeros and exit
+    # -----------------------------------------------------------
     if leaf_start == -1:
-        # We must still loop D to write Zeros if we want to be strictly safe,
-        # OR we rely on the fact that dK/dV are uninitialized and we MUST write 0.0.
-        # Since leaf_start == -1 implies "No Neighbors", dK/dV are 0.0.
-        # We do a simple zero-fill loop.
         for off_d_start in range(0, D, BLOCK_D):
             offs_d = off_d_start + tl.arange(0, BLOCK_D)
             mask_d = offs_d < D
             mask_op = mask_h[:, None] & mask_d[None, :]
-            
             off_out = (b_idx * sdk_b) + (node_id * sdk_node)
+            # Safe to write 0.0 in whatever dtype
             zero_acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
             tl.store(DK_ptr + off_out + (offs_h[:, None] * sdk_h) + (offs_d[None, :] * sdk_d), zero_acc, mask=mask_op)
             tl.store(DV_ptr + off_out + (offs_h[:, None] * sdk_h) + (offs_d[None, :] * sdk_d), zero_acc, mask=mask_op)
@@ -735,46 +732,57 @@ def hierarchical_attention_backward_dK_dV_internal_kernel(
         mask_d = offs_d < D
         mask_op = mask_h[:, None] & mask_d[None, :]
         
-        # Reset Accumulators for this D-Chunk
+        # [CRITICAL FIX 1] Initialize Accumulators as FP32
+        # Even if inputs are FP16, we accumulate in FP32
         dk_acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
         dv_acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
 
         # -----------------------------------------------------------
         # Loop over Neighbors (Inner Loop)
         # -----------------------------------------------------------
-        # We re-iterate neighbors for every D-chunk. 
-        # This trades memory bandwidth (re-reading DS/W) for register safety.
         for start_idx in range(leaf_start, leaf_end, BLOCK_L):
             offs_l = start_idx + tl.arange(0, BLOCK_L)
             mask_l = offs_l < leaf_end
             
-            # Load DS (Re-loaded each time, but cached in L1/L2 usually)
+            # --- Load DS ---
             off_ds_base = (b_idx * sds_b) + (offs_l[:, None] * sds_n) + (w_idx * sds_lvl)
             ds_val = tl.load(DS_ptr + off_ds_base + (offs_h[None, :] * sds_h), 
                            mask=mask_l[:, None] & mask_h[None, :], other=0.0)
 
-            # Load Q Chunk (Depends on D offset)
+            # --- Load Q ---
             off_q_base = (b_idx * sq_b) + (offs_l[:, None, None] * sq_n)
             q_val = tl.load(Q_ptr + off_q_base + (offs_h[None, :, None] * sq_h) + (offs_d[None, None, :] * sq_d), 
                           mask=mask_l[:, None, None] & mask_op[None, :, :], other=0.0)
             
-            dk_acc += tl.sum(ds_val[:, :, None] * q_val, axis=0)
+            # [CRITICAL FIX 2] Cast to FP32 BEFORE Multiplication
+            # If ds_val and q_val are FP16, (ds * q) is FP16 and loses precision immediately.
+            # We want (FP32 * FP32) -> FP32 Accumulator
+            ds_f32 = ds_val.to(tl.float32)
+            q_f32 = q_val.to(tl.float32)
+            
+            dk_acc += tl.sum(ds_f32[:, :, None] * q_f32, axis=0)
 
-            # Load W (Re-loaded)
+            # --- Load W ---
             off_w_base = (b_idx * sw_b) + (offs_l[:, None] * sw_n) + (w_idx * sw_lvl)
             w_val = tl.load(W_ptr + off_w_base + (offs_h[None, :] * sw_h), 
                           mask=mask_l[:, None] & mask_h[None, :], other=0.0)
 
-            # Load dO Chunk (Depends on D offset)
+            # --- Load dO ---
             off_do_base = (b_idx * sdo_b) + (offs_l[:, None, None] * sdo_n)
             do_val = tl.load(DO_ptr + off_do_base + (offs_h[None, :, None] * sdo_h) + (offs_d[None, None, :] * sdo_d), 
                            mask=mask_l[:, None, None] & mask_op[None, :, :], other=0.0)
             
-            dv_acc += tl.sum(w_val[:, :, None] * do_val, axis=0)
+            # [CRITICAL FIX 3] Cast to FP32 BEFORE Multiplication
+            w_f32 = w_val.to(tl.float32)
+            do_f32 = do_val.to(tl.float32)
+            
+            dv_acc += tl.sum(w_f32[:, :, None] * do_f32, axis=0)
 
         # -----------------------------------------------------------
         # Store Chunk
         # -----------------------------------------------------------
+        # tl.store will automatically cast our FP32 accumulators back to 
+        # the pointer's dtype (FP16) if needed.
         off_out = (b_idx * sdk_b) + (node_id * sdk_node)
         tl.store(DK_ptr + off_out + (offs_h[:, None] * sdk_h) + (offs_d[None, :] * sdk_d), dk_acc, mask=mask_op)
         tl.store(DV_ptr + off_out + (offs_h[:, None] * sdk_h) + (offs_d[None, :] * sdk_d), dv_acc, mask=mask_op)
@@ -1060,8 +1068,8 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         )
     
         # --- SETUP PARALLELISM ---
-        dK = torch.zeros_like(K, dtype=torch.float32)
-        dV = torch.zeros_like(V, dtype=torch.float32)
+        dK = torch.zeros_like(K)
+        dV = torch.zeros_like(V)
         dQ = torch.empty_like(Q)
     
         main_stream = torch.cuda.current_stream()
