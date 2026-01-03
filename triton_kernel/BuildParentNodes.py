@@ -1060,8 +1060,8 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         )
     
         # --- SETUP PARALLELISM ---
-        dK = torch.empty_like(K)
-        dV = torch.empty_like(V)
+        dK = torch.zeros_like(K, dtype=torch.float32)
+        dV = torch.zeros_like(V, dtype=torch.float32)
         dQ = torch.empty_like(Q)
     
         main_stream = torch.cuda.current_stream()
