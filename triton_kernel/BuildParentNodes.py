@@ -880,17 +880,18 @@ def hierarchical_attention_backward_dK_dV_atomic_kernel(
         # =========================================================
         for lvl_idx in range(LEVELS):
             # Load parent index
+            # REMOVED 'other=-1'. Assuming node_idx is valid (within grid bounds), 
+            # this memory location is safe to access.
             p_idx = tl.load(
-                Lookup_ptr + node_idx * sl_n + lvl_idx * sl_lvl,
-                other=-1,
+                Lookup_ptr + node_idx * sl_n + lvl_idx * sl_lvl
             )
 
             is_valid = p_idx != -1
 
             if HAS_MASK:
+                # REMOVED 'other=1'
                 mask_val = tl.load(
-                    Mask_ptr + node_idx * sl_n + lvl_idx * sl_lvl,
-                    other=1,
+                    Mask_ptr + node_idx * sl_n + lvl_idx * sl_lvl
                 ).to(tl.int8)
                 is_valid = is_valid & (mask_val == 0)
 
