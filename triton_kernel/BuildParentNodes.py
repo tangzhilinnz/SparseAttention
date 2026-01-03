@@ -691,67 +691,29 @@ def hierarchical_attention_backward_dK_dV_kernel(
     H: tl.constexpr, BLOCK_H: tl.constexpr,
     D: tl.constexpr, BLOCK_D: tl.constexpr,
     START_NODE_ID: tl.constexpr,
-    TARGET_LEVEL: tl.constexpr # <--- The only parameter that changes (1, 2, etc.)
+    TARGET_LEVEL: tl.constexpr
 ):
     pid = tl.program_id(0)
     b_idx = tl.program_id(1)
 
     # 1. Constants derived from TARGET_LEVEL
-    # -----------------------------------------------------------
     NUM_CHILDREN: tl.constexpr = 1 << TARGET_LEVEL
     W_IDX: tl.constexpr = TARGET_LEVEL + 1
 
-    # 2. Identify Parent & Children
-    # -----------------------------------------------------------
+    # 2. Identify Parent
     node_id = pid + START_NODE_ID
     
     # Load starting child index
     tab_ptr = Gather_Table_ptr + (node_id * sg_node)
     child_start = tl.load(tab_ptr + 0)
     
-    # Generate vector of child indices: [child_start, child_start+1, ...]
-    # Shape: [NUM_CHILDREN]
-    offs_k = tl.arange(0, NUM_CHILDREN)
-    child_indices = child_start + offs_k
-
     # Validity Check
     has_children = (child_start != -1)
 
-    # 3. Pre-Load Context (dS, W) for ALL Children
-    # -----------------------------------------------------------
-    # We load all children's dS/W into registers at once.
-    # Shape: [NUM_CHILDREN, BLOCK_H]
-    
     offs_h = tl.arange(0, BLOCK_H)
     mask_h = offs_h < H
 
-    # Pointers
-    # Note: sds_n/sw_n are multiplied by child indices (vectorized)
-    # Resulting Shape: [NUM_CHILDREN, 1] for broadcasting against [1, BLOCK_H]
-    off_ds_base = (b_idx * sds_b) + (child_indices[:, None] * sds_n) + (W_IDX * sds_lvl)
-    off_w_base  = (b_idx * sw_b)  + (child_indices[:, None] * sw_n)  + (W_IDX * sw_lvl)
-
-    # Load Context
-    # mask_h is [BLOCK_H], broadcast to [1, BLOCK_H]
-    # We only load if has_children is True.
-    ds_all = tl.zeros([NUM_CHILDREN, BLOCK_H], dtype=tl.float32)
-    w_all  = tl.zeros([NUM_CHILDREN, BLOCK_H], dtype=tl.float32)
-
-    if has_children:
-        ds_all = tl.load(DS_ptr + off_ds_base + (offs_h[None, :] * sds_h), 
-                         mask=mask_h[None, :], other=0.0)
-        w_all  = tl.load(W_ptr  + off_w_base  + (offs_h[None, :] * sw_h),  
-                         mask=mask_h[None, :], other=0.0)
-
-    # 4. Loop over Dimension D
-    # -----------------------------------------------------------
-    # We process D in chunks to keep register pressure low.
-    
-    # Base Pointers for Q/dO
-    # Shape: [NUM_CHILDREN, 1, 1]
-    off_q_base  = (b_idx * sq_b)  + (child_indices[:, None, None] * sq_n)
-    off_do_base = (b_idx * sdo_b) + (child_indices[:, None, None] * sdo_n)
-
+    # 3. Setup Loop over Dimension D
     off_out = (b_idx * sdk_b) + (node_id * sdk_node)
 
     for off_d_start in range(0, D, BLOCK_D):
@@ -764,36 +726,40 @@ def hierarchical_attention_backward_dK_dV_kernel(
         dv_acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
 
         if has_children:
-            # Common Offsets for this chunk
-            # Shape: [1, BLOCK_H, BLOCK_D]
-            off_hd_q  = (offs_h[None, :, None] * sq_h)  + (offs_d[None, None, :] * sq_d)
-            off_hd_do = (offs_h[None, :, None] * sdo_h) + (offs_d[None, None, :] * sdo_d)
+            # Common Offsets for this chunk of D
+            off_hq_d  = (offs_h[:, None] * sq_h)  + (offs_d[None, :] * sq_d)
+            off_hdo_d = (offs_h[:, None] * sdo_h) + (offs_d[None, :] * sdo_d)
 
             # --- INNER LOOP: Iterate over Children ---
-            # We assume NUM_CHILDREN is small (2, 4).
-            # We loop explicitly to avoid creating a massive [K, H, D] tensor for Q/dO
+            # We load data for each child individually here.
+            # Since NUM_CHILDREN is a constexpr (e.g. 2 or 4), this unrolls completely.
             for k in range(NUM_CHILDREN):
+                # Calculate Child ID
+                child_idx = child_start + k
                 
-                # Extract specific child's context
-                # ds_k: [BLOCK_H] -> [BLOCK_H, 1]
-                ds_k = ds_all[k, :, None]
-                w_k  = w_all[k, :, None]
-                
-                # Load Child's Q and dO
-                # We use the pointer offsets calculated above
-                # Note: slice [k:k+1] on dimension 0
-                ptr_q  = Q_ptr  + off_q_base[k]  + off_hd_q[0]
-                ptr_do = DO_ptr + off_do_base[k] + off_hd_do[0]
-                
-                # Mask is standard 2D [H, D]
-                q_val  = tl.load(ptr_q,  mask=mask_op, other=0.0)
-                do_val = tl.load(ptr_do, mask=mask_op, other=0.0)
+                # --- A. Load Context (dS, W) ---
+                # Pointers for this specific child
+                off_ds_k = (b_idx * sds_b) + (child_idx * sds_n) + (W_IDX * sds_lvl)
+                off_w_k  = (b_idx * sw_b)  + (child_idx * sw_n)  + (W_IDX * sw_lvl)
 
-                # Accumulate
+                # Load [BLOCK_H, 1]
+                ds_k = tl.load(DS_ptr + off_ds_k + (offs_h[:, None] * sds_h), mask=mask_h[:, None], other=0.0)
+                w_k  = tl.load(W_ptr  + off_w_k  + (offs_h[:, None] * sw_h),  mask=mask_h[:, None], other=0.0)
+
+                # --- B. Load Q and dO ---
+                # Pointers for this specific child
+                off_q_k  = (b_idx * sq_b)  + (child_idx * sq_n)
+                off_do_k = (b_idx * sdo_b) + (child_idx * sdo_n)
+                
+                # Load [BLOCK_H, BLOCK_D]
+                q_val  = tl.load(Q_ptr  + off_q_k  + off_hq_d,  mask=mask_op, other=0.0)
+                do_val = tl.load(DO_ptr + off_do_k + off_hdo_d, mask=mask_op, other=0.0)
+
+                # --- C. Accumulate ---
                 dk_acc += ds_k * q_val
                 dv_acc += w_k  * do_val
 
-        # Store Result
+        # 4. Store Result
         tl.store(DK_ptr + off_out + (offs_h[:, None] * sdk_h) + (offs_d[None, :] * sdk_d), dk_acc, mask=mask_op)
         tl.store(DV_ptr + off_out + (offs_h[:, None] * sdk_h) + (offs_d[None, :] * sdk_d), dv_acc, mask=mask_op)
 
