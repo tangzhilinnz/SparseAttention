@@ -1458,8 +1458,10 @@ class HierarchicalSparseAttentionTriton(nn.Module):
         K_full = kv_input
         V_full = self.dropout(v_input)
 
-        # [FIX] Unpack dictionary correctly
-        tables = self._get_lookup_table(N, device=x.device)
+        # [FIX HERE] Pass is_causal based on mask existence
+        is_causal = (mask is not None)
+        tables = self._get_lookup_table(N, is_causal=is_causal, device=x.device)
+
         idx_table = tables["forward_idx"]
         neighbor_causal_mask = tables["forward_mask"]
             
