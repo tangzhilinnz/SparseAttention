@@ -754,13 +754,7 @@ def hierarchical_attention_backward_dK_dV_internal_kernel(
             q_val = tl.load(Q_ptr + off_q_base + (offs_h[None, :, None] * sq_h) + (offs_d[None, None, :] * sq_d), 
                           mask=mask_l[:, None, None] & mask_op[None, :, :], other=0.0)
             
-            # [CRITICAL FIX 2] Cast to FP32 BEFORE Multiplication
-            # If ds_val and q_val are FP16, (ds * q) is FP16 and loses precision immediately.
-            # We want (FP32 * FP32) -> FP32 Accumulator
-            ds_f32 = ds_val.to(tl.float32)
-            q_f32 = q_val.to(tl.float32)
-            
-            dk_acc += tl.sum(ds_f32[:, :, None] * q_f32, axis=0)
+            dk_acc += tl.sum(ds_val[:, :, None] * q_val, axis=0)
 
             # --- Load W ---
             off_w_base = (b_idx * sw_b) + (offs_l[:, None] * sw_n) + (w_idx * sw_lvl)
@@ -771,12 +765,8 @@ def hierarchical_attention_backward_dK_dV_internal_kernel(
             off_do_base = (b_idx * sdo_b) + (offs_l[:, None, None] * sdo_n)
             do_val = tl.load(DO_ptr + off_do_base + (offs_h[None, :, None] * sdo_h) + (offs_d[None, None, :] * sdo_d), 
                            mask=mask_l[:, None, None] & mask_op[None, :, :], other=0.0)
-            
-            # [CRITICAL FIX 3] Cast to FP32 BEFORE Multiplication
-            w_f32 = w_val.to(tl.float32)
-            do_f32 = do_val.to(tl.float32)
-            
-            dv_acc += tl.sum(w_f32[:, :, None] * do_f32, axis=0)
+             
+            dv_acc += tl.sum(w_val[:, :, None] * do_val, axis=0)
 
         # -----------------------------------------------------------
         # Store Chunk
