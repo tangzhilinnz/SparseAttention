@@ -1140,68 +1140,67 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         grad_output = grad_output.contiguous()
         B, N = Q.shape[0], Q.shape[1]
         
-        # 1. Compute dS (Still separate, requires gather-like read or scatter-write? 
-        # Actually dS is per-edge. The existing dS kernel is efficient and fine. Keep it.)
+        # [CRITICAL FIX] View as 4D to generate 4 stride values
+        grad_output_4d = grad_output.view(B, N, H, D) 
+
+        # 1. Compute dS
         DS = torch.zeros_like(Weights)
         grid_ds = (N, B)
         HAS_MASK = (mask_table is not None)
         mask_ptr_safe = mask_table if HAS_MASK else Weights
 
         hierarchical_attention_backward_dS_kernel[grid_ds](
-            grad_output, Weights, V, idx_table, DS, mask_ptr_safe,
-            *grad_output.stride(), *Weights.stride(), *V.stride(),
+            # Pass the 4D view
+            grad_output_4d, Weights, V, idx_table, DS, mask_ptr_safe,
+            
+            # Pass the 4D strides
+            *grad_output_4d.stride(), 
+            *Weights.stride(), *V.stride(),
             *idx_table.stride(), *DS.stride(),
+            
             sm_scale, H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, 
             LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS, HAS_MASK=HAS_MASK,
             num_warps=4
         )
 
-        # 2. Compute dQ (Can also be fused, but fine to keep separate for modularity)
+        # 2. Setup Gradients
+        dK = torch.zeros_like(K, dtype=torch.float32)
+        dV = torch.zeros_like(V, dtype=torch.float32)
         dQ = torch.empty_like(Q)
-        
-        # 3. Compute dK / dV using ATOMIC ADD
-        # [CRITICAL] Must be Zeros because we accumulate into it
-        dK = torch.zeros_like(K)
-        dV = torch.zeros_like(V)
 
-        # Stream management
         main_stream = torch.cuda.current_stream()
         side_stream = torch.cuda.Stream()
         side_stream.wait_stream(main_stream)
         
-        # Branch 1: dQ
+        # Branch 1: dQ (Side Stream)
         with torch.cuda.stream(side_stream):
-            grid_dq = (N, B)
-            hierarchical_attention_backward_dQ_kernel[grid_dq](
+             grid_dq = (N, B)
+             hierarchical_attention_backward_dQ_kernel[grid_dq](
                 DS, K, idx_table, dQ, mask_ptr_safe, 
                 *DS.stride(), *K.stride(), *idx_table.stride(), *dQ.stride(),
                 H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS,
                 HAS_MASK=HAS_MASK, num_warps=4
             )
 
-        # Branch 2: dK / dV (Single Atomic Kernel)
-        # Grid is (N, B) -> We iterate leaves, and they update parents
+        # 3. Atomic Backward Kernel (dK/dV)
         grid_atomic = (N, B)
         
+        # [FIX]: Removed BLOCK_LEVELS=BLOCK_LEVELS from this call
         hierarchical_attention_backward_dK_dV_atomic_kernel[grid_atomic](
-            # Gradients (In)
-            DS, grad_output,
-            # Context (In)
+            DS, 
+            grad_output_4d, # <--- Pass 4D view
             Q, Weights, idx_table, mask_ptr_safe,
-            # Gradients (Out - Atomic)
             dK, dV,
             
-            # Strides
             *DS.stride(),
-            *grad_output.stride(),
+            *grad_output_4d.stride(), # <--- Pass 4D strides
             *Q.stride(),
             *Weights.stride(),
             *idx_table.stride(),
             *dK.stride(),
             
-            # Constants
             H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, 
-            LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS,
+            LEVELS=LEVELS, 
             HAS_MASK=HAS_MASK,
             num_warps=4
         )
