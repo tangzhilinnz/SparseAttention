@@ -466,121 +466,236 @@ def hierarchical_attention_forward_kernel(
 @triton.jit
 def hierarchical_attention_backward_dS_kernel(
     DO_ptr, W_ptr, V_ptr, Lookup_ptr, DS_ptr, Mask_ptr,
-    # Strides for dO
+    # Strides
     sdo_b, sdo_n, sdo_h, sdo_d,
-    # Strides for W
     sw_b, sw_n, sw_h, sw_lvl,
-    # Strides for V (Now separate from K)
     sv_b, sv_n, sv_h, sv_d,
-    # Strides for Lookup/Topology
     sl_n, sl_lvl,
-    # Strides for DS
     sds_b, sds_n, sds_h, sds_lvl,
     
     sm_scale,
     H: tl.constexpr, BLOCK_H: tl.constexpr,
-    D: tl.constexpr, BLOCK_D: tl.constexpr,
-    LEVELS: tl.constexpr, BLOCK_LEVELS: tl.constexpr,
-    HAS_MASK: tl.constexpr # <--- Added Flag
+    D: tl.constexpr, 
+    BLOCK_D: tl.constexpr,      # <--- Keep small (e.g. 32)
+    LEVELS: tl.constexpr, 
+    HAS_MASK: tl.constexpr
 ):
     node_idx = tl.program_id(0)
     b_idx = tl.program_id(1)
 
     h_idx = tl.arange(0, BLOCK_H)
     mask_h = h_idx < H
-    offs_lvl = tl.arange(0, BLOCK_LEVELS)
-    
-    # -----------------------------------------------------------
-    # 1. Mask Logic & Topology Load
-    # -----------------------------------------------------------
-    # Boundary Check: Are we within the max levels?
-    mask_lvl_bounds = offs_lvl < LEVELS
-    off_lookup = node_idx * sl_n + offs_lvl * sl_lvl
-    
-    neighbor_indices = tl.load(Lookup_ptr + off_lookup, mask=mask_lvl_bounds, other=0)
-
-    # Combined Mask: (In Bounds) AND (Not Masked by User)
-    # Start with bounds
-    mask_valid_cross = mask_lvl_bounds
-    
-    if HAS_MASK:
-        # Load User Mask (1 = Ignore/Masked, 0 = Keep)
-        val_int8 = tl.load(Mask_ptr + off_lookup, mask=mask_lvl_bounds, other=1).to(tl.int8)
-        mask_valid_cross = mask_valid_cross & (val_int8 == 0)
 
     # -----------------------------------------------------------
-    # 2. Load Weights (W)
+    # 1. Pre-calculate Base Pointers
     # -----------------------------------------------------------
+    # dO Base: [Node, Head]
+    do_base = DO_ptr + (b_idx * sdo_b) + (node_idx * sdo_n) + (h_idx[:, None] * sdo_h)
+    
+    # W Base: [Node, Head]
     w_base = W_ptr + (b_idx * sw_b) + (node_idx * sw_n) + (h_idx * sw_h)
     
-    # Self Weight
-    w_self = tl.load(w_base + (0 * sw_lvl), mask=mask_h, other=0.0)
-    
-    # Cross Weight
-    # DEFENSIVE: Apply mask_valid_cross. If masked, w_cross becomes 0.0.
-    w_cross = tl.load(w_base[:, None] + ((1 + offs_lvl[None, :]) * sw_lvl), 
-                      mask=mask_h[:, None] & mask_valid_cross[None, :], other=0.0)
-
-    # -----------------------------------------------------------
-    # 3. Compute dP = dot(dO, V)
-    # -----------------------------------------------------------
-    dp_self = tl.zeros([BLOCK_H], dtype=tl.float32)
-    dp_cross = tl.zeros([BLOCK_H, BLOCK_LEVELS], dtype=tl.float32)
-
-    # Use explicit SV strides for V pointer calculation
+    # V Batch Base
     v_batch_base = V_ptr + b_idx * sv_b
-    do_batch_base = DO_ptr + (b_idx * sdo_b) + (node_idx * sdo_n)
     
-    off_node_self = node_idx * sv_n
-    off_node_cross = neighbor_indices * sv_n
+    # DS Base: [Node, Head]
+    ds_base = DS_ptr + (b_idx * sds_b) + (node_idx * sds_n) + (h_idx * sds_h)
 
-    for off_d in range(0, D, BLOCK_D):
-        offs_d = off_d + tl.arange(0, BLOCK_D)
+    # -----------------------------------------------------------
+    # 2. Compute dP_self (Self Attention Dot Product)
+    # -----------------------------------------------------------
+    # Initialize Accumulator
+    dp_self = tl.zeros([BLOCK_H], dtype=tl.float32)
+    
+    # Pre-calc Self V Offset: [Node, Head]
+    off_v_self_base = (node_idx * sv_n) + (h_idx[:, None] * sv_h)
+
+    for off_d_start in range(0, D, BLOCK_D):
+        offs_d = off_d_start + tl.arange(0, BLOCK_D)
         mask_d = offs_d < D
         mask_op = mask_h[:, None] & mask_d[None, :]
 
-        # Load dO
-        do = tl.load(do_batch_base + (h_idx[:, None]*sdo_h) + (offs_d[None, :]*sdo_d), 
-                     mask=mask_op, other=0.0)
+        # Load dO [H, D]
+        do_val = tl.load(do_base + (offs_d[None, :] * sdo_d), mask=mask_op, other=0.0)
         
-        # Load V Self (using sv strides)
-        ptr_v_self = v_batch_base + off_node_self + (h_idx[:, None]*sv_h) + (offs_d[None, :]*sv_d)
-        v_self = tl.load(ptr_v_self, mask=mask_op, other=0.0)
+        # Load V Self [H, D]
+        v_self = tl.load(
+            v_batch_base + off_v_self_base + (offs_d[None, :] * sv_d),
+            mask=mask_op, other=0.0
+        )
         
-        # Load V Cross (using sv strides)
-        ptr_v_cross = v_batch_base + off_node_cross[None, :, None] + \
-                      (h_idx[:, None, None]*sv_h) + (offs_d[None, None, :]*sv_d)
-        
-        # DEFENSIVE: Apply mask_valid_cross to V load.
-        # This prevents loading 'NaNs' or garbage from padding tokens.
-        mask_v_cross = mask_h[:, None, None] & mask_valid_cross[None, :, None] & mask_d[None, None, :]
-        v_cross = tl.load(ptr_v_cross, mask=mask_v_cross, other=0.0)
+        # Accumulate dot product
+        dp_self += tl.sum(do_val * v_self, axis=1)
 
-        dp_self += tl.sum(do * v_self, axis=1)
-        dp_cross += tl.sum(do[:, None, :] * v_cross, axis=2)
+    # Load W Self
+    w_self = tl.load(w_base + (0 * sw_lvl), mask=mask_h, other=0.0)
 
     # -----------------------------------------------------------
-    # 4. Compute dS (Softmax Gradient)
+    # 3. Compute Sum(W * dP) across all levels
     # -----------------------------------------------------------
-    sum_wdp = (w_self * dp_self) + tl.sum(w_cross * dp_cross, axis=1)
+    # We need "sum_wdp" to compute the Softmax Gradient later.
+    # sum_wdp = (w_self * dp_self) + sum(w_cross * dp_cross)
     
+    sum_wdp = (w_self * dp_self)
+
+    # We need to store dp_cross and w_cross values to compute ds_cross later.
+    # Since we can't store infinite history in registers, we will do TWO PASSES
+    # over levels if we want to save memory, OR we just compute sum_wdp first.
+    
+    # Actually, the most efficient way (Register-wise) is to:
+    # 1. Compute dP_self.
+    # 2. Iterate levels to compute dP_cross, store them temporarily in a buffer?
+    #    NO, that uses too much memory.
+    
+    # BETTER APPROACH:
+    # 1. Loop D to get dP_self.
+    # 2. Loop Levels -> Loop D to get dP_cross. Accumulate sum_wdp on the fly.
+    #    This requires recalculating dP_cross later or storing it.
+    
+    # Given the constraints, we will use a [BLOCK_H, LEVELS] tensor for dP_cross 
+    # IF LEVELS is small (e.g. < 8). If LEVELS is large, this will spill.
+    # Assuming LEVELS is moderate (~4-6), we can cache dP_cross in registers.
+    
+    # Buffer to hold dP for all levels: [BLOCK_H, LEVELS]
+    # We treat this as a list of vectors to avoid 2D tensor complexity if possible.
+    # But for simplicity, we'll iterate.
+    
+    # -----------------------------------------------------------
+    # PASS A: Compute dP_cross for all levels & Accumulate sum_wdp
+    # -----------------------------------------------------------
+    # We must store dP_cross values because dS calculation depends on the final sum_wdp.
+    # To avoid spilling, we assume LEVELS is small enough (e.g., 5).
+    # If LEVELS is large, we'd need to recompute or use shared memory.
+    
+    # Create a buffer in registers. 
+    # NOTE: Triton doesn't support dynamic lists easily. We usually vectorize levels here.
+    # IF YOU WANT TO LOOP, you have a dependency cycle: dS_i depends on Sum(W*dP).
+    
+    # Strategy: 
+    # Since dS calculation requires the Global Sum, we cannot fully stream the levels 
+    # independently without two passes or storage.
+    
+    # However, since you asked for a "LOOP" version to save registers *during the dot product*, 
+    # we can do the heavy lifting (dot product) in a loop, store the tiny result (scalar dP),
+    # and then do the final combine.
+    
+    # Let's verify: [BLOCK_H, LEVELS] floats is small (32 * 6 * 4 bytes = 768 bytes).
+    # This fits easily in registers! The problem was the [H, L, D] tensor (100x larger).
+    
+    # So we CAN store dP_cross[L] in registers.
+    
+    # -----------------------------------------------------------
+    
+    # Buffer for dP values (we will compute them one by one)
+    # Since Triton doesn't allow array indexing `dp[i] = val` easily inside a loop 
+    # without tensor ops, we might need a small scratchpad or just use a tensor.
+    # But wait, we are trying to avoid [H, L] vectorization logic overhead? 
+    # No, [H, L] is fine. [H, L, D] is bad.
+    
+    # Hybrid Approach:
+    # 1. Allocate dp_cross_all = zeros([H, LEVELS])
+    # 2. Loop Levels:
+    #      Compute dP_cross_lvl (Looping D) -> Result [H]
+    #      Store into dp_cross_all[:, lvl] (using masking/where)
+    
+    dp_cross_all = tl.zeros([BLOCK_H, LEVELS], dtype=tl.float32)
+    w_cross_all  = tl.zeros([BLOCK_H, LEVELS], dtype=tl.float32) # Need W for final calc
+
+    for lvl_idx in range(LEVELS):
+        # 1. Topology & Mask
+        off_lookup = node_idx * sl_n + lvl_idx * sl_lvl
+        p_idx = tl.load(Lookup_ptr + off_lookup)
+        
+        is_valid = (p_idx != -1)
+        if HAS_MASK:
+            mask_val = tl.load(Mask_ptr + off_lookup).to(tl.int8)
+            is_valid = is_valid & (mask_val == 0)
+
+        # 2. Load Weight [H]
+        # Offset W: level + 1
+        w_idx = lvl_idx + 1
+        mask_load = mask_h & is_valid
+        
+        w_val = tl.load(
+            w_base + (w_idx * sw_lvl), 
+            mask=mask_load, other=0.0
+        )
+        
+        # Store W for later
+        # We use a mask to insert this level's W into the [H, L] buffer
+        # (This is a bit tricky in Triton without tensor indexing, 
+        #  so we often use the 'offs_lvl' masking trick)
+        
+        # Actually, for the "Loop" structure, computing dP one by one is easy, 
+        # but accumulating them into a tensor `dp_cross_all` requires
+        # generating a mask for the current level.
+        
+        # Current Level Mask: [LEVELS]
+        mask_this_lvl = (tl.arange(0, LEVELS) == lvl_idx)
+        
+        # Broadcast W to [H, L] and add to accumulator (only for this level)
+        w_cross_all += w_val[:, None] * mask_this_lvl[None, :].to(tl.float32)
+
+        # 3. Compute dP (Dot Product) for this level
+        dp_lvl = tl.zeros([BLOCK_H], dtype=tl.float32)
+        safe_p_idx = tl.where(is_valid, p_idx, 0)
+        
+        # Pointer to V for this parent
+        off_v_cross_base = (safe_p_idx * sv_n) + (h_idx * sv_h)
+
+        # Inner Loop D
+        for off_d_start in range(0, D, BLOCK_D):
+            offs_d = off_d_start + tl.arange(0, BLOCK_D)
+            mask_d = offs_d < D
+            mask_op = mask_h[:, None] & mask_d[None, :]
+
+            # Load dO
+            do_val = tl.load(do_base + (offs_d[None, :] * sdo_d), mask=mask_op, other=0.0)
+
+            # Load V Cross
+            # Note: Mask V with 'mask_load' (valid edge) to avoid garbage
+            mask_v = mask_load[:, None] & mask_d[None, :]
+            v_val = tl.load(
+                v_batch_base + off_v_cross_base[:, None] + (offs_d[None, :] * sv_d),
+                mask=mask_v, other=0.0
+            )
+
+            dp_lvl += tl.sum(do_val * v_val, axis=1)
+
+        # 4. Store dP into [H, L] buffer
+        dp_cross_all += dp_lvl[:, None] * mask_this_lvl[None, :].to(tl.float32)
+        
+        # 5. Accumulate into sum_wdp
+        sum_wdp += (w_val * dp_lvl)
+
+    # -----------------------------------------------------------
+    # 4. Compute & Store dS
+    # -----------------------------------------------------------
+    
+    # A. dS Self
     ds_self = w_self * (dp_self - sum_wdp) * sm_scale
-    ds_cross = w_cross * (dp_cross - sum_wdp[:, None]) * sm_scale
+    tl.store(ds_base + (0 * sds_lvl), ds_self.to(DS_ptr.dtype.element_ty), mask=mask_h)
 
-    # -----------------------------------------------------------
-    # 5. Store dS
-    # -----------------------------------------------------------
-    ds_base = DS_ptr + (b_idx * sds_b) + (node_idx * sds_n) + (h_idx * sds_h)
+    # B. dS Cross (Loop to store)
+    # Now we iterate levels again to compute and write the final result.
+    # We read from our cached `dp_cross_all` and `w_cross_all`.
     
-    tl.store(ds_base + (0 * sds_lvl), ds_self, mask=mask_h)
-    
-    ds_cross_ptr = ds_base[:, None] + ((1 + offs_lvl[None, :]) * sds_lvl)
-    
-    # SAFE STORE: We use mask_lvl_bounds (bounds only), NOT mask_valid_cross.
-    # Why? If a node is masked, ds_cross is 0.0 (because w_cross was 0.0).
-    # We WANT to write this 0.0 to memory to overwrite any garbage in uninitialized DS.
-    # If we masked the store, DS would retain random values from empty_like().
-    tl.store(ds_cross_ptr, ds_cross, mask=mask_h[:, None] & mask_lvl_bounds[None, :])
+    for lvl_idx in range(LEVELS):
+        # Extract cached values
+        mask_this_lvl = (tl.arange(0, LEVELS) == lvl_idx)
+        
+        # Sum over the L dimension using the mask to pick 1 value
+        w_val = tl.sum(w_cross_all * mask_this_lvl[None, :], axis=1)
+        dp_val = tl.sum(dp_cross_all * mask_this_lvl[None, :], axis=1)
+        
+        # Softmax Gradient Formula
+        # dS_i = w_i * (dP_i - Sum(w * dP))
+        ds_val = w_val * (dp_val - sum_wdp) * sm_scale
+        
+        # Store
+        # Offset: level + 1
+        ds_ptr_lvl = ds_base + ((lvl_idx + 1) * sds_lvl)
+        tl.store(ds_ptr_lvl, ds_val.to(DS_ptr.dtype.element_ty), mask=mask_h)
 
 
 # ==================================================================
@@ -1100,7 +1215,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             *DS.stride(),           
             
             sm_scale, H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, 
-            LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS,
+            LEVELS=LEVELS, #BLOCK_LEVELS=BLOCK_LEVELS,
             HAS_MASK=HAS_MASK,
             num_warps=4
         )
