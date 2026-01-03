@@ -915,82 +915,111 @@ def hierarchical_attention_backward_dK_dV_atomic_kernel(
 #  Backward Kernel 3: Compute dQ (Small Kernel)
 # ------------------------------------------------------------------
 @triton.jit
-def hierarchical_attention_backward_dQ_kernel(
-    DS_ptr, K_ptr, Lookup_ptr, DQ_ptr, Mask_ptr, # <--- Added Mask_ptr
+def hierarchical_attention_backward_dQ_loop_kernel(
+    DS_ptr, K_ptr, Lookup_ptr, DQ_ptr, Mask_ptr,
     sds_b, sds_n, sds_h, sds_lvl,
     sk_b, sk_n, sk_h, sk_d,
     sl_n, sl_lvl,
     sdq_b, sdq_n, sdq_h, sdq_d,
     H: tl.constexpr, BLOCK_H: tl.constexpr,
-    D: tl.constexpr, BLOCK_D: tl.constexpr,
-    LEVELS: tl.constexpr, BLOCK_LEVELS: tl.constexpr,
-    HAS_MASK: tl.constexpr # <--- Added Flag
+    D: tl.constexpr, 
+    BLOCK_D: tl.constexpr,
+    LEVELS: tl.constexpr, 
+    HAS_MASK: tl.constexpr
 ):
     node_idx = tl.program_id(0)
     b_idx = tl.program_id(1)
 
     h_idx = tl.arange(0, BLOCK_H)
     mask_h = h_idx < H
-    offs_lvl = tl.arange(0, BLOCK_LEVELS)
-    
-    # -----------------------------------------------------------
-    # 1. Mask Logic
-    # -----------------------------------------------------------
-    # Base bounds check
-    mask_lvl_bounds = offs_lvl < LEVELS
-    off_lookup = node_idx * sl_n + offs_lvl * sl_lvl
-    
-    # Load Topology
-    neighbor_indices = tl.load(Lookup_ptr + off_lookup, mask=mask_lvl_bounds, other=0)
-    
-    # Combined Mask: (In Bounds) AND (Not Masked by User)
-    mask_valid_cross = mask_lvl_bounds
-    
-    if HAS_MASK:
-        # Load User Mask (1 = Ignore/Masked, 0 = Keep)
-        val_int8 = tl.load(Mask_ptr + off_lookup, mask=mask_lvl_bounds, other=1).to(tl.int8)
-        mask_valid_cross = mask_valid_cross & (val_int8 == 0)
 
     # -----------------------------------------------------------
-    # 2. Load dS
+    # 1. Pre-calculate Base Pointers
     # -----------------------------------------------------------
+    # DS Base: [Node, Head]
     ds_base = DS_ptr + (b_idx * sds_b) + (node_idx * sds_n) + (h_idx * sds_h)
-    ds_self = tl.load(ds_base + (0 * sds_lvl), mask=mask_h, other=0.0)
     
-    # Apply Mask to dS Load (Consistency Check)
-    ds_cross = tl.load(ds_base[:, None] + ((1 + offs_lvl[None, :]) * sds_lvl), 
-                       mask=mask_h[:, None] & mask_valid_cross[None, :], other=0.0)
+    # DQ Base: [Node, Head]
+    dq_base = DQ_ptr + (b_idx * sdq_b) + (node_idx * sdq_n) + (h_idx[:, None] * sdq_h)
 
-    # -----------------------------------------------------------
-    # 3. Compute dQ
-    # -----------------------------------------------------------
+    # K Batch Base: [Batch]
     k_batch_base = K_ptr + b_idx * sk_b
-    off_node_self = node_idx * sk_n
-    off_node_cross = neighbor_indices * sk_n
-    dq_base = DQ_ptr + (b_idx * sdq_b) + (node_idx * sdq_n)
 
-    for off_d in range(0, D, BLOCK_D):
-        offs_d = off_d + tl.arange(0, BLOCK_D)
+    # Pre-load Self DS (reused across D loop)
+    # Shape: [BLOCK_H]
+    ds_self = tl.load(ds_base + (0 * sds_lvl), mask=mask_h, other=0.0)
+
+    # -----------------------------------------------------------
+    # 2. Outer Loop over D (Chunked for Registers)
+    # -----------------------------------------------------------
+    for off_d_start in range(0, D, BLOCK_D):
+        offs_d = off_d_start + tl.arange(0, BLOCK_D)
         mask_d = offs_d < D
         mask_op = mask_h[:, None] & mask_d[None, :]
-        
-        # Load K Self
-        ptr_k_self = k_batch_base + off_node_self + (h_idx[:, None] * sk_h) + (offs_d[None, :] * sk_d)
-        k_self = tl.load(ptr_k_self, mask=mask_op, other=0.0)
-        
-        # Load K Cross (Defensive Masking)
-        ptr_k_cross = k_batch_base + off_node_cross[None, :, None] + \
-                      (h_idx[:, None, None] * sk_h) + (offs_d[None, None, :] * sk_d)
-        
-        # Apply mask_valid_cross to K load.
-        # This prevents reading garbage keys from padding/masked tokens.
-        mask_k_cross = mask_h[:, None, None] & mask_valid_cross[None, :, None] & mask_d[None, None, :]
-        k_cross = tl.load(ptr_k_cross, mask=mask_k_cross, other=0.0)
-        
-        # dQ = sum(dS * K)
-        dq_val = (ds_self[:, None] * k_self) + tl.sum(ds_cross[:, :, None] * k_cross, axis=1)
-        
-        tl.store(dq_base + (h_idx[:, None] * sdq_h) + (offs_d[None, :] * sdq_d), dq_val, mask=mask_op)
+
+        # -------------------------------------------------------
+        # A. Process Self (Level 0)
+        # -------------------------------------------------------
+        # K Self Pointer: [Node, Head, D_Chunk]
+        off_k_self = (node_idx * sk_n) + \
+                     (h_idx[:, None] * sk_h) + \
+                     (offs_d[None, :] * sk_d)
+                     
+        k_self = tl.load(k_batch_base + off_k_self, mask=mask_op, other=0.0)
+
+        # Init Accumulator (FP32 for Precision)
+        # dQ = dS_self * K_self
+        dq_acc = ds_self[:, None].to(tl.float32) * k_self.to(tl.float32)
+
+        # -------------------------------------------------------
+        # B. Inner Loop over Levels (The Optimization)
+        # -------------------------------------------------------
+        for lvl_idx in range(LEVELS):
+            # 1. Load Topology for this level
+            off_lookup = node_idx * sl_n + lvl_idx * sl_lvl
+            
+            # Since 'node_idx' and 'lvl_idx' are valid, no mask needed for lookup
+            p_idx = tl.load(Lookup_ptr + off_lookup)
+
+            # 2. Check Validity (Mask + Topology)
+            is_valid = (p_idx != -1)
+            if HAS_MASK:
+                mask_val = tl.load(Mask_ptr + off_lookup).to(tl.int8)
+                is_valid = is_valid & (mask_val == 0)
+
+            # 3. Load dS for this level [BLOCK_H]
+            # Offset: (lvl + 1) because level 0 is Self
+            ds_ptr_lvl = ds_base + ((lvl_idx + 1) * sds_lvl)
+            
+            # Mask logic: Head must be valid AND Edge must be valid
+            mask_load = mask_h & is_valid
+            
+            ds_cross = tl.load(ds_ptr_lvl, mask=mask_load, other=0.0)
+
+            # 4. Load K for this Parent [BLOCK_H, BLOCK_D]
+            # Safe Parent Index (redirect invalid to 0)
+            safe_p_idx = tl.where(is_valid, p_idx, 0)
+            
+            # Pointer: [Parent_Node, Head, D_Chunk]
+            off_k_cross = (safe_p_idx * sk_n) + \
+                          (h_idx[:, None] * sk_h) + \
+                          (offs_d[None, :] * sk_d)
+            
+            # Mask logic for K: (Head & Valid_Edge & Dim)
+            mask_k = mask_load[:, None] & mask_d[None, :]
+            
+            k_cross = tl.load(k_batch_base + off_k_cross, mask=mask_k, other=0.0)
+
+            # 5. Accumulate (FP32)
+            # dq += dS_cross * K_cross
+            dq_acc += ds_cross[:, None].to(tl.float32) * k_cross.to(tl.float32)
+
+        # -------------------------------------------------------
+        # C. Write Result
+        # -------------------------------------------------------
+        # Cast back to original dtype
+        off_dq_out = offs_d[None, :] * sdq_d
+        tl.store(dq_base + off_dq_out, dq_acc.to(DQ_ptr.dtype.element_ty), mask=mask_op)
 
 
 class HierarchicalAttentionFunc(torch.autograd.Function):
@@ -1093,7 +1122,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             *DS.stride(), *K.stride(), *idx_table.stride(), *dQ.stride(),
             H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS,
             HAS_MASK=HAS_MASK,
-            num_warps=8
+            num_warps=4
         )
     
         # --- BRANCH 2: dK/dV Per Level (Main Stream) ---
