@@ -804,8 +804,6 @@ def hierarchical_attention_backward_dK_dV_atomic_kernel(
     D: tl.constexpr,
     BLOCK_D: tl.constexpr,
     LEVELS: tl.constexpr,
-    # New Constant: Must be power of 2 >= LEVELS (e.g., 4 or 8)
-    BLOCK_LEVELS: tl.constexpr, 
     HAS_MASK: tl.constexpr,
 ):
     # ------------------------------------------------------------
@@ -817,68 +815,30 @@ def hierarchical_attention_backward_dK_dV_atomic_kernel(
     h_idx = tl.arange(0, BLOCK_H)
     mask_h = h_idx < H
 
-    # Level Indices [BLOCK_LEVELS]
-    offs_lvl = tl.arange(0, BLOCK_LEVELS)
-    mask_lvl = offs_lvl < LEVELS
-
     # ------------------------------------------------------------
     # Base pointers (Node Specific)
     # ------------------------------------------------------------
-    # Pointers for Q, dO, W, dS start at the node/batch offset
+    # Pre-calculate base offsets to avoid re-doing math in the loop
     q_base = Q_ptr + b_idx * sq_b + node_idx * sq_n
     do_base = DO_ptr + b_idx * sdo_b + node_idx * sdo_n
     
-    # Pre-calculate base offsets for W and DS for this specific node/batch
+    # We will offset these by level/head inside the loops
     w_node_base = W_ptr + b_idx * sw_b + node_idx * sw_n
     ds_node_base = DS_ptr + b_idx * sds_b + node_idx * sds_n
-
-    # ------------------------------------------------------------
-    # 1. Load Topology & Validity for ALL Levels [BLOCK_LEVELS]
-    # ------------------------------------------------------------
-    off_lookup = node_idx * sl_n + offs_lvl * sl_lvl
     
-    # Load Parent Indices
-    p_idx = tl.load(Lookup_ptr + off_lookup, mask=mask_lvl, other=-1)
-    
-    # Determine Validity (Parent exists AND Level is within range)
-    is_valid_edge = (p_idx != -1) & mask_lvl
-
-    if HAS_MASK:
-        mask_val = tl.load(Mask_ptr + off_lookup, mask=mask_lvl, other=1).to(tl.int8)
-        is_valid_edge = is_valid_edge & (mask_val == 0)
-
-    # Safe Parent Index (avoid segfaults on invalid levels)
-    safe_p_idx = tl.where(is_valid_edge, p_idx, 0)
+    # Pre-calculate Lookup Pointers
+    lookup_base = Lookup_ptr + node_idx * sl_n
+    mask_ptr_base = Mask_ptr + node_idx * sl_n
 
     # ------------------------------------------------------------
-    # 2. Load Context (W, dS) for ALL Levels [BLOCK_LEVELS, BLOCK_H]
-    # ------------------------------------------------------------
-    # W index corresponds to level + 1
-    w_level_indices = offs_lvl + 1
-    
-    # Pointer Math: [L, 1] + [1, H] -> [L, H]
-    off_w_ds = (w_level_indices[:, None] * sw_lvl) + (h_idx[None, :] * sw_h)
-    
-    # We only load if the edge is valid AND the head is valid
-    # mask_ctx: [BLOCK_LEVELS, BLOCK_H]
-    mask_ctx = is_valid_edge[:, None] & mask_h[None, :]
-
-    w_cross = tl.load(w_node_base + off_w_ds, mask=mask_ctx, other=0.0)
-    ds_cross = tl.load(ds_node_base + (w_level_indices[:, None] * sds_lvl) + (h_idx[None, :] * sds_h), mask=mask_ctx, other=0.0)
-
-    # ------------------------------------------------------------
-    # Loop over D
+    # Loop over D (Split Feature Dim to save registers)
     # ------------------------------------------------------------
     for off_d_start in range(0, D, BLOCK_D):
         offs_d = off_d_start + tl.arange(0, BLOCK_D)
         mask_d = offs_d < D
-        
-        # mask_op: [BLOCK_H, BLOCK_D] (Standard 2D mask for Q/dO)
         mask_op = mask_h[:, None] & mask_d[None, :]
 
-        # ---------------------------------------------------------
-        # 3. Load Q and dO [BLOCK_H, BLOCK_D]
-        # ---------------------------------------------------------
+        # 1. Load Q and dO (reused across all levels)
         q_val = tl.load(
             q_base + h_idx[:, None] * sq_h + offs_d[None, :] * sq_d,
             mask=mask_op, other=0.0
@@ -889,56 +849,66 @@ def hierarchical_attention_backward_dK_dV_atomic_kernel(
         )
 
         # ---------------------------------------------------------
-        # 4. Process SELF (Level 0) - Reverted to Atomic Add
+        # 2. SELF (Level 0) - Atomic
         # ---------------------------------------------------------
         w_self = tl.load(w_node_base + (0 * sw_lvl) + (h_idx * sw_h), mask=mask_h, other=0.0)
         ds_self = tl.load(ds_node_base + (0 * sds_lvl) + (h_idx * sds_h), mask=mask_h, other=0.0)
         
+        # Compute & Write immediately to free registers
+        dk_self = ds_self[:, None] * q_val
+        dv_self = w_self[:, None] * do_val
+        
         off_out_self = b_idx * sdk_b + node_idx * sdk_n
         off_hd = h_idx[:, None] * sdk_h + offs_d[None, :] * sdk_d
         
-        # CHANGED: Reverted to atomic_add as requested
-        tl.atomic_add(
-            DK_ptr + off_out_self + off_hd, 
-            ds_self[:, None] * q_val, 
-            mask=mask_op
-        )
-        tl.atomic_add(
-            DV_ptr + off_out_self + off_hd, 
-            w_self[:, None] * do_val, 
-            mask=mask_op
-        )
+        tl.atomic_add(DK_ptr + off_out_self + off_hd, dk_self, mask=mask_op)
+        tl.atomic_add(DV_ptr + off_out_self + off_hd, dv_self, mask=mask_op)
 
         # ---------------------------------------------------------
-        # 5. Process PARENTS (Vectorized) - 3D Tensor Operations
+        # 3. PARENTS (Loop) - Minimizes Register Pressure
         # ---------------------------------------------------------
-        # Calculate Contributions
-        # ds_cross: [L, H] -> [L, H, 1]
-        # q_val:    [H, D] -> [1, H, D]
-        # Result:   [L, H, D]
-        dk_contrib = ds_cross[:, :, None] * q_val[None, :, :]
-        dv_contrib = w_cross[:, :, None] * do_val[None, :, :]
+        # We process one level at a time.
+        for lvl_idx in range(LEVELS):
+            # A. Load Topology
+            # Note: No 'mask=' needed for lookup, bounds are safe
+            p_idx = tl.load(lookup_base + lvl_idx * sl_lvl)
 
-        # Calculate Output Pointers [L, H, D]
-        # Base parent offset: [L, 1, 1]
-        off_out_p = b_idx * sdk_b + safe_p_idx[:, None, None] * sdk_n
-        
-        # Head/Dim offset: [1, H, D]
-        off_out_hd_3d = h_idx[None, :, None] * sdk_h + offs_d[None, None, :] * sdk_d
-        
-        # Final Pointers
-        ptr_dk_out = DK_ptr + off_out_p + off_out_hd_3d
-        ptr_dv_out = DV_ptr + off_out_p + off_out_hd_3d
+            # B. Check Validity
+            is_valid_edge = p_idx != -1
+            if HAS_MASK:
+                mask_val = tl.load(mask_ptr_base + lvl_idx * sl_lvl).to(tl.int8)
+                is_valid_edge = is_valid_edge & (mask_val == 0)
 
-        # Final Mask [L, H, D]
-        # Valid Edge [L] & Valid Head [H] & Valid Dim [D]
-        mask_final = is_valid_edge[:, None, None] & mask_h[None, :, None] & mask_d[None, None, :]
+            # C. Early Exit Logic (Masking)
+            # We construct a mask for loads. If edge is invalid, we load 0s.
+            mask_load_cross = mask_h & is_valid_edge
+            
+            # Safe Parent Index
+            safe_p_idx = tl.where(is_valid_edge, p_idx, 0)
 
-        # ---------------------------------------------------------
-        # 6. Mass Atomic Add
-        # ---------------------------------------------------------
-        tl.atomic_add(ptr_dk_out, dk_contrib, mask=mask_final)
-        tl.atomic_add(ptr_dv_out, dv_contrib, mask=mask_final)
+            # D. Load Weights/DS (Level + 1)
+            w_idx = lvl_idx + 1
+            w_cross = tl.load(
+                w_node_base + (w_idx * sw_lvl) + (h_idx * sw_h), 
+                mask=mask_load_cross, other=0.0
+            )
+            ds_cross = tl.load(
+                ds_node_base + (w_idx * sds_lvl) + (h_idx * sds_h), 
+                mask=mask_load_cross, other=0.0
+            )
+
+            # E. Compute Gradient contribution
+            # Registers used: [BLOCK_H, BLOCK_D]. 
+            # This overwrites the previous level's data, keeping usage low.
+            dk_contrib = ds_cross[:, None] * q_val
+            dv_contrib = w_cross[:, None] * do_val
+            
+            # F. Atomic Add
+            off_out_p = b_idx * sdk_b + safe_p_idx * sdk_n
+            mask_store = mask_load_cross[:, None] & mask_d[None, :]
+            
+            tl.atomic_add(DK_ptr + off_out_p + off_hd, dk_contrib, mask=mask_store)
+            tl.atomic_add(DV_ptr + off_out_p + off_hd, dv_contrib, mask=mask_store)
 
 
 # ------------------------------------------------------------------
@@ -1264,7 +1234,6 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             H=H, BLOCK_H=BLOCK_H,
             D=D, BLOCK_D=BLOCK_D,
             LEVELS=LEVELS, 
-            BLOCK_LEVELS=BLOCK_LEVELS, # <--- Added this required argument
             HAS_MASK=HAS_MASK,
         
             num_warps=4
