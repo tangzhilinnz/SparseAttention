@@ -915,7 +915,7 @@ def hierarchical_attention_backward_dK_dV_atomic_kernel(
 #  Backward Kernel 3: Compute dQ (Small Kernel)
 # ------------------------------------------------------------------
 @triton.jit
-def hierarchical_attention_backward_dQ_loop_kernel(
+def hierarchical_attention_backward_dQ_kernel(
     DS_ptr, K_ptr, Lookup_ptr, DQ_ptr, Mask_ptr,
     sds_b, sds_n, sds_h, sds_lvl,
     sk_b, sk_n, sk_h, sk_d,
