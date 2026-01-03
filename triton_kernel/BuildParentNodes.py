@@ -1093,7 +1093,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             *DS.stride(), *K.stride(), *idx_table.stride(), *dQ.stride(),
             H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS,
             HAS_MASK=HAS_MASK,
-            num_warps=4
+            num_warps=8
         )
     
         # --- BRANCH 2: dK/dV Per Level (Main Stream) ---
