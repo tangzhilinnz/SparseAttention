@@ -1224,45 +1224,45 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         for lvl in range(1, LEVELS):
             num_nodes_in_level = N >> lvl  
             
-            #if lvl == 1 or lvl == 2 or lvl == 3 or lvl == 4 or lvl == 5 or lvl == 6 or lvl == 7 or lvl == 8 or lvl == 9:
-            grid_lvl = (num_nodes_in_level, B)
+            if lvl == 1 or lvl == 2 or lvl == 3 or lvl == 4 or lvl == 5 or lvl == 6 or lvl == 7 or lvl == 8 or lvl == 9:
+                grid_lvl = (num_nodes_in_level, B)
     
-            hierarchical_attention_backward_dK_dV_kernel[grid_lvl](
-                DS, Q, Weights, grad_output_4d, gather_table,
-                dK, dV,
-                *DS.stride(), *Q.stride(), *Weights.stride(),
-                *grad_output_4d.stride(),
-                *dK.stride(),
-                *gather_table.stride(),
-                H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
+                hierarchical_attention_backward_dK_dV_kernel[grid_lvl](
+                    DS, Q, Weights, grad_output_4d, gather_table,
+                    dK, dV,
+                    *DS.stride(), *Q.stride(), *Weights.stride(),
+                    *grad_output_4d.stride(),
+                    *dK.stride(),
+                    *gather_table.stride(),
+                    H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
         
-                START_NODE_ID=current_start_node,
-                TARGET_LEVEL=lvl, # <--- Pass 1 or 2 here
+                    START_NODE_ID=current_start_node,
+                    TARGET_LEVEL=lvl, # <--- Pass 1 or 2 here
         
-                num_warps=4
-            )
+                    num_warps=4
+                )
             
-            ## --- GENERIC CASE: Level 3+ (Standard Internal Kernel) ---
-            #else:
-            #    gather_width = 1 << lvl        
-            #    BLOCK_L_DYNAMIC = min(64, triton.next_power_of_2(gather_width))
-            #    
-            #    grid_internal = (num_nodes_in_level, B)
-            #    
-            #    hierarchical_attention_backward_dK_dV_internal_kernel[grid_internal](
-            #        DS, Q, Weights, grad_output_4d, gather_table, 
-            #        dK, dV,
-            #        *DS.stride(), *Q.stride(), *Weights.stride(), 
-            #        *grad_output_4d.stride(),
-            #        *dK.stride(),
-            #        *gather_table.stride(),
-            #        H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, 
-            #        
-            #        BLOCK_L=BLOCK_L_DYNAMIC,
-            #        START_NODE_ID=current_start_node,
-            #        
-            #        num_warps=4
-            #    )
+            # --- GENERIC CASE: Level 3+ (Standard Internal Kernel) ---
+            else:
+                gather_width = 1 << lvl        
+                BLOCK_L_DYNAMIC = min(64, triton.next_power_of_2(gather_width))
+                
+                grid_internal = (num_nodes_in_level, B)
+                
+                hierarchical_attention_backward_dK_dV_internal_kernel[grid_internal](
+                    DS, Q, Weights, grad_output_4d, gather_table, 
+                    dK, dV,
+                    *DS.stride(), *Q.stride(), *Weights.stride(), 
+                    *grad_output_4d.stride(),
+                    *dK.stride(),
+                    *gather_table.stride(),
+                    H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, 
+                    
+                    BLOCK_L=BLOCK_L_DYNAMIC,
+                    START_NODE_ID=current_start_node,
+                    
+                    num_warps=4
+                )
             
             # Update offset for the next level
             current_start_node += num_nodes_in_level
