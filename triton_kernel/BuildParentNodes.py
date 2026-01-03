@@ -803,43 +803,24 @@ def hierarchical_attention_backward_dK_dV_atomic_kernel(
     # Constants
     H: tl.constexpr, BLOCK_H: tl.constexpr,
     D: tl.constexpr, BLOCK_D: tl.constexpr,
-    LEVELS: tl.constexpr, BLOCK_LEVELS: tl.constexpr,
+    LEVELS: tl.constexpr, 
     HAS_MASK: tl.constexpr
 ):
-    node_idx = tl.program_id(0) # This is the LEAF index
+    # Grid is (N, B). Each block handles one Leaf Node.
+    node_idx = tl.program_id(0) 
     b_idx = tl.program_id(1)
 
     # 1. Setup Offsets
     h_idx = tl.arange(0, BLOCK_H)
     mask_h = h_idx < H
     
-    # 2. Pre-load Topology for this Leaf
-    # We load the entire row of parents for this leaf
-    offs_lvl = tl.arange(0, BLOCK_LEVELS)
-    mask_lvl = offs_lvl < LEVELS
-    
-    off_lookup = node_idx * sl_n + offs_lvl * sl_lvl
-    
-    # Load Parent Indices
-    parent_indices = tl.load(Lookup_ptr + off_lookup, mask=mask_lvl, other=-1)
-    
-    # Load Mask (User Mask)
-    parent_valid_mask = (parent_indices != -1)
-    if HAS_MASK:
-        val_int8 = tl.load(Mask_ptr + off_lookup, mask=mask_lvl, other=1).to(tl.int8)
-        parent_valid_mask = parent_valid_mask & (val_int8 == 0)
-
-    # 3. Base Pointers for this Leaf
+    # 2. Base Pointers for this Leaf
     q_base = Q_ptr + (b_idx * sq_b) + (node_idx * sq_n)
     do_base = DO_ptr + (b_idx * sdo_b) + (node_idx * sdo_n)
-    
-    # Weights Base
     w_base = W_ptr + (b_idx * sw_b) + (node_idx * sw_n) + (h_idx * sw_h)
-    
-    # DS Base
     ds_base = DS_ptr + (b_idx * sds_b) + (node_idx * sds_n) + (h_idx * sds_h)
 
-    # 4. Loop over Dimension D (Tiling)
+    # 3. Loop over Dimension D (Tiling)
     for off_d_start in range(0, D, BLOCK_D):
         offs_d = off_d_start + tl.arange(0, BLOCK_D)
         mask_d = offs_d < D
@@ -855,14 +836,13 @@ def hierarchical_attention_backward_dK_dV_atomic_kernel(
 
         # --- B. Process SELF (Optimization: Direct Store, No Atomic) ---
         # Level 0 (Self) is always index 0 in Weights/DS. 
-        # The Leaf itself is the only one writing to DK_leaf/DV_leaf in this topology.
         w_self = tl.load(w_base + (0 * sw_lvl), mask=mask_h, other=0.0)
         ds_self = tl.load(ds_base + (0 * sds_lvl), mask=mask_h, other=0.0)
         
         dk_self = ds_self[:, None] * q_val
         dv_self = w_self[:, None] * do_val
         
-        # Store Self Gradients directly
+        # Store Self Gradients directly to Leaf Index
         off_out_self = (b_idx * sdk_b) + (node_idx * sdk_n)
         tl.store(DK_ptr + off_out_self + (h_idx[:, None] * sdk_h) + (offs_d[None, :] * sdk_d), 
                  dk_self, mask=mask_op)
@@ -870,47 +850,47 @@ def hierarchical_attention_backward_dK_dV_atomic_kernel(
                  dv_self, mask=mask_op)
 
         # --- C. Process PARENTS (Loop Levels -> Atomic Add) ---
-        # Iterate through levels 0 to LEVELS-1 (Indices in topology are Level+1, but array index is 0..L)
-        # Note: The 'parent_indices' array maps: Column 0 -> Level 1 Parent, Column 1 -> Level 2 Parent...
-        
+        # We iterate levels and load the specific parent index for that level.
         for lvl_idx in range(LEVELS):
-            # Check validity
-            p_idx = tl.load(Lookup_ptr + off_lookup + lvl_idx * sl_lvl)
+            # 1. Load Neighbor Index (Scalar load, broadcast to block)
+            ptr_lookup = Lookup_ptr + (node_idx * sl_n) + (lvl_idx * sl_lvl)
+            p_idx = tl.load(ptr_lookup)
             
-            # Since we can't branch easily inside the D-loop without splitting blocks,
-            # we rely on the mask. If invalid, we just atomic_add zeros (safe but slightly wasteful),
-            # OR we check condition. Checking condition per scalar is tricky in vectorized code.
-            # Best way: Check if the *entire block* is invalid? No, topology is uniform.
-            # We just use mask logic.
+            # 2. Validity Check
+            is_valid = (p_idx != -1)
             
-            if p_idx != -1: # Scalar check (Uniform across block usually if tree is balanced)
-                # Load Mask for this specific level
-                # Topology Table Index i corresponds to Weight Column i+1
-                valid = parent_valid_mask[0, lvl_idx] # We loaded this into register earlier
-                
-                if valid:
-                    # Load W and DS for this connection
-                    # Weights[Self, L1, L2...] -> Index is lvl_idx + 1
-                    w_idx = lvl_idx + 1 
-                    
-                    w_cross = tl.load(w_base + (w_idx * sw_lvl), mask=mask_h, other=0.0)
-                    ds_cross = tl.load(ds_base + (w_idx * sds_lvl), mask=mask_h, other=0.0)
-                    
-                    # Compute Partial Gradients
-                    # dK_parent += dS_leaf_to_parent * Q_leaf
-                    dk_contrib = ds_cross[:, None] * q_val
-                    
-                    # dV_parent += W_leaf_to_parent * dO_leaf
-                    dv_contrib = w_cross[:, None] * do_val
-                    
-                    # Atomic Add to Parent Address
-                    off_out_parent = (b_idx * sdk_b) + (p_idx * sdk_n)
-                    
-                    tl.atomic_add(DK_ptr + off_out_parent + (h_idx[:, None] * sdk_h) + (offs_d[None, :] * sdk_d), 
-                                  dk_contrib, mask=mask_op)
-                    
-                    tl.atomic_add(DV_ptr + off_out_parent + (h_idx[:, None] * sdk_h) + (offs_d[None, :] * sdk_d), 
-                                  dv_contrib, mask=mask_op)
+            # 3. User Mask Check
+            if HAS_MASK:
+                 ptr_mask = Mask_ptr + (node_idx * sl_n) + (lvl_idx * sl_lvl)
+                 mask_val = tl.load(ptr_mask).to(tl.int8)
+                 is_valid = is_valid & (mask_val == 0)
+            
+            # 4. Safe Pointer Arithmetic
+            # If invalid, map p_idx to 0 to prevent OOB/Segfaults during pointer arithmetic.
+            # The 'is_valid' mask will ensure we don't actually WRITE to 0.
+            safe_p_idx = tl.where(is_valid, p_idx, 0)
+            
+            # 5. Load Weights & Gradients
+            # Weights/DS Index is Level + 1
+            w_idx = lvl_idx + 1
+            w_cross = tl.load(w_base + (w_idx * sw_lvl), mask=mask_h, other=0.0)
+            ds_cross = tl.load(ds_base + (w_idx * sds_lvl), mask=mask_h, other=0.0)
+            
+            # 6. Compute Partial Gradients
+            dk_contrib = ds_cross[:, None] * q_val
+            dv_contrib = w_cross[:, None] * do_val
+            
+            # 7. Atomic Add with Mask
+            off_out_p = (b_idx * sdk_b) + (safe_p_idx * sdk_n)
+            
+            # Combine loop bounds mask with validity mask
+            final_mask = mask_op & is_valid
+            
+            target_k = DK_ptr + off_out_p + (h_idx[:, None] * sdk_h) + (offs_d[None, :] * sdk_d)
+            target_v = DV_ptr + off_out_p + (h_idx[:, None] * sdk_h) + (offs_d[None, :] * sdk_d)
+            
+            tl.atomic_add(target_k, dk_contrib, mask=final_mask)
+            tl.atomic_add(target_v, dv_contrib, mask=final_mask)
 
 
 # ------------------------------------------------------------------
