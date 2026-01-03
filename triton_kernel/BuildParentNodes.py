@@ -1081,21 +1081,20 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         dV = torch.zeros_like(V)
         dQ = torch.empty_like(Q)
     
-        main_stream = torch.cuda.current_stream()
-        side_stream = torch.cuda.Stream()
-        
-        side_stream.wait_stream(main_stream)
+        #main_stream = torch.cuda.current_stream()
+        #side_stream = torch.cuda.Stream()
+        #side_stream.wait_stream(main_stream)
     
         # --- BRANCH 1: dQ (Side Stream) ---
-        with torch.cuda.stream(side_stream):
-            grid_dq = (N, B)
-            hierarchical_attention_backward_dQ_kernel[grid_dq](
-                DS, K, idx_table, dQ, mask_ptr_safe, 
-                *DS.stride(), *K.stride(), *idx_table.stride(), *dQ.stride(),
-                H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS,
-                HAS_MASK=HAS_MASK,
-                num_warps=4
-            )
+        #with torch.cuda.stream(side_stream):
+        grid_dq = (N, B)
+        hierarchical_attention_backward_dQ_kernel[grid_dq](
+            DS, K, idx_table, dQ, mask_ptr_safe, 
+            *DS.stride(), *K.stride(), *idx_table.stride(), *dQ.stride(),
+            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS,
+            HAS_MASK=HAS_MASK,
+            num_warps=4
+        )
     
         # --- BRANCH 2: dK/dV Per Level (Main Stream) ---
         
@@ -1140,7 +1139,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             
             current_start_node += num_nodes_in_level
     
-        main_stream.wait_stream(side_stream)
+        #main_stream.wait_stream(side_stream)
         
         return dQ, dK, dV, None, None, None
 
