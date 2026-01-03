@@ -1135,7 +1135,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
                 BLOCK_L=BLOCK_L_DYNAMIC,
                 START_NODE_ID=current_start_node,
                 
-                num_warps=8
+                num_warps=4
             )
             
             current_start_node += num_nodes_in_level
