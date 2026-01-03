@@ -804,28 +804,67 @@ def hierarchical_attention_backward_dK_dV_atomic_kernel(
     D: tl.constexpr,
     BLOCK_D: tl.constexpr,
     LEVELS: tl.constexpr,
+    # New Constant: Must be power of 2 >= LEVELS (e.g., 4 or 8)
+    BLOCK_LEVELS: tl.constexpr, 
     HAS_MASK: tl.constexpr,
 ):
     # ------------------------------------------------------------
-    # Grid: (node_idx = leaf id, b_idx = batch)
+    # Grid & Indices
     # ------------------------------------------------------------
     node_idx = tl.program_id(0)
     b_idx = tl.program_id(1)
 
-    # ------------------------------------------------------------
-    # Head indices
-    # ------------------------------------------------------------
     h_idx = tl.arange(0, BLOCK_H)
     mask_h = h_idx < H
 
+    # Level Indices [BLOCK_LEVELS]
+    offs_lvl = tl.arange(0, BLOCK_LEVELS)
+    mask_lvl = offs_lvl < LEVELS
+
     # ------------------------------------------------------------
-    # Base pointers
+    # Base pointers (Node Specific)
     # ------------------------------------------------------------
+    # Pointers for Q, dO, W, dS start at the node/batch offset
     q_base = Q_ptr + b_idx * sq_b + node_idx * sq_n
     do_base = DO_ptr + b_idx * sdo_b + node_idx * sdo_n
+    
+    # Pre-calculate base offsets for W and DS for this specific node/batch
+    w_node_base = W_ptr + b_idx * sw_b + node_idx * sw_n
+    ds_node_base = DS_ptr + b_idx * sds_b + node_idx * sds_n
 
-    w_base = W_ptr + b_idx * sw_b + node_idx * sw_n + h_idx * sw_h
-    ds_base = DS_ptr + b_idx * sds_b + node_idx * sds_n + h_idx * sds_h
+    # ------------------------------------------------------------
+    # 1. Load Topology & Validity for ALL Levels [BLOCK_LEVELS]
+    # ------------------------------------------------------------
+    off_lookup = node_idx * sl_n + offs_lvl * sl_lvl
+    
+    # Load Parent Indices
+    p_idx = tl.load(Lookup_ptr + off_lookup, mask=mask_lvl, other=-1)
+    
+    # Determine Validity (Parent exists AND Level is within range)
+    is_valid_edge = (p_idx != -1) & mask_lvl
+
+    if HAS_MASK:
+        mask_val = tl.load(Mask_ptr + off_lookup, mask=mask_lvl, other=1).to(tl.int8)
+        is_valid_edge = is_valid_edge & (mask_val == 0)
+
+    # Safe Parent Index (avoid segfaults on invalid levels)
+    safe_p_idx = tl.where(is_valid_edge, p_idx, 0)
+
+    # ------------------------------------------------------------
+    # 2. Load Context (W, dS) for ALL Levels [BLOCK_LEVELS, BLOCK_H]
+    # ------------------------------------------------------------
+    # W index corresponds to level + 1
+    w_level_indices = offs_lvl + 1
+    
+    # Pointer Math: [L, 1] + [1, H] -> [L, H]
+    off_w_ds = (w_level_indices[:, None] * sw_lvl) + (h_idx[None, :] * sw_h)
+    
+    # We only load if the edge is valid AND the head is valid
+    # mask_ctx: [BLOCK_LEVELS, BLOCK_H]
+    mask_ctx = is_valid_edge[:, None] & mask_h[None, :]
+
+    w_cross = tl.load(w_node_base + off_w_ds, mask=mask_ctx, other=0.0)
+    ds_cross = tl.load(ds_node_base + (w_level_indices[:, None] * sds_lvl) + (h_idx[None, :] * sds_h), mask=mask_ctx, other=0.0)
 
     # ------------------------------------------------------------
     # Loop over D
@@ -833,98 +872,73 @@ def hierarchical_attention_backward_dK_dV_atomic_kernel(
     for off_d_start in range(0, D, BLOCK_D):
         offs_d = off_d_start + tl.arange(0, BLOCK_D)
         mask_d = offs_d < D
+        
+        # mask_op: [BLOCK_H, BLOCK_D] (Standard 2D mask for Q/dO)
         mask_op = mask_h[:, None] & mask_d[None, :]
 
-        # Load Q and dO
+        # ---------------------------------------------------------
+        # 3. Load Q and dO [BLOCK_H, BLOCK_D]
+        # ---------------------------------------------------------
         q_val = tl.load(
             q_base + h_idx[:, None] * sq_h + offs_d[None, :] * sq_d,
-            mask=mask_op,
-            other=0.0,
+            mask=mask_op, other=0.0
         )
-
         do_val = tl.load(
             do_base + h_idx[:, None] * sdo_h + offs_d[None, :] * sdo_d,
-            mask=mask_op,
-            other=0.0,
+            mask=mask_op, other=0.0
         )
 
-        # =========================================================
-        # SELF (level 0) ATOMIC
-        # =========================================================
-        w_self = tl.load(w_base + 0 * sw_lvl, mask=mask_h, other=0.0)
-        ds_self = tl.load(ds_base + 0 * sds_lvl, mask=mask_h, other=0.0)
-
-        dk_self = ds_self[:, None] * q_val
-        dv_self = w_self[:, None] * do_val
-
+        # ---------------------------------------------------------
+        # 4. Process SELF (Level 0) - Reverted to Atomic Add
+        # ---------------------------------------------------------
+        w_self = tl.load(w_node_base + (0 * sw_lvl) + (h_idx * sw_h), mask=mask_h, other=0.0)
+        ds_self = tl.load(ds_node_base + (0 * sds_lvl) + (h_idx * sds_h), mask=mask_h, other=0.0)
+        
         off_out_self = b_idx * sdk_b + node_idx * sdk_n
-
+        off_hd = h_idx[:, None] * sdk_h + offs_d[None, :] * sdk_d
+        
+        # CHANGED: Reverted to atomic_add as requested
         tl.atomic_add(
-            DK_ptr + off_out_self
-            + h_idx[:, None] * sdk_h
-            + offs_d[None, :] * sdk_d,
-            dk_self,
-            mask=mask_op,
+            DK_ptr + off_out_self + off_hd, 
+            ds_self[:, None] * q_val, 
+            mask=mask_op
+        )
+        tl.atomic_add(
+            DV_ptr + off_out_self + off_hd, 
+            w_self[:, None] * do_val, 
+            mask=mask_op
         )
 
-        tl.atomic_add(
-            DV_ptr + off_out_self
-            + h_idx[:, None] * sdk_h
-            + offs_d[None, :] * sdk_d,
-            dv_self,
-            mask=mask_op,
-        )
+        # ---------------------------------------------------------
+        # 5. Process PARENTS (Vectorized) - 3D Tensor Operations
+        # ---------------------------------------------------------
+        # Calculate Contributions
+        # ds_cross: [L, H] -> [L, H, 1]
+        # q_val:    [H, D] -> [1, H, D]
+        # Result:   [L, H, D]
+        dk_contrib = ds_cross[:, :, None] * q_val[None, :, :]
+        dv_contrib = w_cross[:, :, None] * do_val[None, :, :]
 
-        # =========================================================
-        # PARENTS (levels 1+)
-        # =========================================================
-        for lvl_idx in range(LEVELS):
-            # Load parent index
-            # REMOVED 'other=-1'. Assuming node_idx is valid (within grid bounds), 
-            # this memory location is safe to access.
-            p_idx = tl.load(
-                Lookup_ptr + node_idx * sl_n + lvl_idx * sl_lvl
-            )
+        # Calculate Output Pointers [L, H, D]
+        # Base parent offset: [L, 1, 1]
+        off_out_p = b_idx * sdk_b + safe_p_idx[:, None, None] * sdk_n
+        
+        # Head/Dim offset: [1, H, D]
+        off_out_hd_3d = h_idx[None, :, None] * sdk_h + offs_d[None, None, :] * sdk_d
+        
+        # Final Pointers
+        ptr_dk_out = DK_ptr + off_out_p + off_out_hd_3d
+        ptr_dv_out = DV_ptr + off_out_p + off_out_hd_3d
 
-            is_valid = p_idx != -1
+        # Final Mask [L, H, D]
+        # Valid Edge [L] & Valid Head [H] & Valid Dim [D]
+        mask_final = is_valid_edge[:, None, None] & mask_h[None, :, None] & mask_d[None, None, :]
 
-            if HAS_MASK:
-                # REMOVED 'other=1'
-                mask_val = tl.load(
-                    Mask_ptr + node_idx * sl_n + lvl_idx * sl_lvl
-                ).to(tl.int8)
-                is_valid = is_valid & (mask_val == 0)
-
-            safe_p_idx = tl.where(is_valid, p_idx, 0)
-
-            # Load weights / ds (level + 1)
-            w_idx = lvl_idx + 1
-            w_cross = tl.load(w_base + w_idx * sw_lvl, mask=mask_h, other=0.0)
-            ds_cross = tl.load(ds_base + w_idx * sds_lvl, mask=mask_h, other=0.0)
-
-            dk_contrib = ds_cross[:, None] * q_val
-            dv_contrib = w_cross[:, None] * do_val
-
-            valid_mask = is_valid & mask_h
-            final_mask = valid_mask[:, None] & mask_d[None, :]
-
-            off_out_p = b_idx * sdk_b + safe_p_idx * sdk_n
-
-            tl.atomic_add(
-                DK_ptr + off_out_p
-                + h_idx[:, None] * sdk_h
-                + offs_d[None, :] * sdk_d,
-                dk_contrib,
-                mask=final_mask,
-            )
-
-            tl.atomic_add(
-                DV_ptr + off_out_p
-                + h_idx[:, None] * sdk_h
-                + offs_d[None, :] * sdk_d,
-                dv_contrib,
-                mask=final_mask,
-            )
+        # ---------------------------------------------------------
+        # 6. Mass Atomic Add
+        # ---------------------------------------------------------
+        tl.atomic_add(ptr_dk_out, dk_contrib, mask=mask_final)
+        tl.atomic_add(ptr_dv_out, dv_contrib, mask=mask_final)
 
 
 # ------------------------------------------------------------------
@@ -1161,104 +1175,105 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
     #     return dQ, dK, dV, None, None, None
 
     @staticmethod
-    def backward(ctx, grad_output):
-        # 1. Retrieve Tensors
-        Q, K, V, idx_table, Weights, mask_table = ctx.saved_tensors
-        sm_scale, H, BLOCK_H, D, BLOCK_D, LEVELS, BLOCK_LEVELS = ctx.constants
-        
-        # [CRITICAL FIX] View as 4D to generate 4 stride values
-        # grad_output comes in as [B, N, D], but kernels need [B, N, H, D] strides
-        grad_output = grad_output.contiguous()
-        B, N = Q.shape[0], Q.shape[1]
-        grad_output_4d = grad_output.view(B, N, H, D) 
+def backward(ctx, grad_output):
+    # 1. Retrieve Tensors
+    Q, K, V, idx_table, Weights, mask_table = ctx.saved_tensors
+    sm_scale, H, BLOCK_H, D, BLOCK_D, LEVELS, BLOCK_LEVELS = ctx.constants
+    
+    # [CRITICAL FIX] View as 4D to generate 4 stride values
+    # grad_output comes in as [B, N, D], but kernels need [B, N, H, D] strides
+    grad_output = grad_output.contiguous()
+    B, N = Q.shape[0], Q.shape[1]
+    grad_output_4d = grad_output.view(B, N, H, D) 
 
-        # 2. Compute dS (Runs on Main Stream)
-        DS = torch.empty_like(Weights)
-        grid_ds = (N, B)
-        
-        HAS_MASK = (mask_table is not None)
-        mask_ptr_safe = mask_table if HAS_MASK else Weights
+    # 2. Compute dS (Runs on Main Stream)
+    DS = torch.empty_like(Weights)
+    grid_ds = (N, B)
+    
+    HAS_MASK = (mask_table is not None)
+    mask_ptr_safe = mask_table if HAS_MASK else Weights
 
-        # (Assumes dS kernel exists in scope)
-        hierarchical_attention_backward_dS_kernel[grid_ds](
-            # Pass the 4D view
-            grad_output_4d, Weights, V, idx_table, DS, mask_ptr_safe,
-            
-            # Pass the 4D strides
-            *grad_output_4d.stride(), 
-            *Weights.stride(),            
-            *V.stride(),            
-            *idx_table.stride(),    
-            *DS.stride(),            
-            
-            sm_scale, H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, 
-            LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS,
+    # (Assumes dS kernel exists in scope)
+    hierarchical_attention_backward_dS_kernel[grid_ds](
+        # Pass the 4D view
+        grad_output_4d, Weights, V, idx_table, DS, mask_ptr_safe,
+        
+        # Pass the 4D strides
+        *grad_output_4d.stride(), 
+        *Weights.stride(),            
+        *V.stride(),            
+        *idx_table.stride(),    
+        *DS.stride(),            
+        
+        sm_scale, H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, 
+        LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS,
+        HAS_MASK=HAS_MASK,
+        num_warps=4
+    )
+
+    # --- SETUP PARALLELISM ---
+    # Initialize dK/dV to Zeros for Atomic Accumulation
+    dK = torch.zeros_like(K)
+    dV = torch.zeros_like(V)
+    dQ = torch.empty_like(Q)
+
+    main_stream = torch.cuda.current_stream()
+    side_stream = torch.cuda.Stream()
+    
+    side_stream.wait_stream(main_stream)
+
+    # --- BRANCH 1: dQ (Side Stream) ---
+    with torch.cuda.stream(side_stream):
+        grid_dq = (N, B)
+        # (Assumes dQ kernel exists in scope)
+        hierarchical_attention_backward_dQ_kernel[grid_dq](
+            DS, K, idx_table, dQ, mask_ptr_safe, 
+            *DS.stride(), *K.stride(), *idx_table.stride(), *dQ.stride(),
+            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS,
             HAS_MASK=HAS_MASK,
             num_warps=4
         )
+
+    # --- BRANCH 2: dK/dV (Main Stream - Vectorized Atomic) ---
+    # Replaced the scalar loop kernel with the vectorized kernel.
+    grid_atomic = (N, B)
     
-        # --- SETUP PARALLELISM ---
-        # Initialize dK/dV to Zeros for Atomic Accumulation
-        dK = torch.zeros_like(K)
-        dV = torch.zeros_like(V)
-        dQ = torch.empty_like(Q)
-    
-        main_stream = torch.cuda.current_stream()
-        side_stream = torch.cuda.Stream()
+    # Use the VECTORIZED Kernel
+    hierarchical_attention_backward_dK_dV_atomic_kernel[grid_atomic](
+        # Inputs
+        DS,              # DS_ptr
+        grad_output_4d,  # DO_ptr
+        Q,               # Q_ptr
+        Weights,         # W_ptr
+        idx_table,       # Lookup_ptr
+        mask_ptr_safe,   # Mask_ptr
         
-        side_stream.wait_stream(main_stream)
-    
-        # --- BRANCH 1: dQ (Side Stream) ---
-        with torch.cuda.stream(side_stream):
-            grid_dq = (N, B)
-            # (Assumes dQ kernel exists in scope)
-            hierarchical_attention_backward_dQ_kernel[grid_dq](
-                DS, K, idx_table, dQ, mask_ptr_safe, 
-                *DS.stride(), *K.stride(), *idx_table.stride(), *dQ.stride(),
-                H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS,
-                HAS_MASK=HAS_MASK,
-                num_warps=4
-            )
-    
-        # --- BRANCH 2: dK/dV (Main Stream - Fused Atomic) ---
-        # Replaced the separate Leaf/Internal kernels with one atomic kernel.
-        # This iterates over Leaf nodes (N) and atomically adds gradients to parents.
-        grid_atomic = (N, B)
+        # Outputs (Accumulators)
+        dK,              # DK_ptr
+        dV,              # DV_ptr
         
-        hierarchical_attention_backward_dK_dV_atomic_kernel[grid_atomic](
-            # Inputs
-            DS,              # DS_ptr
-            grad_output_4d,  # DO_ptr
-            Q,               # Q_ptr
-            Weights,         # W_ptr
-            idx_table,       # Lookup_ptr
-            mask_ptr_safe,   # Mask_ptr
-            
-            # Outputs (Accumulators)
-            dK,              # DK_ptr
-            dV,              # DV_ptr
-            
-            # Strides
-            *DS.stride(),             # sds_b, sds_n, sds_h, sds_lvl
-            *grad_output_4d.stride(), # sdo_b, sdo_n, sdo_h, sdo_d
-            *Q.stride(),              # sq_b, sq_n, sq_h, sq_d
-            *Weights.stride(),        # sw_b, sw_n, sw_h, sw_lvl
-            *idx_table.stride(),      # sl_n, sl_lvl (Assumes [N, LEVELS])
-            *dK.stride(),             # sdk_b, sdk_n, sdk_h, sdk_d
-            
-            # Constants
-            H=H, BLOCK_H=BLOCK_H,
-            D=D, BLOCK_D=BLOCK_D,
-            LEVELS=LEVELS, 
-            HAS_MASK=HAS_MASK,
-            
-            num_warps=4
-        )
-    
-        # Synchronize streams
-        main_stream.wait_stream(side_stream)
+        # Strides
+        *DS.stride(),             # sds_b, sds_n, sds_h, sds_lvl
+        *grad_output_4d.stride(), # sdo_b, sdo_n, sdo_h, sdo_d
+        *Q.stride(),              # sq_b, sq_n, sq_h, sq_d
+        *Weights.stride(),        # sw_b, sw_n, sw_h, sw_lvl
+        *idx_table.stride(),      # sl_n, sl_lvl (Assumes [N, LEVELS])
+        *dK.stride(),             # sdk_b, sdk_n, sdk_h, sdk_d
         
-        return dQ, dK, dV, None, None, None, None
+        # Constants
+        H=H, BLOCK_H=BLOCK_H,
+        D=D, BLOCK_D=BLOCK_D,
+        LEVELS=LEVELS, 
+        BLOCK_LEVELS=BLOCK_LEVELS, # <--- Added this required argument
+        HAS_MASK=HAS_MASK,
+        
+        num_warps=4
+    )
+
+    # Synchronize streams
+    main_stream.wait_stream(side_stream)
+    
+    return dQ, dK, dV, None, None, None, None
 
 def hierarchical_fused_attention(Q, K, V, idx_table, mask_table=None):
     """
