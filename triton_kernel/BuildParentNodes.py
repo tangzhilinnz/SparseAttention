@@ -1243,12 +1243,20 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         for lvl in range(1, LEVELS):
             num_nodes_in_level = N >> lvl  
             
-            if lvl < 7:
+            #if lvl < 8:
+            #    current_split_k = 1
+            #elif lvl < 10:
+            #    current_split_k = 4
+            #else:
+            #    current_split_k = 16
+
+            # --- Dynamic Split-K Logic ---
+            if lvl < 8:
                 current_split_k = 1
-            elif lvl < 10:
-                current_split_k = 4
             else:
-                current_split_k = 16
+                # 2^(lvl - 7) implementation using bit shift
+                current_split_k = 1 << (lvl - 7)    
+
 
             # Calculate Grid
             # Multiply node count by split factor to launch more blocks
@@ -2139,7 +2147,7 @@ def run_full_suite_update_X_from_Y():
     # 1. SETUP & CORRECTNESS CHECK
     # ==========================================================================
     # [CONFIG] Choose your dtype here: torch.float32 or torch.float16
-    check_dtype = torch.float32
+    check_dtype = torch.float16
     
     print(f"{'='*60}")
     print(f"1. CORRECTNESS CHECK ({check_dtype}) - update_X_from_Y")
