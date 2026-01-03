@@ -467,7 +467,7 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def hierarchical_attention_backward_dS_loop_kernel(
+def hierarchical_attention_backward_dS_kernel(
     DO_ptr, W_ptr, V_ptr, Lookup_ptr, DS_ptr, Mask_ptr,
     # Strides
     sdo_b, sdo_n, sdo_h, sdo_d,
