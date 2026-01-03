@@ -1040,16 +1040,17 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         HAS_MASK = (mask_table is not None)
         mask_ptr_safe = mask_table if HAS_MASK else Weights
 
+        # (Assumes dS kernel exists in scope)
         hierarchical_attention_backward_dS_kernel[grid_ds](
             # Pass the 4D view
             grad_output_4d, Weights, V, idx_table, DS, mask_ptr_safe,
             
             # Pass the 4D strides
             *grad_output_4d.stride(), 
-            *Weights.stride(),           
+            *Weights.stride(),            
             *V.stride(),            
             *idx_table.stride(),    
-            *DS.stride(),           
+            *DS.stride(),            
             
             sm_scale, H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, 
             LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS,
@@ -1058,6 +1059,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         )
     
         # --- SETUP PARALLELISM ---
+        # Initialize dK/dV to Zeros for Atomic Accumulation
         dK = torch.zeros_like(K)
         dV = torch.zeros_like(V)
         dQ = torch.empty_like(Q)
@@ -1070,6 +1072,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         # --- BRANCH 1: dQ (Side Stream) ---
         with torch.cuda.stream(side_stream):
             grid_dq = (N, B)
+            # (Assumes dQ kernel exists in scope)
             hierarchical_attention_backward_dQ_kernel[grid_dq](
                 DS, K, idx_table, dQ, mask_ptr_safe, 
                 *DS.stride(), *K.stride(), *idx_table.stride(), *dQ.stride(),
@@ -1078,52 +1081,45 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
                 num_warps=4
             )
     
-        # --- BRANCH 2: dK/dV Per Level (Main Stream) ---
+        # --- BRANCH 2: dK/dV (Main Stream - Fused Atomic) ---
+        # Replaced the separate Leaf/Internal kernels with one atomic kernel.
+        # This iterates over Leaf nodes (N) and atomically adds gradients to parents.
+        grid_atomic = (N, B)
         
-        # Step A: Launch Specialized Leaf Kernel (Level 0)
-        grid_leaf = (N, B)
-        hierarchical_attention_backward_dK_dV_leaf_kernel[grid_leaf](
-            DS, Q, Weights, grad_output_4d, gather_table, # <--- Use 4D
-            dK, dV,
-            *DS.stride(), *Q.stride(), *Weights.stride(), 
-            *grad_output_4d.stride(), # <--- Use 4D Strides
-            *dK.stride(),
-            *gather_table.stride(),
-            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
+        hierarchical_attention_backward_dK_dV_atomic_kernel[grid_atomic](
+            # Inputs
+            DS,              # DS_ptr
+            grad_output_4d,  # DO_ptr
+            Q,               # Q_ptr
+            Weights,         # W_ptr
+            idx_table,       # Lookup_ptr
+            mask_ptr_safe,   # Mask_ptr
+            
+            # Outputs (Accumulators)
+            dK,              # DK_ptr
+            dV,              # DV_ptr
+            
+            # Strides
+            *DS.stride(),             # sds_b, sds_n, sds_h, sds_lvl
+            *grad_output_4d.stride(), # sdo_b, sdo_n, sdo_h, sdo_d
+            *Q.stride(),              # sq_b, sq_n, sq_h, sq_d
+            *Weights.stride(),        # sw_b, sw_n, sw_h, sw_lvl
+            *idx_table.stride(),      # sl_n, sl_lvl (Assumes [N, LEVELS])
+            *dK.stride(),             # sdk_b, sdk_n, sdk_h, sdk_d
+            
+            # Constants
+            H=H, BLOCK_H=BLOCK_H,
+            D=D, BLOCK_D=BLOCK_D,
+            LEVELS=LEVELS, 
+            HAS_MASK=HAS_MASK,
+            
             num_warps=4
         )
     
-        # Step B: Launch Generic Internal Kernels (Levels 1 to N)
-        current_start_node = N 
-        
-        for lvl in range(1, LEVELS):
-            num_nodes_in_level = N >> lvl  
-            gather_width = 1 << lvl        
-            
-            BLOCK_L_DYNAMIC = min(128, triton.next_power_of_2(gather_width))
-            
-            grid_internal = (num_nodes_in_level, B)
-            
-            hierarchical_attention_backward_dK_dV_internal_kernel[grid_internal](
-                DS, Q, Weights, grad_output_4d, gather_table, # <--- Use 4D
-                dK, dV,
-                *DS.stride(), *Q.stride(), *Weights.stride(), 
-                *grad_output_4d.stride(), # <--- Use 4D Strides
-                *dK.stride(),
-                *gather_table.stride(),
-                H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, 
-                
-                BLOCK_L=BLOCK_L_DYNAMIC,
-                START_NODE_ID=current_start_node,
-                
-                num_warps=4
-            )
-            
-            current_start_node += num_nodes_in_level
-    
+        # Synchronize streams
         main_stream.wait_stream(side_stream)
         
-        return dQ, dK, dV, None, None, None
+        return dQ, dK, dV, None, None, None, None
 
     # @staticmethod
     # def backward(ctx, grad_output):
