@@ -1011,11 +1011,10 @@ def hierarchical_attention_backward_dQ_kernel(
 
 class HierarchicalAttentionFunc(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, Q, K, V, idx_table, gather_table, mask_table=None):
+    def forward(ctx, Q, K, V, idx_table, mask_table=None):
         # Alignment checks
         Q = Q.contiguous(); K = K.contiguous(); V = V.contiguous()
         idx_table = idx_table.contiguous()
-        if gather_table is not None: gather_table = gather_table.contiguous()
         if mask_table is not None: mask_table = mask_table.contiguous()
 
         B, N, H, D = Q.shape
@@ -1053,7 +1052,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         )
         
         # [UPDATE] Save mask_table for backward. PyTorch handles 'None' correctly.
-        ctx.save_for_backward(Q, K, V, idx_table, gather_table, Weights, mask_table)
+        ctx.save_for_backward(Q, K, V, idx_table, Weights, mask_table)
         ctx.constants = (sm_scale, H, BLOCK_H, D, BLOCK_D, LEVELS, BLOCK_LEVELS)
         return Out
 
@@ -1164,7 +1163,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         # 1. Retrieve Tensors
-        Q, K, V, idx_table, gather_table, Weights, mask_table = ctx.saved_tensors
+        Q, K, V, idx_table, Weights, mask_table = ctx.saved_tensors
         sm_scale, H, BLOCK_H, D, BLOCK_D, LEVELS, BLOCK_LEVELS = ctx.constants
         
         # [CRITICAL FIX] View as 4D to generate 4 stride values
@@ -1261,11 +1260,11 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         
         return dQ, dK, dV, None, None, None, None
 
-def hierarchical_fused_attention(Q, K, V, idx_table, gather_table, mask_table=None):
+def hierarchical_fused_attention(Q, K, V, idx_table, mask_table=None):
     """
     Wrapper for the custom autograd function.
     """
-    return HierarchicalAttentionFunc.apply(Q, K, V, idx_table, gather_table, mask_table)
+    return HierarchicalAttentionFunc.apply(Q, K, V, idx_table, mask_table)
 
 
 ## ============================================================================================= ##
@@ -1781,7 +1780,7 @@ class HierarchicalSparseAttentionTriton(nn.Module):
         
         idx_table = tables["forward_idx"]
         neighbor_mask = tables["forward_mask"]
-        gather_table = tables["backward_gather"]
+        #gather_table = tables["backward_gather"]
         
         # If active_mask is None, kernel assumes full visibility.
         # If is_causal, we pass the pre-computed mask from the table.
@@ -1790,7 +1789,6 @@ class HierarchicalSparseAttentionTriton(nn.Module):
         output_leaf_heads = hierarchical_fused_attention(
             Q, K_full, V_full, 
             idx_table,      # Forward Topology
-            gather_table,   # Backward Topology (Was missing!)
             active_mask     # Mask Table
         )
     
