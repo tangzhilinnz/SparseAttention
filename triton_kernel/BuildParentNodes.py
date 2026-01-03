@@ -1251,7 +1251,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             #    current_split_k = 16
 
             # --- Dynamic Split-K Logic ---
-            if lvl < 10:
+            if lvl < 8:
                 current_split_k = 1
             else:
                 # 2^(lvl - 7) implementation using bit shift
