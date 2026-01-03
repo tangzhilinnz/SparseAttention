@@ -1255,7 +1255,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
                 current_split_k = 1
             else:
                 # 2^(lvl - 7) implementation using bit shift
-                current_split_k = 1 << (lvl - 7)    
+                current_split_k = 1 << (lvl - 6)    
 
 
             # Calculate Grid
