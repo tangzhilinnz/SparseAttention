@@ -1976,7 +1976,7 @@ def run_full_suite_update_X_from_Y():
     # 1. Setup Dimensions for Correctness
     # N needs to be a power of 2 usually for easier tree construction logic, 
     # though strict power of 2 isn't always required depending on your idx_table implementation.
-    B, N, D, H = 2, 256, 64, 16
+    B, N, D, H = 32, 2048, 64, 16
     dim = H * D
     
     # 2. Initialize Model (Dropout=0.0 for deterministic check)
