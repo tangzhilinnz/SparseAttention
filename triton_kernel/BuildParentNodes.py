@@ -1498,7 +1498,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         grid = (N, B)
         BLOCK_H = triton.next_power_of_2(H)
         BLOCK_LEVELS = triton.next_power_of_2(LEVELS)
-        BLOCK_D = min(128, triton.next_power_of_2(D))
+        BLOCK_D = min(64, triton.next_power_of_2(D))
         sm_scale = 1.0 / math.sqrt(D)
         
         hierarchical_attention_forward_kernel[grid](
@@ -1635,51 +1635,37 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         B, N = Q.shape[0], Q.shape[1]
         grad_output_4d = grad_output.view(B, N, H, D) 
 
-        # -----------------------------------------------------------
-        # 2. FUSED STEP: Compute dS and dQ together
-        # -----------------------------------------------------------
-        # Allocations
+        # 2. Compute dS (Main Stream)
         DS = torch.empty_like(Weights)
-        dQ = torch.empty_like(Q)
-        
-        # Mask Setup
+        grid_ds = (N, B)
         HAS_MASK = (mask_table is not None)
-        mask_ptr_safe = mask_table if HAS_MASK else Weights # Dummy
-        
-        # Grid: (Nodes, Batch) - Same as before
-        grid_fused_ds_dq = (N, B)
+        mask_ptr_safe = mask_table if HAS_MASK else Weights
 
-        hierarchical_attention_backward_dS_dQ_fused_kernel[grid_fused_ds_dq](
-            # Pointers
-            grad_output_4d, Weights, V, K, idx_table, 
-            DS, dQ, mask_ptr_safe,
-            
-            # Strides (All 4D/3D strides)
-            *grad_output_4d.stride(), # sdo
-            *Weights.stride(),        # sw
-            *V.stride(),              # sv
-            *K.stride(),              # sk
-            *DS.stride(),             # sds
-            *dQ.stride(),             # sdq
-            *idx_table.stride(),      # sl
-            
-            # Constants
-            sm_scale,
-            H=H, BLOCK_H=BLOCK_H, 
-            D=D, BLOCK_D=BLOCK_D, # Standard Block size for register reuse
-            LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS,
-            HAS_MASK=HAS_MASK,
-            num_warps=4
+        hierarchical_attention_backward_dS_kernel[grid_ds](
+            grad_output_4d, Weights, V, idx_table, DS, mask_ptr_safe,
+            *grad_output_4d.stride(), *Weights.stride(), *V.stride(), 
+            *idx_table.stride(), *DS.stride(),            
+            sm_scale, H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=32, 
+            LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS, HAS_MASK=HAS_MASK, num_warps=4
         )
 
-        # -----------------------------------------------------------
-        # 3. Compute dK / dV (Dependent on dS)
-        # -----------------------------------------------------------
-        # Allocations
+        # --- SETUP PARALLELISM ---
         dK = torch.zeros_like(K)
         dV = torch.zeros_like(V)
+        dQ = torch.empty_like(Q)
 
-        # --- Step A: Leaf Kernel (Level 0) ---
+        # --- BRANCH 1: dQ (Independent) ---
+        grid_dq = (N, B)
+        hierarchical_attention_backward_dQ_kernel[grid_dq](
+            DS, K, idx_table, dQ, mask_ptr_safe, 
+            *DS.stride(), *K.stride(), *idx_table.stride(), *dQ.stride(),
+            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=32, LEVELS=LEVELS,
+            HAS_MASK=HAS_MASK, num_warps=4
+        )
+
+        # --- BRANCH 2: dK/dV (Dependent on dS) ---
+        
+        # Step A: Leaf Kernel (Level 0)
         grid_leaf = (N, B)
         hierarchical_attention_backward_dK_dV_leaf_kernel[grid_leaf](
             DS, Q, Weights, grad_output_4d, gather_table,
@@ -1689,13 +1675,15 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, num_warps=4
         )
 
-        # --- Step B: Internal Levels (Split Strategy) ---
+        # CUTOFF: Levels 1-8 use Kernel A. Levels 9+ use Kernel B.
         CUTOFF_LEVEL = 8
         
-        # Kernel 1: Low Levels (Split=1, Loop-Based)
+        # --- KERNEL A: Low Levels (Split=1) ---
         if LEVELS >= 1:
             limit = min(LEVELS, CUTOFF_LEVEL)
+            # Total blocks = N - (N >> limit)
             total_blocks_low = N - (N >> limit)
+            
             grid_low = (total_blocks_low, B)
             
             hierarchical_attention_backward_low_level_kernel[grid_low](
@@ -1709,11 +1697,17 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
                 num_warps=4
             )
 
-        # Kernel 2: High Levels (Split>1, Math-Based)
+        # --- KERNEL B: High Levels (Split>1) ---
         if LEVELS > CUTOFF_LEVEL:
             num_high_levels = LEVELS - CUTOFF_LEVEL
+            
+            # Constant blocks per level = N >> (CUTOFF)
+            # Actually, logic dictates: N >> (START_LEVEL - 1)
+            # If START_LEVEL=9, we need N >> 8.
             blocks_per_lvl = N >> CUTOFF_LEVEL
+            
             total_blocks_high = blocks_per_lvl * num_high_levels
+            
             grid_high = (total_blocks_high, B)
             
             hierarchical_attention_backward_high_level_kernel[grid_high](
@@ -1723,11 +1717,11 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
                 *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
                 H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
                 N=N,
-                START_LEVEL=CUTOFF_LEVEL + 1, 
+                START_LEVEL=CUTOFF_LEVEL + 1, # Start at Level 9
                 num_warps=4
             )
-        
-        return dQ, dK, dV, None, None, None, None
+            
+        return dQ, dK, dV, None, None, None
 
 def hierarchical_fused_attention(Q, K, V, idx_table, gather_table, mask_table=None):
     """
@@ -2583,7 +2577,7 @@ def run_full_suite_update_X_from_Y():
 
     # Config: Large scale to saturate GPU
     # B, N, D, H = 32, 4096, 64, 8
-    B, N, D, H = 32, 2048, 64, 8
+    B, N, D, H = 2, 2048 * 64, 64, 8
     dim = D * H
 
     print(f"Config: B={B}, N={N}, D={dim} (HeadDim={D}), H={H}, dtype={check_dtype}")
