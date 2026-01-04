@@ -945,103 +945,153 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        # 1. Retrieve Tensors
+        # ============================================================
+        # 0. Retrieve saved tensors & constants
+        # ============================================================
         Q, K, V, idx_table, gather_table, Weights, mask_table = ctx.saved_tensors
         sm_scale, H, BLOCK_H, D, BLOCK_D, LEVELS, BLOCK_LEVELS = ctx.constants
-        
-        # [CRITICAL FIX] View as 4D to generate 4 stride values
+
         grad_output = grad_output.contiguous()
         B, N = Q.shape[0], Q.shape[1]
-        grad_output_4d = grad_output.view(B, N, H, D) 
-    
-        # 2. Compute dS (Runs on Main Stream)
-        DS = torch.empty_like(Weights)
-        grid_ds = (N, B)
-        
+
+        # View once (no copy)
+        grad_output_4d = grad_output.view(B, N, H, D)
+
         HAS_MASK = (mask_table is not None)
         mask_ptr_safe = mask_table if HAS_MASK else Weights
-    
-        hierarchical_attention_backward_dS_kernel[grid_ds](
+
+        # ============================================================
+        # 1. Allocate outputs (NO zero-init)
+        # ============================================================
+        dQ = torch.empty_like(Q)
+        dK = torch.empty_like(K)
+        dV = torch.empty_like(V)
+
+        DS = torch.empty_like(Weights)
+
+        # ============================================================
+        # 2. Cache strides (reduces Python overhead)
+        # ============================================================
+        q_strides  = Q.stride()
+        k_strides  = K.stride()
+        v_strides  = V.stride()
+        w_strides  = Weights.stride()
+        ds_strides = DS.stride()
+        go_strides = grad_output_4d.stride()
+        idx_strides = idx_table.stride()
+        gtab_strides = gather_table.stride()
+
+        # ============================================================
+        # 3. Kernel handles (avoid attribute lookups)
+        # ============================================================
+        k_dS   = hierarchical_attention_backward_dS_kernel
+        k_dQ   = hierarchical_attention_backward_dQ_kernel
+        k_leaf = hierarchical_attention_backward_dK_dV_leaf_kernel
+        k_int  = hierarchical_attention_backward_dK_dV_internal_kernel
+
+        grid = (N, B)
+
+        # ============================================================
+        # 4. Compute dS (must finish first)
+        # ============================================================
+        k_dS[grid](
             grad_output_4d, Weights, V, idx_table, DS, mask_ptr_safe,
-            *grad_output_4d.stride(), 
-            *Weights.stride(),            
-            *V.stride(),            
-            *idx_table.stride(),    
-            *DS.stride(),            
-            sm_scale, H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, 
+            *go_strides,
+            *w_strides,
+            *v_strides,
+            *idx_strides,
+            *ds_strides,
+            sm_scale,
+            H=H, BLOCK_H=BLOCK_H,
+            D=D, BLOCK_D=BLOCK_D,
             LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS,
             HAS_MASK=HAS_MASK,
-            num_warps=4
+            num_warps=4,
         )
-    
-        # --- SETUP PARALLELISM ---
-        dK = torch.zeros_like(K)
-        dV = torch.zeros_like(V)
-        dQ = torch.empty_like(Q)
-    
-        # --- BRANCH 1: dQ ---
-        grid_dq = (N, B)
-        hierarchical_attention_backward_dQ_kernel[grid_dq](
-            DS, K, idx_table, dQ, mask_ptr_safe, 
-            *DS.stride(), *K.stride(), *idx_table.stride(), *dQ.stride(),
-            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, LEVELS=LEVELS, #BLOCK_LEVELS=BLOCK_LEVELS,
-            HAS_MASK=HAS_MASK,
-            num_warps=4
-        )
-    
-        # --- BRANCH 2: dK/dV Per Level (Main Stream) ---
-        
-        # Step A: Launch Specialized Leaf Kernel (Level 0)
-        grid_leaf = (N, B)
-        hierarchical_attention_backward_dK_dV_leaf_kernel[grid_leaf](
-            DS, Q, Weights, grad_output_4d, gather_table, # <--- Use 4D
+
+        # ============================================================
+        # 5. Parallel execution: dQ on side stream
+        # ============================================================
+        main_stream = torch.cuda.current_stream()
+        side_stream = torch.cuda.Stream()
+
+        side_stream.wait_stream(main_stream)
+
+        with torch.cuda.stream(side_stream):
+            k_dQ[grid](
+                DS, K, idx_table, dQ, mask_ptr_safe,
+                *ds_strides,
+                *k_strides,
+                *idx_strides,
+                *dQ.stride(),
+                H=H, BLOCK_H=BLOCK_H,
+                D=D, BLOCK_D=BLOCK_D,
+                LEVELS=LEVELS,
+                HAS_MASK=HAS_MASK,
+                num_warps=4,
+            )
+
+        # ============================================================
+        # 6. Leaf dK/dV (level 0) — main stream
+        # ============================================================
+        k_leaf[grid](
+            DS, Q, Weights, grad_output_4d, gather_table,
             dK, dV,
-            *DS.stride(), *Q.stride(), *Weights.stride(), 
-            *grad_output_4d.stride(), # <--- Use 4D Strides
+            *ds_strides,
+            *q_strides,
+            *w_strides,
+            *go_strides,
             *dK.stride(),
-            *gather_table.stride(),
-            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
-            num_warps=4
+            *gtab_strides,
+            H=H, BLOCK_H=BLOCK_H,
+            D=D, BLOCK_D=BLOCK_D,
+            num_warps=4,
         )
-    
-        # Step B: Loop Over Internal Levels
-        current_start_node = N 
-        
+
+        # ============================================================
+        # 7. Internal levels (optimized SPLIT_K schedule)
+        # ============================================================
+        # Precomputed split schedule (cheap, predictable)
+        # lvl:   0 1 2 3 4 5 6 7  8  9 10 11 12 ...
+        # split: 1 1 1 1 1 1 1 1  2  4  8 16 32 ...
+        split_k_table = [1] * LEVELS
+        for lvl in range(8, LEVELS):
+            split_k_table[lvl] = 1 << (lvl - 7)
+
+        current_start_node = N
+
         for lvl in range(1, LEVELS):
-            num_nodes_in_level = N >> lvl  
+            num_nodes = N >> lvl
+            split_k = split_k_table[lvl]
 
-            # --- Dynamic Split-K Logic ---
-            if lvl < 8:
-                current_split_k = 1
-            else:
-                # 2^(lvl - 7) implementation using bit shift
-                current_split_k = 1 << (lvl - 7)    
+            grid_lvl = (num_nodes * split_k, B)
 
-
-            # Calculate Grid
-            # Multiply node count by split factor to launch more blocks
-            grid_lvl = (num_nodes_in_level * current_split_k, B)
-        
-            hierarchical_attention_backward_dK_dV_internal_kernel[grid_lvl](
+            k_int[grid_lvl](
                 DS, Q, Weights, grad_output_4d, gather_table,
                 dK, dV,
-                *DS.stride(), *Q.stride(), *Weights.stride(),
-                *grad_output_4d.stride(),
+                *ds_strides,
+                *q_strides,
+                *w_strides,
+                *go_strides,
                 *dK.stride(),
-                *gather_table.stride(),
-                H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
-            
+                *gtab_strides,
+                H=H, BLOCK_H=BLOCK_H,
+                D=D, BLOCK_D=BLOCK_D,
                 START_NODE_ID=current_start_node,
                 TARGET_LEVEL=lvl,
-                SPLIT_K=current_split_k, # <--- Pass the split factor
-            
-                num_warps=4
+                SPLIT_K=split_k,
+                num_warps=4,
             )
-            
-            # Update offset for the next level
-            current_start_node += num_nodes_in_level
-    
-        return dQ, dK, dV, None, None, None, None
+
+            current_start_node += num_nodes
+
+        # ============================================================
+        # 8. Synchronize streams
+        # ============================================================
+        main_stream.wait_stream(side_stream)
+
+        return dQ, dK, dV, None, None, None
+
 
     #@staticmethod
     #def backward(ctx, grad_output):
