@@ -1006,20 +1006,9 @@ def hierarchical_attention_backward_low_level_kernel(
     # ------------------------------------------------------------------
     
     # A. Calculate Node ID
-    # Since blocks are assigned sequentially starting from Level 1 (which starts at node N),
-    # the mapping is purely linear.
     node_id = N + pid
 
     # B. Calculate Target Level (Bitwise Magic)
-    # The levels are defined by powers of 2 boundaries from the end.
-    # Level 1: Ends at N/2. (MSB at K-1)
-    # Level 2: Ends at 3N/4. (MSB at K-2)
-    # Formula: Level = Log2(N) - Floor(Log2(N - 1 - pid))
-    
-    # We compute Log2(N) at compile time using a Python trick for constexprs
-    # (Assuming N is power of 2)
-    LOG_N: tl.constexpr = N.bit_length() - 1
-    
     # Reverse PID Index
     rev_idx = N - 1 - pid
     
