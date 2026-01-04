@@ -963,9 +963,9 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         # ============================================================
         # 1. Allocate outputs (NO zero-init)
         # ============================================================
-        dQ = torch.empty_like(Q)
-        dK = torch.empty_like(K)
-        dV = torch.empty_like(V)
+        dQ = torch.zeros_like(Q)
+        dK = torch.zeros_like(K)
+        dV = torch.zeros_like(V)
 
         DS = torch.empty_like(Weights)
 
