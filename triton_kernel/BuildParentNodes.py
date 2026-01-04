@@ -1957,7 +1957,7 @@ def run_full_suite_update_X_from_Y():
     # 1. SETUP & CORRECTNESS CHECK
     # ==========================================================================
     # [CONFIG] Choose your dtype here: torch.float32 or torch.float16
-    check_dtype = torch.float16
+    check_dtype = torch.float32
     
     print(f"{'='*60}")
     print(f"1. CORRECTNESS CHECK ({check_dtype}) - update_X_from_Y")
@@ -2039,6 +2039,8 @@ def run_full_suite_update_X_from_Y():
     # ==========================================================================
     # 2. PERFORMANCE BENCHMARK (Float16 - Large Scale)
     # ==========================================================================
+    check_dtype = torch.float16
+
     print(f"\n{'='*60}")
     print(f"2. SPEED BENCHMARK ({check_dtype} - Large Scale)")
     print(f"{'='*60}")
