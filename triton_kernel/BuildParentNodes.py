@@ -681,11 +681,8 @@ def hierarchical_attention_backward_dK_dV_leaf_kernel(
 # ==================================================================
 @triton.jit
 def hierarchical_attention_backward_dK_dV_internal_kernel(
-    # Inputs
     DS_ptr, Q_ptr, W_ptr, DO_ptr, Gather_Table_ptr,
-    # Outputs
     DK_ptr, DV_ptr,
-
     # Strides
     sds_b, sds_n, sds_h, sds_lvl,
     sq_b, sq_n, sq_h, sq_d,
@@ -693,116 +690,93 @@ def hierarchical_attention_backward_dK_dV_internal_kernel(
     sdo_b, sdo_n, sdo_h, sdo_d,
     sdk_b, sdk_node, sdk_h, sdk_d,
     sg_node, sg_dim,
-
     # Constants
-    H: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-    D: tl.constexpr,
-    BLOCK_D: tl.constexpr,
+    H: tl.constexpr, BLOCK_H: tl.constexpr,
+    D: tl.constexpr, BLOCK_D: tl.constexpr,
     START_NODE_ID: tl.constexpr,
     TARGET_LEVEL: tl.constexpr,
-    SPLIT_K: tl.constexpr,
+    SPLIT_K: tl.constexpr  # <--- NEW: Parallelism Factor (e.g., 1, 4, 8)
 ):
-    # ------------------------------------------------------------
-    # Program IDs & Constants
-    # ------------------------------------------------------------
     pid = tl.program_id(0)
     b_idx = tl.program_id(1)
-    
+
+    # 1. Constants
     NUM_CHILDREN: tl.constexpr = 1 << TARGET_LEVEL
     W_IDX: tl.constexpr = TARGET_LEVEL + 1
-
-    # Decode SPLIT-K
+    
+    # 2. Identify Parent Node & Split ID
+    # Grid is now (NUM_NODES * SPLIT_K, B)
     node_local_id = pid // SPLIT_K
     split_id = pid % SPLIT_K
-    node_id = node_local_id + START_NODE_ID
-
-    # ------------------------------------------------------------
-    # Determine Child Range (Static)
-    # ------------------------------------------------------------
-    CHILDREN_PER_SPLIT: tl.constexpr = (NUM_CHILDREN + SPLIT_K - 1) // SPLIT_K
-    start_k = split_id * CHILDREN_PER_SPLIT
-
-    # ------------------------------------------------------------
-    # Pointers & Offsets
-    # ------------------------------------------------------------
-    offs_h = tl.arange(0, BLOCK_H)
-    mask_h = offs_h < H
     
-    # 1. Gather Table
-    # [FIX] Removed 'other=-1'. We load the value directly. 
-    # If the node has no children, the table itself contains -1.
-    child_start_base = tl.load(Gather_Table_ptr + node_id * sg_node)
+    node_id = node_local_id + START_NODE_ID
+    
+    # 3. Determine Child Range for this Split
+    # e.g., Children 0-1024 split by 4 -> [0-256], [256-512], ...
+    total_children = NUM_CHILDREN
+    children_per_split = total_children // SPLIT_K
+    
+    start_k = split_id * children_per_split
+    # Handle remainder if not perfectly divisible (though powers of 2 usually are)
+    if split_id == SPLIT_K - 1:
+        children_per_split = total_children - start_k
+        
+    # 4. Gather Logic
+    tab_ptr = Gather_Table_ptr + (node_id * sg_node)
+    child_start_base = tl.load(tab_ptr + 0)
     
     has_children = (child_start_base != -1)
 
-    # 2. Output Pointer (Base)
-    off_out_base = (b_idx * sdk_b) + (node_id * sdk_node) + (offs_h[:, None] * sdk_h)
+    offs_h = tl.arange(0, BLOCK_H)
+    mask_h = offs_h < H
 
-    # 3. Input Base Pointers (Hoisted Invariants)
-    # DS Base: [Batch] + [Level]
-    ptr_ds_batch = DS_ptr + (b_idx * sds_b) + (W_IDX * sds_lvl)
+    # 5. Loop over D
+    off_out = (b_idx * sdk_b) + (node_id * sdk_node)
     
-    # W Base: [Batch] + [Level]
-    ptr_w_batch = W_ptr + (b_idx * sw_b) + (W_IDX * sw_lvl)
+    # Pre-calc pointers invariant to D
+    # We only need base pointers here, offsets added in loop
     
-    # Q/DO Base: [Batch]
-    ptr_q_batch = Q_ptr + (b_idx * sq_b)
-    ptr_do_batch = DO_ptr + (b_idx * sdo_b)
-
-    # ------------------------------------------------------------
-    # Loop over D (Outer)
-    # ------------------------------------------------------------
     for off_d_start in range(0, D, BLOCK_D):
         offs_d = off_d_start + tl.arange(0, BLOCK_D)
         mask_d = offs_d < D
         mask_op = mask_h[:, None] & mask_d[None, :]
 
-        # Accumulators (FP32)
         dk_acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
         dv_acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
 
         if has_children:
-            # Pre-calculate Head/Dim offsets for this chunk
-            # Shape: [BLOCK_H, BLOCK_D]
             off_hq_d  = (offs_h[:, None] * sq_h)  + (offs_d[None, :] * sq_d)
             off_hdo_d = (offs_h[:, None] * sdo_h) + (offs_d[None, :] * sdo_d)
 
-            # ----------------------------------------------------
-            # Child loop (Inner)
-            # ----------------------------------------------------
-            for k_offset in range(CHILDREN_PER_SPLIT):
+            # --- INNER LOOP: Iterate ONLY over this split's children ---
+            for k_offset in range(children_per_split):
+                # Actual child index relative to the start of the list
                 k = start_k + k_offset
-                valid_child = k < NUM_CHILDREN
                 
-                # Actual Child Index
                 child_idx = child_start_base + k
-
-                # --- Optimized Pointer Math ---
                 
-                # A. Load DS / W [BLOCK_H, 1]
-                ptr_ds = ptr_ds_batch + (child_idx * sds_n) + (offs_h * sds_h)
-                ptr_w  = ptr_w_batch  + (child_idx * sw_n)  + (offs_h * sw_h)
+                # --- A. Load Context (dS, W) ---
+                off_ds_k = (b_idx * sds_b) + (child_idx * sds_n) + (W_IDX * sds_lvl)
+                off_w_k  = (b_idx * sw_b)  + (child_idx * sw_n)  + (W_IDX * sw_lvl)
 
-                ds = tl.load(ptr_ds, mask=mask_h & valid_child, other=0.0)[:, None]
-                w  = tl.load(ptr_w,  mask=mask_h & valid_child, other=0.0)[:, None]
+                ds_k = tl.load(DS_ptr + off_ds_k + (offs_h[:, None] * sds_h), mask=mask_h[:, None], other=0.0)
+                w_k  = tl.load(W_ptr  + off_w_k  + (offs_h[:, None] * sw_h),  mask=mask_h[:, None], other=0.0)
 
-                # B. Load Q / DO [BLOCK_H, BLOCK_D]
-                ptr_q  = ptr_q_batch  + (child_idx * sq_n)  + off_hq_d
-                ptr_do = ptr_do_batch + (child_idx * sdo_n) + off_hdo_d
+                # --- B. Load Q and dO ---
+                off_q_k  = (b_idx * sq_b)  + (child_idx * sq_n)
+                off_do_k = (b_idx * sdo_b) + (child_idx * sdo_n)
+                
+                q_val  = tl.load(Q_ptr  + off_q_k  + off_hq_d,  mask=mask_op, other=0.0)
+                do_val = tl.load(DO_ptr + off_do_k + off_hdo_d, mask=mask_op, other=0.0)
 
-                q  = tl.load(ptr_q,  mask=mask_op & valid_child, other=0.0)
-                do = tl.load(ptr_do, mask=mask_op & valid_child, other=0.0)
+                dk_acc += ds_k * q_val
+                dv_acc += w_k  * do_val
 
-                # Accumulate
-                dk_acc += ds * q
-                dv_acc += w * do
-
-        # --------------------------------------------------------
-        # Write output (Atomic or Store)
-        # --------------------------------------------------------
-        ptr_dk = DK_ptr + off_out_base + (offs_d[None, :] * sdk_d)
-        ptr_dv = DV_ptr + off_out_base + (offs_d[None, :] * sdk_d)
+        # 6. Store Result
+        # CRITICAL: If SPLIT_K > 1, multiple blocks write to the same node -> Atomic Add
+        # If SPLIT_K == 1, we are the only owner -> Store (Faster)
+        ptr_dk = DK_ptr + off_out + (offs_h[:, None] * sdk_h) + (offs_d[None, :] * sdk_d)
+        ptr_dv = DV_ptr + off_out + (offs_h[:, None] * sdk_h) + (offs_d[None, :] * sdk_d)
 
         if SPLIT_K > 1:
             tl.atomic_add(ptr_dk, dk_acc, mask=mask_op)
