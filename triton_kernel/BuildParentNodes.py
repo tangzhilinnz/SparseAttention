@@ -976,48 +976,44 @@ def hierarchical_attention_backward_low_level_kernel(
     pid = tl.program_id(0)
     b_idx = tl.program_id(1)
 
-    ## ------------------------------------------------------------------
-    ## 1. PID DECODING (Geometric Loop)
-    ## ------------------------------------------------------------------
-    ## We assume Split-K is ALWAYS 1 for these levels.
-    #
-    #target_level = 0
-    #node_id = 0
-    #
-    #current_block_offset = 0
-    #current_node_offset = N # Start after leaves
-    #
-    ## Iterate only up to MAX_LEVEL
-    #for lvl in range(1, MAX_LEVEL + 1):
-    #    nodes_in_lvl = N >> lvl
-    #    
-    #    # Check if PID belongs to this level
-    #    if pid >= current_block_offset and pid < (current_block_offset + nodes_in_lvl):
-    #        target_level = lvl
-    #        
-    #        node_local = pid - current_block_offset
-    #        node_id = current_node_offset + node_local
-    #        
-    #    # Accumulate offsets
-    #    current_block_offset += nodes_in_lvl
-    #    current_node_offset += nodes_in_lvl
-
     # ------------------------------------------------------------------
-    # 1. O(1) DECODING (Loop Free)
+    # 1. PID DECODING (Unrolled & Constant Folded)
     # ------------------------------------------------------------------
     
-    # A. Calculate Node ID
+    # OPTIMIZATION 1: Node ID is Linear!
+    # You don't need a loop to find node_id. 
+    # The blocks are laid out sequentially: [Level 1 Nodes] [Level 2 Nodes] ...
+    # So Global Node ID is always just Offset + PID.
     node_id = N + pid
 
-    # B. Calculate Target Level (Bitwise Magic)
-    # Reverse PID Index
-    rev_idx = N - 1 - pid
+    # OPTIMIZATION 2: Unrolled Level Check
+    # We use a mutable variable that gets updated.
+    # Since the loop range is static (constexpr), Triton unrolls this completely.
+    target_level = 0
     
-    # Find MSB position (Floor of Log2)
-    # We convert to float32 to use the fast GPU hardware log2 unit
-    msb_pos = tl.math.log2(rev_idx.to(tl.float32)).to(tl.int32)
+    # We iterate 1..MAX_LEVEL. 
+    # Because MAX_LEVEL is small (e.g. 8), this unrolled code is tiny.
+    # Level 1 checks: 50% threads exit here.
+    # Level 2 checks: 25% threads exit here.
     
-    target_level = LOG_N - msb_pos
+    # 'found' flag prevents lower levels from overwriting the correct level
+    # logic, effectively simulating an 'if/elif/elif' chain.
+    found = 0
+    
+    for lvl in range(1, MAX_LEVEL + 1):
+        # COMPILE-TIME CONSTANT CALCULATION
+        # The threshold for Level 'lvl' is exactly: N - (N >> lvl)
+        # e.g., Lvl 1: pid < N - N/2
+        # e.g., Lvl 2: pid < N - N/4
+        # Since N and lvl are constexpr, this 'limit' is baked into the PTX code as a constant.
+        limit = N - (N >> lvl)
+        
+        # Runtime Check (1 Comparison, 0 Arithmetic)
+        # We use 'if not found' to simulate the 'elif' behavior
+        if not found:
+            if pid < limit:
+                target_level = lvl
+                found = 1
 
     # ------------------------------------------------------------------
     # 2. GATHER LOGIC (No Atomics)
@@ -1837,15 +1833,12 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         CUTOFF_LEVEL = 6
         
         # --- KERNEL A: Low Levels (Split=1) ---
-
-
         if LEVELS >= 1:
             limit = min(LEVELS, CUTOFF_LEVEL)
+            # Total blocks = N - (N >> limit)
             total_blocks_low = N - (N >> limit)
-            grid_low = (total_blocks_low, B)
             
-            # Calculate LogN on CPU
-            log_n = N.bit_length() - 1 
+            grid_low = (total_blocks_low, B)
             
             hierarchical_attention_backward_low_level_kernel[grid_low](
                 DS, Q, Weights, grad_output_4d, gather_table,
@@ -1853,8 +1846,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
                 *DS.stride(), *Q.stride(), *Weights.stride(),
                 *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
                 H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
-                N=N,
-                LOG_N=log_n, # <--- PASS IT HERE
+                N=N, 
                 MAX_LEVEL=limit, 
                 num_warps=4
             )
