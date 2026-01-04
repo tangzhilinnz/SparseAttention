@@ -1835,10 +1835,11 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         # --- KERNEL A: Low Levels (Split=1) ---
         if LEVELS >= 1:
             limit = min(LEVELS, CUTOFF_LEVEL)
-            # Total blocks = N - (N >> limit)
             total_blocks_low = N - (N >> limit)
-            
             grid_low = (total_blocks_low, B)
+            
+            # Calculate LogN on CPU
+            log_n = N.bit_length() - 1 
             
             hierarchical_attention_backward_low_level_kernel[grid_low](
                 DS, Q, Weights, grad_output_4d, gather_table,
@@ -1846,7 +1847,8 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
                 *DS.stride(), *Q.stride(), *Weights.stride(),
                 *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
                 H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
-                N=N, 
+                N=N,
+                LOG_N=log_n, # <--- PASS IT HERE
                 MAX_LEVEL=limit, 
                 num_warps=4
             )
