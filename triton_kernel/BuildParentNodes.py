@@ -1635,7 +1635,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         B, N = Q.shape[0], Q.shape[1]
         grad_output_4d = grad_output.view(B, N, H, D) 
 
-        # 2. Compute dS (Main Stream)
+        # 2. Compute dS (Runs on Main Stream)
         DS = torch.empty_like(Weights)
         grid_ds = (N, B)
         HAS_MASK = (mask_table is not None)
@@ -1654,16 +1654,28 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         dV = torch.zeros_like(V)
         dQ = torch.empty_like(Q)
 
-        # --- BRANCH 1: dQ (Independent) ---
-        grid_dq = (N, B)
-        hierarchical_attention_backward_dQ_kernel[grid_dq](
-            DS, K, idx_table, dQ, mask_ptr_safe, 
-            *DS.stride(), *K.stride(), *idx_table.stride(), *dQ.stride(),
-            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=32, LEVELS=LEVELS,
-            HAS_MASK=HAS_MASK, num_warps=4
-        )
+        # Create a side stream for dQ
+        stream_dq = torch.cuda.Stream()
+        
+        # Record that dS is done on the main stream so dQ knows when to start
+        ds_done_event = torch.cuda.Event()
+        ds_done_event.record(torch.cuda.current_stream())
 
-        # --- BRANCH 2: dK/dV (Dependent on dS) ---
+        # --- BRANCH 1: dQ (Independent Side Stream) ---
+        with torch.cuda.stream(stream_dq):
+            # Wait for dS to be computed
+            stream_dq.wait_event(ds_done_event)
+            
+            grid_dq = (N, B)
+            hierarchical_attention_backward_dQ_kernel[grid_dq](
+                DS, K, idx_table, dQ, mask_ptr_safe, 
+                *DS.stride(), *K.stride(), *idx_table.stride(), *dQ.stride(),
+                H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=32, LEVELS=LEVELS,
+                HAS_MASK=HAS_MASK, num_warps=4
+            )
+
+        # --- BRANCH 2: dK/dV (Dependent on dS, Runs on Main Stream) ---
+        # This runs immediately after dS, in parallel with the dQ stream above.
         
         # Step A: Leaf Kernel (Level 0)
         grid_leaf = (N, B)
@@ -1681,9 +1693,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         # --- KERNEL A: Low Levels (Split=1) ---
         if LEVELS >= 1:
             limit = min(LEVELS, CUTOFF_LEVEL)
-            # Total blocks = N - (N >> limit)
             total_blocks_low = N - (N >> limit)
-            
             grid_low = (total_blocks_low, B)
             
             hierarchical_attention_backward_low_level_kernel[grid_low](
@@ -1700,14 +1710,8 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         # --- KERNEL B: High Levels (Split>1) ---
         if LEVELS > CUTOFF_LEVEL:
             num_high_levels = LEVELS - CUTOFF_LEVEL
-            
-            # Constant blocks per level = N >> (CUTOFF)
-            # Actually, logic dictates: N >> (START_LEVEL - 1)
-            # If START_LEVEL=9, we need N >> 8.
             blocks_per_lvl = N >> CUTOFF_LEVEL
-            
             total_blocks_high = blocks_per_lvl * num_high_levels
-            
             grid_high = (total_blocks_high, B)
             
             hierarchical_attention_backward_high_level_kernel[grid_high](
@@ -1717,10 +1721,16 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
                 *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
                 H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
                 N=N,
-                START_LEVEL=CUTOFF_LEVEL + 1, # Start at Level 9
+                START_LEVEL=CUTOFF_LEVEL + 1, 
                 num_warps=4
             )
             
+        # --- SYNCHRONIZATION ---
+        # Before returning, the main stream must verify dQ is done.
+        dq_done_event = torch.cuda.Event()
+        dq_done_event.record(stream_dq)
+        torch.cuda.current_stream().wait_event(dq_done_event)
+
         return dQ, dK, dV, None, None, None
 
 def hierarchical_fused_attention(Q, K, V, idx_table, gather_table, mask_table=None):
