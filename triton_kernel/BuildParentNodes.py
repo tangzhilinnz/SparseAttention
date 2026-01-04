@@ -970,7 +970,7 @@ def hierarchical_attention_backward_low_level_kernel(
     H: tl.constexpr, BLOCK_H: tl.constexpr,
     D: tl.constexpr, BLOCK_D: tl.constexpr,
     N: tl.constexpr,
-    MAX_LEVEL: tl.constexpr # e.g., 8
+    MAX_LEVEL: tl.constexpr
 ):
     pid = tl.program_id(0)
     b_idx = tl.program_id(1)
@@ -1059,7 +1059,7 @@ def hierarchical_attention_backward_low_level_kernel(
 
 
 @triton.jit
-def hierarchical_attention_backward_high_level_kernel(
+def hierarchical_attention_backward_high_level_kernel_bk(
     # Inputs
     DS_ptr, Q_ptr, W_ptr, DO_ptr, Gather_Table_ptr,
     DK_ptr, DV_ptr,
@@ -1167,6 +1167,146 @@ def hierarchical_attention_backward_high_level_kernel(
         tl.atomic_add(ptr_dk, dk_acc, mask=mask_op)
         tl.atomic_add(ptr_dv, dv_acc, mask=mask_op)
 
+
+
+@triton.jit
+def hierarchical_attention_backward_high_level_kernel(
+    # Inputs
+    DS_ptr, Q_ptr, W_ptr, DO_ptr, Gather_Table_ptr,
+    DK_ptr, DV_ptr,
+    # Strides
+    sds_b, sds_n, sds_h, sds_lvl,
+    sq_b, sq_n, sq_h, sq_d,
+    sw_b, sw_n, sw_h, sw_lvl,
+    sdo_b, sdo_n, sdo_h, sdo_d,
+    sdk_b, sdk_node, sdk_h, sdk_d,
+    sg_node, sg_dim,
+    # Constants
+    H: tl.constexpr, BLOCK_H: tl.constexpr,
+    D: tl.constexpr, BLOCK_D: tl.constexpr,
+    N: tl.constexpr,
+    START_LEVEL: tl.constexpr 
+):
+    pid = tl.program_id(0)
+    b_idx = tl.program_id(1)
+
+    # ------------------------------------------------------------------
+    # 1. BITWISE PID DECODING (Extreme Optimization)
+    # ------------------------------------------------------------------
+    # Constants derived from N and START_LEVEL
+    # SHIFT_GRID = log2(BLOCKS_PER_LVL) = log2(N) - (START_LEVEL - 1)
+    # Note: We rely on the compiler to fold these constants.
+    
+    # Blocks Per Level = N / 2^(START_LEVEL - 1)
+    BLOCKS_PER_LVL: tl.constexpr = N >> (START_LEVEL - 1)
+    BLOCK_MASK: tl.constexpr = BLOCKS_PER_LVL - 1
+    
+    # 1. Which Level? (Integer Div -> Right Shift?)
+    # Since BLOCKS_PER_LVL is power of 2, 'pid // BLOCKS' is a Shift.
+    # However, 'pid' is dynamic, so we can just use integer div, 
+    # Triton/LLVM optimizes 'div by power-of-2' into a shift automatically.
+    # But for 'rem', using AND is explicitly cleaner.
+    
+    lvl_offset = pid // BLOCKS_PER_LVL
+    target_level = START_LEVEL + lvl_offset
+    
+    # 2. Relative Index (Modulo -> Bitwise AND)
+    rem = pid & BLOCK_MASK
+    
+    # 3. Calculate Split-K Parameters
+    # shift_val = L - (START_LEVEL - 1)
+    shift_val = target_level - (START_LEVEL - 1)
+    
+    # split_k = 1 << shift_val. 
+    # split_k_mask = split_k - 1 = (1 << shift_val) - 1.
+    split_k_mask = (1 << shift_val) - 1
+    
+    # 4. Decode Node vs Split (Bitwise)
+    node_local = rem >> shift_val           # Division by split_k
+    split_id   = rem & split_k_mask         # Modulo split_k
+    
+    # 5. Global Node ID
+    start_node_global = (2 * N) - (N >> (target_level - 1))
+    node_id = start_node_global + node_local
+
+    # ------------------------------------------------------------------
+    # 2. CONSTANT LOOP SETUP
+    # ------------------------------------------------------------------
+    # CRITICAL INSIGHT: 
+    # num_children / split_k is CONSTANT across all levels in this kernel.
+    # Ratio = 2^L / 2^(L - (START-1)) = 2^(START-1)
+    # This allows the compiler to generate fixed-size loops.
+    CHILDREN_PER_SPLIT: tl.constexpr = 1 << (START_LEVEL - 1)
+    
+    w_idx = target_level + 1
+    
+    # Start K (Simple Multiply)
+    start_k = split_id * CHILDREN_PER_SPLIT
+    
+    # Gather Table Lookup
+    # Using 'tl.load' with 'cache_modifier=".ca"' (Cache All) since this is reused
+    tab_ptr = Gather_Table_ptr + (node_id * sg_node)
+    child_start_base = tl.load(tab_ptr + 0) # Hint: cache this heavily
+    has_children = (child_start_base != -1)
+
+    # Base Pointers (Hoisted)
+    offs_h = tl.arange(0, BLOCK_H)
+    mask_h = offs_h < H
+    off_out_base = (b_idx * sdk_b) + (node_id * sdk_node) + (offs_h[:, None] * sdk_h)
+    
+    ptr_ds_base = DS_ptr + (b_idx * sds_b) + (w_idx * sds_lvl)
+    ptr_w_base  = W_ptr  + (b_idx * sw_b)  + (w_idx * sw_lvl)
+    ptr_q_base  = Q_ptr  + (b_idx * sq_b)
+    ptr_do_base = DO_ptr + (b_idx * sdo_b)
+
+    # ------------------------------------------------------------------
+    # 3. MAIN LOOP
+    # ------------------------------------------------------------------
+    for off_d_start in range(0, D, BLOCK_D):
+        offs_d = off_d_start + tl.arange(0, BLOCK_D)
+        mask_d = offs_d < D
+        mask_op = mask_h[:, None] & mask_d[None, :]
+
+        dk_acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
+        dv_acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
+
+        if has_children:
+            off_hq_d  = (offs_h[:, None] * sq_h)  + (offs_d[None, :] * sq_d)
+            off_hdo_d = (offs_h[:, None] * sdo_h) + (offs_d[None, :] * sdo_d)
+
+            # EXTREME OPTIMIZATION:
+            # 1. No 'range(dynamic)'. Range is CONSTANT.
+            # 2. No 'if k < num_children'. Math guarantees safety.
+            # 3. Compiler can fully unroll or pipeline this.
+            for k_offset in range(CHILDREN_PER_SPLIT):
+                # Calculate offsets (Pure ALU, no branches)
+                k = start_k + k_offset
+                child_idx = child_start_base + k
+                
+                # Pointers
+                # Using 'offs_h' and 'offs_d' which are registers
+                ptr_ds = ptr_ds_base + (child_idx * sds_n) + (offs_h * sds_h)
+                ptr_w  = ptr_w_base  + (child_idx * sw_n)  + (offs_h * sw_h)
+                
+                # Load (Masked only by Head/Dim, not by Child index)
+                ds = tl.load(ptr_ds, mask=mask_h, other=0.0)[:, None]
+                w  = tl.load(ptr_w,  mask=mask_h, other=0.0)[:, None]
+                
+                ptr_q  = ptr_q_base  + (child_idx * sq_n)  + off_hq_d
+                ptr_do = ptr_do_base + (child_idx * sdo_n) + off_hdo_d
+                
+                q  = tl.load(ptr_q,  mask=mask_op, other=0.0)
+                do = tl.load(ptr_do, mask=mask_op, other=0.0)
+                
+                # FMA (Fused Multiply Add)
+                dk_acc += ds * q
+                dv_acc += w * do
+
+        # Atomic Store (Required for Zone 2)
+        ptr_dk = DK_ptr + off_out_base + (offs_d[None, :] * sdk_d)
+        ptr_dv = DV_ptr + off_out_base + (offs_d[None, :] * sdk_d)
+        tl.atomic_add(ptr_dk, dk_acc, mask=mask_op)
+        tl.atomic_add(ptr_dv, dv_acc, mask=mask_op)
 
 
 # ------------------------------------------------------------------
@@ -1675,7 +1815,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, num_warps=4
         )
 
-        # CUTOFF: Levels 1-8 use Kernel A. Levels 9+ use Kernel B.
+        
         CUTOFF_LEVEL = 6
         
         # --- KERNEL A: Low Levels (Split=1) ---
