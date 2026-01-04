@@ -977,43 +977,34 @@ def hierarchical_attention_backward_low_level_kernel(
     b_idx = tl.program_id(1)
 
     # ------------------------------------------------------------------
-    # 1. PID DECODING (Unrolled & Constant Folded)
+    # 1. PID DECODING (Loop Free / Unrolled Select)
     # ------------------------------------------------------------------
     
-    # OPTIMIZATION 1: Node ID is Linear!
-    # You don't need a loop to find node_id. 
-    # The blocks are laid out sequentially: [Level 1 Nodes] [Level 2 Nodes] ...
-    # So Global Node ID is always just Offset + PID.
+    # OPTIMIZATION 1: Node ID is Linear
+    # node_id starts at N (Level 1 start) and increments linearly with PID.
     node_id = N + pid
 
-    # OPTIMIZATION 2: Unrolled Level Check
-    # We use a mutable variable that gets updated.
-    # Since the loop range is static (constexpr), Triton unrolls this completely.
-    target_level = 0
+    # OPTIMIZATION 2: Unrolled Level Selection
+    # Instead of 'if/else', we use a chain of 'tl.where' instructions.
+    # We iterate BACKWARDS so that the smallest (most specific) level "wins".
     
-    # We iterate 1..MAX_LEVEL. 
-    # Because MAX_LEVEL is small (e.g. 8), this unrolled code is tiny.
-    # Level 1 checks: 50% threads exit here.
-    # Level 2 checks: 25% threads exit here.
+    # Initialize to the fallback (highest possible level for this kernel)
+    # Since our grid size guarantees pid is valid, this is safe.
+    target_level = MAX_LEVEL
     
-    # 'found' flag prevents lower levels from overwriting the correct level
-    # logic, effectively simulating an 'if/elif/elif' chain.
-    found = 0
-    
-    for lvl in range(1, MAX_LEVEL + 1):
-        # COMPILE-TIME CONSTANT CALCULATION
-        # The threshold for Level 'lvl' is exactly: N - (N >> lvl)
-        # e.g., Lvl 1: pid < N - N/2
-        # e.g., Lvl 2: pid < N - N/4
-        # Since N and lvl are constexpr, this 'limit' is baked into the PTX code as a constant.
+    # Iterate from MAX_LEVEL-1 down to 1
+    # Example: If MAX_LEVEL=3
+    # 1. target = 3
+    # 2. Check Level 2 limit. If pid < L2_Limit, target = 2.
+    # 3. Check Level 1 limit. If pid < L1_Limit, target = 1.
+    for lvl in range(MAX_LEVEL - 1, 0, -1):
+        # Compile-time constant limit calculation
         limit = N - (N >> lvl)
         
-        # Runtime Check (1 Comparison, 0 Arithmetic)
-        # We use 'if not found' to simulate the 'elif' behavior
-        if not found:
-            if pid < limit:
-                target_level = lvl
-                found = 1
+        # GPU Select Instruction
+        # If pid fits in this smaller level, update target_level.
+        # Otherwise, keep the previous value.
+        target_level = tl.where(pid < limit, lvl, target_level)
 
     # ------------------------------------------------------------------
     # 2. GATHER LOGIC (No Atomics)
