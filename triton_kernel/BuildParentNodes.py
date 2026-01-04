@@ -1527,7 +1527,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         )
 
         # CUTOFF: Levels 1-8 use Kernel A. Levels 9+ use Kernel B.
-        CUTOFF_LEVEL = 6
+        CUTOFF_LEVEL = 8
         
         # --- KERNEL A: Low Levels (Split=1) ---
         if LEVELS >= 1:
@@ -2428,7 +2428,7 @@ def run_full_suite_update_X_from_Y():
 
     # Config: Large scale to saturate GPU
     # B, N, D, H = 32, 4096, 64, 8
-    B, N, D, H = 32, 2048 * 4, 64, 8
+    B, N, D, H = 2, 2048 * 64, 64, 8
     dim = D * H
 
     print(f"Config: B={B}, N={N}, D={dim} (HeadDim={D}), H={H}, dtype={check_dtype}")
