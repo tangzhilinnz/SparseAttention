@@ -1059,7 +1059,7 @@ def hierarchical_attention_backward_low_level_kernel(
 
 
 @triton.jit
-def hierarchical_attention_backward_high_level_kernel_bk(
+def hierarchical_attention_backward_high_level_kernel(
     # Inputs
     DS_ptr, Q_ptr, W_ptr, DO_ptr, Gather_Table_ptr,
     DK_ptr, DV_ptr,
@@ -1170,7 +1170,7 @@ def hierarchical_attention_backward_high_level_kernel_bk(
 
 
 @triton.jit
-def hierarchical_attention_backward_high_level_kernel(
+def hierarchical_attention_backward_high_level_kernel_bk(
     # Inputs
     DS_ptr, Q_ptr, W_ptr, DO_ptr, Gather_Table_ptr,
     DK_ptr, DV_ptr,
