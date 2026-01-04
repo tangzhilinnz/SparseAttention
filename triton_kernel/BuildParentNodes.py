@@ -975,9 +975,9 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         )
 
         # --- SETUP PARALLELISM ---
-        dK = torch.zero_like(K)
-        dV = torch.zero_like(V)
-        dQ = torch.zero_like(Q)
+        dK = torch.zeros_like(K)
+        dV = torch.zeros_like(V)
+        dQ = torch.zeros_like(Q)
 
         # --- BRANCH 1: dQ ---
         grid_dq = (N, B)
