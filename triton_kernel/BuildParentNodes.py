@@ -1007,7 +1007,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         # Step B: Loop Over Internal Levels
         current_start_node = N 
         
-        for lvl in range(1, LEVELS):
+        for lvl in range(1, LEVELS+1):
             num_nodes_in_level = N >> lvl
 
             # --- Dynamic Split-K Logic ---
