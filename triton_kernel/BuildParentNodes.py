@@ -1523,35 +1523,130 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         ctx.constants = (sm_scale, H, BLOCK_H, D, BLOCK_D, LEVELS, BLOCK_LEVELS)
         return Out
 
+    @staticmethod
+    def backward(ctx, grad_output):
+        # 1. Retrieve Tensors
+        Q, K, V, idx_table, gather_table, Weights, mask_table = ctx.saved_tensors
+        sm_scale, H, BLOCK_H, D, BLOCK_D, LEVELS, BLOCK_LEVELS = ctx.constants
+        
+        # [CRITICAL FIX] View as 4D to generate 4 stride values
+        grad_output = grad_output.contiguous()
+        B, N = Q.shape[0], Q.shape[1]
+        grad_output_4d = grad_output.view(B, N, H, D) 
+    
+        # 2. Compute dS (Runs on Main Stream)
+        DS = torch.empty_like(Weights)
+        grid_ds = (N, B)
+        
+        HAS_MASK = (mask_table is not None)
+        mask_ptr_safe = mask_table if HAS_MASK else Weights
+    
+        hierarchical_attention_backward_dS_kernel[grid_ds](
+            grad_output_4d, Weights, V, idx_table, DS, mask_ptr_safe,
+            *grad_output_4d.stride(), 
+            *Weights.stride(),            
+            *V.stride(),            
+            *idx_table.stride(),    
+            *DS.stride(),            
+            sm_scale, H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, 
+            LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS,
+            HAS_MASK=HAS_MASK,
+            num_warps=4
+        )
+    
+        # --- SETUP PARALLELISM ---
+        dK = torch.zeros_like(K)
+        dV = torch.zeros_like(V)
+        dQ = torch.empty_like(Q)
+    
+        # --- BRANCH 1: dQ ---
+        grid_dq = (N, B)
+        hierarchical_attention_backward_dQ_kernel[grid_dq](
+            DS, K, idx_table, dQ, mask_ptr_safe, 
+            *DS.stride(), *K.stride(), *idx_table.stride(), *dQ.stride(),
+            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, LEVELS=LEVELS, #BLOCK_LEVELS=BLOCK_LEVELS,
+            HAS_MASK=HAS_MASK,
+            num_warps=4
+        )
+    
+        # --- BRANCH 2: dK/dV Per Level (Main Stream) ---
+        
+        # Step A: Launch Specialized Leaf Kernel (Level 0)
+        grid_leaf = (N, B)
+        hierarchical_attention_backward_dK_dV_leaf_kernel[grid_leaf](
+            DS, Q, Weights, grad_output_4d, gather_table, # <--- Use 4D
+            dK, dV,
+            *DS.stride(), *Q.stride(), *Weights.stride(), 
+            *grad_output_4d.stride(), # <--- Use 4D Strides
+            *dK.stride(),
+            *gather_table.stride(),
+            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
+            num_warps=4
+        )
+    
+        # Step B: Loop Over Internal Levels
+        current_start_node = N 
+        
+        for lvl in range(1, LEVELS+1):
+            num_nodes_in_level = N >> lvl
+    
+            # --- Dynamic Split-K Logic ---
+            if lvl < 9:
+                current_split_k = 1
+            else:
+                # 2^(lvl - 7) implementation using bit shift
+                current_split_k = 1 << (lvl - 8)    
+    
+    
+            # Calculate Grid
+            # Multiply node count by split factor to launch more blocks
+            grid_lvl = (num_nodes_in_level * current_split_k, B)
+        
+            hierarchical_attention_backward_dK_dV_internal_kernel[grid_lvl](
+                DS, Q, Weights, grad_output_4d, gather_table,
+                dK, dV,
+                *DS.stride(), *Q.stride(), *Weights.stride(),
+                *grad_output_4d.stride(),
+                *dK.stride(),
+                *gather_table.stride(),
+                H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
+            
+                START_NODE_ID=current_start_node,
+                TARGET_LEVEL=lvl,
+                SPLIT_K=current_split_k, # <--- Pass the split factor
+            
+                num_warps=4
+            )
+            
+            # Update offset for the next level
+            current_start_node += num_nodes_in_level
+    
+        return dQ, dK, dV, None, None, None
+
+
     #@staticmethod
     #def backward(ctx, grad_output):
     #    # 1. Retrieve Tensors
     #    Q, K, V, idx_table, gather_table, Weights, mask_table = ctx.saved_tensors
     #    sm_scale, H, BLOCK_H, D, BLOCK_D, LEVELS, BLOCK_LEVELS = ctx.constants
     #    
-    #    # [CRITICAL FIX] View as 4D to generate 4 stride values
+    #    # View as 4D
     #    grad_output = grad_output.contiguous()
     #    B, N = Q.shape[0], Q.shape[1]
     #    grad_output_4d = grad_output.view(B, N, H, D) 
     #
-    #    # 2. Compute dS (Runs on Main Stream)
+    #    # 2. Compute dS (Main Stream)
     #    DS = torch.empty_like(Weights)
     #    grid_ds = (N, B)
-    #    
     #    HAS_MASK = (mask_table is not None)
     #    mask_ptr_safe = mask_table if HAS_MASK else Weights
     #
     #    hierarchical_attention_backward_dS_kernel[grid_ds](
     #        grad_output_4d, Weights, V, idx_table, DS, mask_ptr_safe,
-    #        *grad_output_4d.stride(), 
-    #        *Weights.stride(),            
-    #        *V.stride(),            
-    #        *idx_table.stride(),    
-    #        *DS.stride(),            
-    #        sm_scale, H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, 
-    #        LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS,
-    #        HAS_MASK=HAS_MASK,
-    #        num_warps=4
+    #        *grad_output_4d.stride(), *Weights.stride(), *V.stride(), 
+    #        *idx_table.stride(), *DS.stride(),            
+    #        sm_scale, H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=32, 
+    #        LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS, HAS_MASK=HAS_MASK, num_warps=4
     #    )
     #
     #    # --- SETUP PARALLELISM ---
@@ -1559,179 +1654,74 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
     #    dV = torch.zeros_like(V)
     #    dQ = torch.empty_like(Q)
     #
-    #    # --- BRANCH 1: dQ ---
+    #    # --- BRANCH 1: dQ (Independent) ---
     #    grid_dq = (N, B)
     #    hierarchical_attention_backward_dQ_kernel[grid_dq](
     #        DS, K, idx_table, dQ, mask_ptr_safe, 
     #        *DS.stride(), *K.stride(), *idx_table.stride(), *dQ.stride(),
-    #        H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, LEVELS=LEVELS, #BLOCK_LEVELS=BLOCK_LEVELS,
-    #        HAS_MASK=HAS_MASK,
-    #        num_warps=4
+    #        H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=32, LEVELS=LEVELS,
+    #        HAS_MASK=HAS_MASK, num_warps=4
     #    )
     #
-    #    # --- BRANCH 2: dK/dV Per Level (Main Stream) ---
+    #    # --- BRANCH 2: dK/dV (Dependent on dS) ---
     #    
-    #    # Step A: Launch Specialized Leaf Kernel (Level 0)
+    #    # Step A: Leaf Kernel (Level 0)
     #    grid_leaf = (N, B)
     #    hierarchical_attention_backward_dK_dV_leaf_kernel[grid_leaf](
-    #        DS, Q, Weights, grad_output_4d, gather_table, # <--- Use 4D
+    #        DS, Q, Weights, grad_output_4d, gather_table,
     #        dK, dV,
     #        *DS.stride(), *Q.stride(), *Weights.stride(), 
-    #        *grad_output_4d.stride(), # <--- Use 4D Strides
-    #        *dK.stride(),
-    #        *gather_table.stride(),
-    #        H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
-    #        num_warps=4
+    #        *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
+    #        H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, num_warps=4
     #    )
     #
-    #    # Step B: Loop Over Internal Levels
-    #    current_start_node = N 
+    #    # CUTOFF: Levels 1-8 use Kernel A. Levels 9+ use Kernel B.
+    #    CUTOFF_LEVEL = 8
     #    
-    #    for lvl in range(1, LEVELS+1):
-    #        num_nodes_in_level = N >> lvl
-    #
-    #        # --- Dynamic Split-K Logic ---
-    #        if lvl < 9:
-    #            current_split_k = 1
-    #        else:
-    #            # 2^(lvl - 7) implementation using bit shift
-    #            current_split_k = 1 << (lvl - 8)    
-    #
-    #
-    #        # Calculate Grid
-    #        # Multiply node count by split factor to launch more blocks
-    #        grid_lvl = (num_nodes_in_level * current_split_k, B)
-    #    
-    #        hierarchical_attention_backward_dK_dV_internal_kernel[grid_lvl](
+    #    # --- KERNEL A: Low Levels (Split=1) ---
+    #    if LEVELS >= 1:
+    #        limit = min(LEVELS, CUTOFF_LEVEL)
+    #        # Total blocks = N - (N >> limit)
+    #        total_blocks_low = N - (N >> limit)
+    #        
+    #        grid_low = (total_blocks_low, B)
+    #        
+    #        hierarchical_attention_backward_low_level_kernel[grid_low](
     #            DS, Q, Weights, grad_output_4d, gather_table,
     #            dK, dV,
     #            *DS.stride(), *Q.stride(), *Weights.stride(),
-    #            *grad_output_4d.stride(),
-    #            *dK.stride(),
-    #            *gather_table.stride(),
+    #            *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
     #            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
+    #            N=N, 
+    #            MAX_LEVEL=limit, 
+    #            num_warps=4
+    #        )
+    #
+    #    # --- KERNEL B: High Levels (Split>1) ---
+    #    if LEVELS > CUTOFF_LEVEL:
+    #        num_high_levels = LEVELS - CUTOFF_LEVEL
     #        
-    #            START_NODE_ID=current_start_node,
-    #            TARGET_LEVEL=lvl,
-    #            SPLIT_K=current_split_k, # <--- Pass the split factor
+    #        # Constant blocks per level = N >> (CUTOFF)
+    #        # Actually, logic dictates: N >> (START_LEVEL - 1)
+    #        # If START_LEVEL=9, we need N >> 8.
+    #        blocks_per_lvl = N >> CUTOFF_LEVEL
     #        
+    #        total_blocks_high = blocks_per_lvl * num_high_levels
+    #        
+    #        grid_high = (total_blocks_high, B)
+    #        
+    #        hierarchical_attention_backward_high_level_kernel[grid_high](
+    #            DS, Q, Weights, grad_output_4d, gather_table,
+    #            dK, dV,
+    #            *DS.stride(), *Q.stride(), *Weights.stride(),
+    #            *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
+    #            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
+    #            N=N,
+    #            START_LEVEL=CUTOFF_LEVEL + 1, # Start at Level 9
     #            num_warps=4
     #        )
     #        
-    #        # Update offset for the next level
-    #        current_start_node += num_nodes_in_level
-    #
     #    return dQ, dK, dV, None, None, None
-
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        # 1. Retrieve Tensors
-        Q, K, V, idx_table, gather_table, Weights, mask_table = ctx.saved_tensors
-        sm_scale, H, BLOCK_H, D, BLOCK_D, LEVELS, BLOCK_LEVELS = ctx.constants
-        
-        # View as 4D
-        grad_output = grad_output.contiguous()
-        B, N = Q.shape[0], Q.shape[1]
-        grad_output_4d = grad_output.view(B, N, H, D) 
-
-        # 2. Compute dS (Runs on Main Stream)
-        DS = torch.empty_like(Weights)
-        grid_ds = (N, B)
-        HAS_MASK = (mask_table is not None)
-        mask_ptr_safe = mask_table if HAS_MASK else Weights
-
-        hierarchical_attention_backward_dS_kernel[grid_ds](
-            grad_output_4d, Weights, V, idx_table, DS, mask_ptr_safe,
-            *grad_output_4d.stride(), *Weights.stride(), *V.stride(), 
-            *idx_table.stride(), *DS.stride(),            
-            sm_scale, H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=32, 
-            LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS, HAS_MASK=HAS_MASK, num_warps=4
-        )
-
-        # --- SETUP PARALLELISM ---
-        dK = torch.zeros_like(K)
-        dV = torch.zeros_like(V)
-        dQ = torch.empty_like(Q)
-
-        # Create a side stream for dQ
-        stream_dq = torch.cuda.Stream()
-        
-        # Record that dS is done on the main stream so dQ knows when to start
-        ds_done_event = torch.cuda.Event()
-        ds_done_event.record(torch.cuda.current_stream())
-
-        # --- BRANCH 1: dQ (Independent Side Stream) ---
-        with torch.cuda.stream(stream_dq):
-            # Wait for dS to be computed
-            stream_dq.wait_event(ds_done_event)
-            
-            grid_dq = (N, B)
-            hierarchical_attention_backward_dQ_kernel[grid_dq](
-                DS, K, idx_table, dQ, mask_ptr_safe, 
-                *DS.stride(), *K.stride(), *idx_table.stride(), *dQ.stride(),
-                H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=32, LEVELS=LEVELS,
-                HAS_MASK=HAS_MASK, num_warps=4
-            )
-
-        # --- BRANCH 2: dK/dV (Dependent on dS, Runs on Main Stream) ---
-        # This runs immediately after dS, in parallel with the dQ stream above.
-        
-        # Step A: Leaf Kernel (Level 0)
-        grid_leaf = (N, B)
-        hierarchical_attention_backward_dK_dV_leaf_kernel[grid_leaf](
-            DS, Q, Weights, grad_output_4d, gather_table,
-            dK, dV,
-            *DS.stride(), *Q.stride(), *Weights.stride(), 
-            *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
-            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, num_warps=4
-        )
-
-        # CUTOFF: Levels 1-8 use Kernel A. Levels 9+ use Kernel B.
-        CUTOFF_LEVEL = 8
-        
-        # --- KERNEL A: Low Levels (Split=1) ---
-        if LEVELS >= 1:
-            limit = min(LEVELS, CUTOFF_LEVEL)
-            total_blocks_low = N - (N >> limit)
-            grid_low = (total_blocks_low, B)
-            
-            hierarchical_attention_backward_low_level_kernel[grid_low](
-                DS, Q, Weights, grad_output_4d, gather_table,
-                dK, dV,
-                *DS.stride(), *Q.stride(), *Weights.stride(),
-                *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
-                H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
-                N=N, 
-                MAX_LEVEL=limit, 
-                num_warps=4
-            )
-
-        # --- KERNEL B: High Levels (Split>1) ---
-        if LEVELS > CUTOFF_LEVEL:
-            num_high_levels = LEVELS - CUTOFF_LEVEL
-            blocks_per_lvl = N >> CUTOFF_LEVEL
-            total_blocks_high = blocks_per_lvl * num_high_levels
-            grid_high = (total_blocks_high, B)
-            
-            hierarchical_attention_backward_high_level_kernel[grid_high](
-                DS, Q, Weights, grad_output_4d, gather_table,
-                dK, dV,
-                *DS.stride(), *Q.stride(), *Weights.stride(),
-                *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
-                H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
-                N=N,
-                START_LEVEL=CUTOFF_LEVEL + 1, 
-                num_warps=4
-            )
-            
-        # --- SYNCHRONIZATION ---
-        # Before returning, the main stream must verify dQ is done.
-        dq_done_event = torch.cuda.Event()
-        dq_done_event.record(stream_dq)
-        torch.cuda.current_stream().wait_event(dq_done_event)
-
-        return dQ, dK, dV, None, None, None
 
 def hierarchical_fused_attention(Q, K, V, idx_table, gather_table, mask_table=None):
     """
