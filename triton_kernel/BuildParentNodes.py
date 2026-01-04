@@ -1032,7 +1032,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             )
 
         # ============================================================
-        # 6. Leaf dK/dV (level 0) — main stream
+        # 6. Leaf dK/dV (level 0) main stream
         # ============================================================
         k_leaf[grid](
             DS, Q, Weights, grad_output_4d, gather_table,
