@@ -1008,14 +1008,14 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         current_start_node = N 
         
         for lvl in range(1, LEVELS):
-            num_nodes_in_level = N >> lvl  
+            num_nodes_in_level = N >> lvl
 
             # --- Dynamic Split-K Logic ---
-            if lvl < 9:
+            if lvl < 10:
                 current_split_k = 1
             else:
                 # 2^(lvl - 7) implementation using bit shift
-                current_split_k = 1 << (lvl - 8)    
+                current_split_k = 1 << (lvl - 9)    
 
 
             # Calculate Grid
