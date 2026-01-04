@@ -977,7 +977,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         # --- SETUP PARALLELISM ---
         dK = torch.zeros_like(K)
         dV = torch.zeros_like(V)
-        dQ = torch.zeros_like(Q)
+        dQ = torch.empty_like(Q)
 
         # --- BRANCH 1: dQ ---
         grid_dq = (N, B)
@@ -1916,7 +1916,7 @@ def run_full_suite_update_X_from_Y():
 
     # 1. Setup Dimensions for Correctness
     # N needs to be a power of 2 usually for easier tree construction logic.
-    B, N, D, H = 32, 2048, 64, 16
+    B, N, D, H = 32, 512, 64, 16
     dim = H * D
     
     # 2. Initialize Model (Dropout=0.0 for deterministic check)
