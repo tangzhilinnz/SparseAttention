@@ -975,31 +975,59 @@ def hierarchical_attention_backward_low_level_kernel(
     pid = tl.program_id(0)
     b_idx = tl.program_id(1)
 
+    ## ------------------------------------------------------------------
+    ## 1. PID DECODING (Geometric Loop)
+    ## ------------------------------------------------------------------
+    ## We assume Split-K is ALWAYS 1 for these levels.
+    #
+    #target_level = 0
+    #node_id = 0
+    #
+    #current_block_offset = 0
+    #current_node_offset = N # Start after leaves
+    #
+    ## Iterate only up to MAX_LEVEL
+    #for lvl in range(1, MAX_LEVEL + 1):
+    #    nodes_in_lvl = N >> lvl
+    #    
+    #    # Check if PID belongs to this level
+    #    if pid >= current_block_offset and pid < (current_block_offset + nodes_in_lvl):
+    #        target_level = lvl
+    #        
+    #        node_local = pid - current_block_offset
+    #        node_id = current_node_offset + node_local
+    #        
+    #    # Accumulate offsets
+    #    current_block_offset += nodes_in_lvl
+    #    current_node_offset += nodes_in_lvl
+
     # ------------------------------------------------------------------
-    # 1. PID DECODING (Geometric Loop)
+    # 1. O(1) DECODING (Loop Free)
     # ------------------------------------------------------------------
-    # We assume Split-K is ALWAYS 1 for these levels.
     
-    target_level = 0
-    node_id = 0
+    # A. Calculate Node ID
+    # Since blocks are assigned sequentially starting from Level 1 (which starts at node N),
+    # the mapping is purely linear.
+    node_id = N + pid
+
+    # B. Calculate Target Level (Bitwise Magic)
+    # The levels are defined by powers of 2 boundaries from the end.
+    # Level 1: Ends at N/2. (MSB at K-1)
+    # Level 2: Ends at 3N/4. (MSB at K-2)
+    # Formula: Level = Log2(N) - Floor(Log2(N - 1 - pid))
     
-    current_block_offset = 0
-    current_node_offset = N # Start after leaves
+    # We compute Log2(N) at compile time using a Python trick for constexprs
+    # (Assuming N is power of 2)
+    LOG_N: tl.constexpr = N.bit_length() - 1
     
-    # Iterate only up to MAX_LEVEL
-    for lvl in range(1, MAX_LEVEL + 1):
-        nodes_in_lvl = N >> lvl
-        
-        # Check if PID belongs to this level
-        if pid >= current_block_offset and pid < (current_block_offset + nodes_in_lvl):
-            target_level = lvl
-            
-            node_local = pid - current_block_offset
-            node_id = current_node_offset + node_local
-            
-        # Accumulate offsets
-        current_block_offset += nodes_in_lvl
-        current_node_offset += nodes_in_lvl
+    # Reverse PID Index
+    rev_idx = N - 1 - pid
+    
+    # Find MSB position (Floor of Log2)
+    # We convert to float32 to use the fast GPU hardware log2 unit
+    msb_pos = tl.math.log2(rev_idx.to(tl.float32)).to(tl.int32)
+    
+    target_level = LOG_N - msb_pos
 
     # ------------------------------------------------------------------
     # 2. GATHER LOGIC (No Atomics)
