@@ -741,8 +741,8 @@ def hierarchical_attention_backward_dK_dV_internal_kernel(
         mask_d = offs_d < D
         mask_op = mask_h[:, None] & mask_d[None, :]
 
-        dk_acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
-        dv_acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
+        dk_acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float16)
+        dv_acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float16)
 
         if has_children:
             off_hq_d  = (offs_h[:, None] * sq_h)  + (offs_d[None, :] * sq_d)
