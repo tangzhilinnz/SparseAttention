@@ -1654,14 +1654,14 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         dV = torch.zeros_like(V)
         dQ = torch.empty_like(Q)
 
-        # --- BRANCH 1: dQ (Independent) ---
-        grid_dq = (N, B)
-        hierarchical_attention_backward_dQ_kernel[grid_dq](
-            DS, K, idx_table, dQ, mask_ptr_safe, 
-            *DS.stride(), *K.stride(), *idx_table.stride(), *dQ.stride(),
-            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=32, LEVELS=LEVELS,
-            HAS_MASK=HAS_MASK, num_warps=4
-        )
+        ## --- BRANCH 1: dQ (Independent) ---
+        #grid_dq = (N, B)
+        #hierarchical_attention_backward_dQ_kernel[grid_dq](
+        #    DS, K, idx_table, dQ, mask_ptr_safe, 
+        #    *DS.stride(), *K.stride(), *idx_table.stride(), *dQ.stride(),
+        #    H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=32, LEVELS=LEVELS,
+        #    HAS_MASK=HAS_MASK, num_warps=4
+        #)
 
         # --- BRANCH 2: dK/dV (Dependent on dS) ---
         
@@ -1720,6 +1720,15 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
                 START_LEVEL=CUTOFF_LEVEL + 1, # Start at Level 9
                 num_warps=4
             )
+
+         # --- BRANCH 1: dQ (Independent) ---
+        grid_dq = (N, B)
+        hierarchical_attention_backward_dQ_kernel[grid_dq](
+            DS, K, idx_table, dQ, mask_ptr_safe, 
+            *DS.stride(), *K.stride(), *idx_table.stride(), *dQ.stride(),
+            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=32, LEVELS=LEVELS,
+            HAS_MASK=HAS_MASK, num_warps=4
+        )
             
         return dQ, dK, dV, None, None, None
 
