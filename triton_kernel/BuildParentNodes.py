@@ -1321,7 +1321,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             total_blocks += N - (N >> limit)
             
         # Zone 2 (Levels 8+)
-        if LEVELS >= 7:
+        if LEVELS >= 8:
             # Each level has constant blocks: N >> 8
             blocks_per_lvl = N >> 8
             num_levels_zone2 = LEVELS - 7
@@ -2199,7 +2199,7 @@ def run_full_suite_update_X_from_Y():
 
     # Config: Large scale to saturate GPU
     # B, N, D, H = 32, 4096, 64, 8
-    B, N, D, H = 64, 2048* 4, 64, 8
+    B, N, D, H = 64, 1024, 64, 8
     dim = D * H
 
     print(f"Config: B={B}, N={N}, D={dim} (HeadDim={D}), H={H}, dtype={check_dtype}")
