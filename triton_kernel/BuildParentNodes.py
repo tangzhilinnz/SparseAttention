@@ -741,8 +741,8 @@ def hierarchical_attention_backward_dK_dV_internal_kernel(
         mask_d = offs_d < D
         mask_op = mask_h[:, None] & mask_d[None, :]
 
-        dk_acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float16)
-        dv_acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float16)
+        dk_acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
+        dv_acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
 
         if has_children:
             off_hq_d  = (offs_h[:, None] * sq_h)  + (offs_d[None, :] * sq_d)
@@ -779,6 +779,127 @@ def hierarchical_attention_backward_dK_dV_internal_kernel(
         ptr_dv = DV_ptr + off_out + (offs_h[:, None] * sdk_h) + (offs_d[None, :] * sdk_d)
 
         if SPLIT_K > 1:
+            tl.atomic_add(ptr_dk, dk_acc, mask=mask_op)
+            tl.atomic_add(ptr_dv, dv_acc, mask=mask_op)
+        else:
+            tl.store(ptr_dk, dk_acc, mask=mask_op)
+            tl.store(ptr_dv, dv_acc, mask=mask_op)
+
+
+
+@triton.jit
+def hierarchical_attention_backward_dK_dV_fused_kernel(
+    # Inputs
+    DS_ptr, Q_ptr, W_ptr, DO_ptr, Gather_Table_ptr, 
+    Task_Metadata_ptr, # <--- NEW: Pointer to pre-calculated task list
+    # Outputs
+    DK_ptr, DV_ptr,
+
+    # Strides
+    sds_b, sds_n, sds_h, sds_lvl,
+    sq_b, sq_n, sq_h, sq_d,
+    sw_b, sw_n, sw_h, sw_lvl,
+    sdo_b, sdo_n, sdo_h, sdo_d,
+    sdk_b, sdk_node, sdk_h, sdk_d,
+    sg_node, sg_dim,
+
+    # Constants (Invariant)
+    H: tl.constexpr, BLOCK_H: tl.constexpr,
+    D: tl.constexpr, BLOCK_D: tl.constexpr
+):
+    pid = tl.program_id(0)
+    b_idx = tl.program_id(1)
+
+    # ------------------------------------------------------------
+    # 1. Load Task Metadata (The "Routing" Step)
+    # ------------------------------------------------------------
+    # Each task entry is 4 integers: [Node_ID, Level, Split_ID, Split_K_Total]
+    # We use int32, so offset is pid * 4
+    task_offset = pid * 4
+    
+    # Load all 4 values. 
+    # Note: We assume Task_Metadata_ptr is int32 pointer.
+    node_id   = tl.load(Task_Metadata_ptr + task_offset + 0)
+    level     = tl.load(Task_Metadata_ptr + task_offset + 1)
+    split_id  = tl.load(Task_Metadata_ptr + task_offset + 2)
+    split_k   = tl.load(Task_Metadata_ptr + task_offset + 3)
+
+    # ------------------------------------------------------------
+    # 2. Compute Derived Constants (Dynamic)
+    # ------------------------------------------------------------
+    # Previous constexprs are now runtime variables
+    num_children = 1 << level
+    w_idx = level + 1
+    
+    # Calculate Child Range for this Split
+    # Equivalent to: (num_children + split_k - 1) // split_k
+    children_per_split = (num_children + split_k - 1) // split_k
+    
+    start_k = split_id * children_per_split
+    
+    # ------------------------------------------------------------
+    # 3. Gather Logic (Standard)
+    # ------------------------------------------------------------
+    tab_ptr = Gather_Table_ptr + (node_id * sg_node)
+    child_start_base = tl.load(tab_ptr + 0)
+    has_children = (child_start_base != -1)
+
+    # Pointers Invariant to D
+    offs_h = tl.arange(0, BLOCK_H)
+    mask_h = offs_h < H
+    
+    # Base Pointers (Hoisted)
+    off_out_base = (b_idx * sdk_b) + (node_id * sdk_node) + (offs_h[:, None] * sdk_h)
+    
+    ptr_ds_batch = DS_ptr + (b_idx * sds_b) + (w_idx * sds_lvl)
+    ptr_w_batch  = W_ptr  + (b_idx * sw_b)  + (w_idx * sw_lvl)
+    ptr_q_batch  = Q_ptr  + (b_idx * sq_b)
+    ptr_do_batch = DO_ptr + (b_idx * sdo_b)
+
+    # ------------------------------------------------------------
+    # 4. Main Loop
+    # ------------------------------------------------------------
+    for off_d_start in range(0, D, BLOCK_D):
+        offs_d = off_d_start + tl.arange(0, BLOCK_D)
+        mask_d = offs_d < D
+        mask_op = mask_h[:, None] & mask_d[None, :]
+
+        dk_acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
+        dv_acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
+
+        if has_children:
+            off_hq_d  = (offs_h[:, None] * sq_h)  + (offs_d[None, :] * sq_d)
+            off_hdo_d = (offs_h[:, None] * sdo_h) + (offs_d[None, :] * sdo_d)
+
+            # Dynamic Inner Loop
+            for k_offset in range(children_per_split):
+                k = start_k + k_offset
+                # Safety check for last split
+                if k < num_children:
+                    child_idx = child_start_base + k
+                    
+                    # Pointer Math
+                    ptr_ds = ptr_ds_batch + (child_idx * sds_n) + (offs_h * sds_h)
+                    ptr_w  = ptr_w_batch  + (child_idx * sw_n)  + (offs_h * sw_h)
+                    
+                    ds = tl.load(ptr_ds, mask=mask_h, other=0.0)[:, None]
+                    w  = tl.load(ptr_w,  mask=mask_h, other=0.0)[:, None]
+                    
+                    ptr_q  = ptr_q_batch  + (child_idx * sq_n)  + off_hq_d
+                    ptr_do = ptr_do_batch + (child_idx * sdo_n) + off_hdo_d
+                    
+                    q  = tl.load(ptr_q,  mask=mask_op, other=0.0)
+                    do = tl.load(ptr_do, mask=mask_op, other=0.0)
+                    
+                    dk_acc += ds * q
+                    dv_acc += w * do
+
+        # 5. Write Output
+        ptr_dk = DK_ptr + off_out_base + (offs_d[None, :] * sdk_d)
+        ptr_dv = DV_ptr + off_out_base + (offs_d[None, :] * sdk_d)
+
+        # Dynamic Atomic Decision
+        if split_k > 1:
             tl.atomic_add(ptr_dk, dk_acc, mask=mask_op)
             tl.atomic_add(ptr_dv, dv_acc, mask=mask_op)
         else:
@@ -897,6 +1018,53 @@ def hierarchical_attention_backward_dQ_kernel(
 
 
 class HierarchicalAttentionFunc(torch.autograd.Function):
+    
+    # Cache for backward task metadata: Key=(N, device), Value=task_tensor
+    _backward_task_cache = {}
+
+    @staticmethod
+    def _get_or_create_backward_metadata(N, LEVELS, device):
+        """
+        Retrieves pre-calculated task metadata for Fused Backward Kernel.
+        Generates it once per (N, Device) configuration.
+        """
+        cache_key = (N, device)
+        
+        if cache_key in HierarchicalAttentionFunc._backward_task_cache:
+            return HierarchicalAttentionFunc._backward_task_cache[cache_key]
+        
+        # --- GENERATE METADATA (Run Once) ---
+        tasks = []
+        current_start_node = N # Start after leaves
+        
+        # Iterate Levels 1 to Root
+        for lvl in range(1, LEVELS + 1):
+            num_nodes = N >> lvl
+            
+            # Split-K Logic
+            split_k = 1
+            if lvl >= 9:
+                split_k = 1 << (lvl - 8)
+            
+            # Generate tasks for this level
+            for i in range(num_nodes):
+                global_node_id = current_start_node + i
+                
+                # Create 'split_k' tasks for this single node
+                for s in range(split_k):
+                    # Format: [Node_ID, Level, Split_ID, Split_K_Total]
+                    tasks.append([global_node_id, lvl, s, split_k])
+            
+            current_start_node += num_nodes
+
+        # Create Tensor and Cache It
+        # Note: We use int32 for efficiency
+        task_tensor = torch.tensor(tasks, dtype=torch.int32, device=device)
+        
+        HierarchicalAttentionFunc._backward_task_cache[cache_key] = task_tensor
+        return task_tensor
+    
+
     @staticmethod
     def forward(ctx, Q, K, V, idx_table, gather_table, mask_table=None):
         # Alignment checks
@@ -943,115 +1111,13 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         ctx.constants = (sm_scale, H, BLOCK_H, D, BLOCK_D, LEVELS, BLOCK_LEVELS)
         return Out
 
-    @staticmethod
-    def backward(ctx, grad_output):
-        # 1. Retrieve Tensors
-        Q, K, V, idx_table, gather_table, Weights, mask_table = ctx.saved_tensors
-        sm_scale, H, BLOCK_H, D, BLOCK_D, LEVELS, BLOCK_LEVELS = ctx.constants
-        
-        # [CRITICAL FIX] View as 4D to generate 4 stride values
-        grad_output = grad_output.contiguous()
-        B, N = Q.shape[0], Q.shape[1]
-        grad_output_4d = grad_output.view(B, N, H, D) 
-
-        # 2. Compute dS (Runs on Main Stream)
-        DS = torch.empty_like(Weights)
-        grid_ds = (N, B)
-        
-        HAS_MASK = (mask_table is not None)
-        mask_ptr_safe = mask_table if HAS_MASK else Weights
-
-        hierarchical_attention_backward_dS_kernel[grid_ds](
-            grad_output_4d, Weights, V, idx_table, DS, mask_ptr_safe,
-            *grad_output_4d.stride(), 
-            *Weights.stride(),            
-            *V.stride(),            
-            *idx_table.stride(),    
-            *DS.stride(),            
-            sm_scale, H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, 
-            LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS,
-            HAS_MASK=HAS_MASK,
-            num_warps=4
-        )
-
-        # --- SETUP PARALLELISM ---
-        dK = torch.zeros_like(K)
-        dV = torch.zeros_like(V)
-        dQ = torch.empty_like(Q)
-
-        # --- BRANCH 1: dQ ---
-        grid_dq = (N, B)
-        hierarchical_attention_backward_dQ_kernel[grid_dq](
-            DS, K, idx_table, dQ, mask_ptr_safe, 
-            *DS.stride(), *K.stride(), *idx_table.stride(), *dQ.stride(),
-            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, LEVELS=LEVELS, #BLOCK_LEVELS=BLOCK_LEVELS,
-            HAS_MASK=HAS_MASK,
-            num_warps=4
-        )
-
-        # --- BRANCH 2: dK/dV Per Level (Main Stream) ---
-        
-        # Step A: Launch Specialized Leaf Kernel (Level 0)
-        grid_leaf = (N, B)
-        hierarchical_attention_backward_dK_dV_leaf_kernel[grid_leaf](
-            DS, Q, Weights, grad_output_4d, gather_table, # <--- Use 4D
-            dK, dV,
-            *DS.stride(), *Q.stride(), *Weights.stride(), 
-            *grad_output_4d.stride(), # <--- Use 4D Strides
-            *dK.stride(),
-            *gather_table.stride(),
-            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
-            num_warps=4
-        )
-
-        # Step B: Loop Over Internal Levels
-        current_start_node = N 
-        
-        for lvl in range(1, LEVELS+1):
-            num_nodes_in_level = N >> lvl
-
-            # --- Dynamic Split-K Logic ---
-            if lvl < 9:
-                current_split_k = 1
-            else:
-                # 2^(lvl - 7) implementation using bit shift
-                current_split_k = 1 << (lvl - 8)    
-
-
-            # Calculate Grid
-            # Multiply node count by split factor to launch more blocks
-            grid_lvl = (num_nodes_in_level * current_split_k, B)
-        
-            hierarchical_attention_backward_dK_dV_internal_kernel[grid_lvl](
-                DS, Q, Weights, grad_output_4d, gather_table,
-                dK, dV,
-                *DS.stride(), *Q.stride(), *Weights.stride(),
-                *grad_output_4d.stride(),
-                *dK.stride(),
-                *gather_table.stride(),
-                H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
-            
-                START_NODE_ID=current_start_node,
-                TARGET_LEVEL=lvl,
-                SPLIT_K=current_split_k, # <--- Pass the split factor
-            
-                num_warps=4
-            )
-            
-            # Update offset for the next level
-            current_start_node += num_nodes_in_level
-
-        return dQ, dK, dV, None, None, None
-
-
     #@staticmethod
     #def backward(ctx, grad_output):
     #    # 1. Retrieve Tensors
-    #    Q, K, V, idx_table, Weights, mask_table = ctx.saved_tensors
+    #    Q, K, V, idx_table, gather_table, Weights, mask_table = ctx.saved_tensors
     #    sm_scale, H, BLOCK_H, D, BLOCK_D, LEVELS, BLOCK_LEVELS = ctx.constants
-    #
+    #    
     #    # [CRITICAL FIX] View as 4D to generate 4 stride values
-    #    # grad_output comes in as [B, N, D], but kernels need [B, N, H, D] strides
     #    grad_output = grad_output.contiguous()
     #    B, N = Q.shape[0], Q.shape[1]
     #    grad_output_4d = grad_output.view(B, N, H, D) 
@@ -1059,22 +1125,17 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
     #    # 2. Compute dS (Runs on Main Stream)
     #    DS = torch.empty_like(Weights)
     #    grid_ds = (N, B)
-    #
+    #    
     #    HAS_MASK = (mask_table is not None)
     #    mask_ptr_safe = mask_table if HAS_MASK else Weights
     #
-    #    # (Assumes dS kernel exists in scope)
     #    hierarchical_attention_backward_dS_kernel[grid_ds](
-    #        # Pass the 4D view
     #        grad_output_4d, Weights, V, idx_table, DS, mask_ptr_safe,
-    #    
-    #        # Pass the 4D strides
     #        *grad_output_4d.stride(), 
     #        *Weights.stride(),            
     #        *V.stride(),            
     #        *idx_table.stride(),    
     #        *DS.stride(),            
-    #    
     #        sm_scale, H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, 
     #        LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS,
     #        HAS_MASK=HAS_MASK,
@@ -1082,67 +1143,144 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
     #    )
     #
     #    # --- SETUP PARALLELISM ---
-    #    # Initialize dK/dV to Zeros for Atomic Accumulation
     #    dK = torch.zeros_like(K)
     #    dV = torch.zeros_like(V)
     #    dQ = torch.empty_like(Q)
     #
-    #    main_stream = torch.cuda.current_stream()
-    #    side_stream = torch.cuda.Stream()
-    #
-    #    side_stream.wait_stream(main_stream)
-    #
-    #    # --- BRANCH 1: dQ (Side Stream) ---
-    #    with torch.cuda.stream(side_stream):
-    #        grid_dq = (N, B)
-    #        # (Assumes dQ kernel exists in scope)
-    #        hierarchical_attention_backward_dQ_kernel[grid_dq](
-    #            DS, K, idx_table, dQ, mask_ptr_safe, 
-    #            *DS.stride(), *K.stride(), *idx_table.stride(), *dQ.stride(),
-    #            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS,
-    #            HAS_MASK=HAS_MASK,
-    #            num_warps=4
-    #        )
-    #
-    #    # --- BRANCH 2: dK/dV (Main Stream - Vectorized Atomic) ---
-    #    # Replaced the scalar loop kernel with the vectorized kernel.
-    #    grid_atomic = (N, B)
-    #
-    #    # Use the VECTORIZED Kernel
-    #    hierarchical_attention_backward_dK_dV_atomic_kernel[grid_atomic](
-    #        # Inputs
-    #        DS,              # DS_ptr
-    #        grad_output_4d,  # DO_ptr
-    #        Q,               # Q_ptr
-    #        Weights,         # W_ptr
-    #        idx_table,       # Lookup_ptr
-    #        mask_ptr_safe,   # Mask_ptr
-    #    
-    #        # Outputs (Accumulators)
-    #        dK,              # DK_ptr
-    #        dV,              # DV_ptr
-    #    
-    #        # Strides
-    #        *DS.stride(),             # sds_b, sds_n, sds_h, sds_lvl
-    #        *grad_output_4d.stride(), # sdo_b, sdo_n, sdo_h, sdo_d
-    #        *Q.stride(),              # sq_b, sq_n, sq_h, sq_d
-    #        *Weights.stride(),        # sw_b, sw_n, sw_h, sw_lvl
-    #        *idx_table.stride(),      # sl_n, sl_lvl (Assumes [N, LEVELS])
-    #        *dK.stride(),             # sdk_b, sdk_n, sdk_h, sdk_d
-    #    
-    #        # Constants
-    #        H=H, BLOCK_H=BLOCK_H,
-    #        D=D, BLOCK_D=BLOCK_D,
-    #        LEVELS=LEVELS, 
+    #    # --- BRANCH 1: dQ ---
+    #    grid_dq = (N, B)
+    #    hierarchical_attention_backward_dQ_kernel[grid_dq](
+    #        DS, K, idx_table, dQ, mask_ptr_safe, 
+    #        *DS.stride(), *K.stride(), *idx_table.stride(), *dQ.stride(),
+    #        H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, LEVELS=LEVELS, #BLOCK_LEVELS=BLOCK_LEVELS,
     #        HAS_MASK=HAS_MASK,
-    #    
-    #        num_warps=8
+    #        num_warps=4
     #    )
     #
-    #    # Synchronize streams
-    #    main_stream.wait_stream(side_stream)
+    #    # --- BRANCH 2: dK/dV Per Level (Main Stream) ---
+    #    
+    #    # Step A: Launch Specialized Leaf Kernel (Level 0)
+    #    grid_leaf = (N, B)
+    #    hierarchical_attention_backward_dK_dV_leaf_kernel[grid_leaf](
+    #        DS, Q, Weights, grad_output_4d, gather_table, # <--- Use 4D
+    #        dK, dV,
+    #        *DS.stride(), *Q.stride(), *Weights.stride(), 
+    #        *grad_output_4d.stride(), # <--- Use 4D Strides
+    #        *dK.stride(),
+    #        *gather_table.stride(),
+    #        H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
+    #        num_warps=4
+    #    )
     #
-    #    return dQ, dK, dV, None, None
+    #    # Step B: Loop Over Internal Levels
+    #    current_start_node = N 
+    #    
+    #    for lvl in range(1, LEVELS+1):
+    #        num_nodes_in_level = N >> lvl
+    #
+    #        # --- Dynamic Split-K Logic ---
+    #        if lvl < 9:
+    #            current_split_k = 1
+    #        else:
+    #            # 2^(lvl - 7) implementation using bit shift
+    #            current_split_k = 1 << (lvl - 8)    
+    #
+    #
+    #        # Calculate Grid
+    #        # Multiply node count by split factor to launch more blocks
+    #        grid_lvl = (num_nodes_in_level * current_split_k, B)
+    #    
+    #        hierarchical_attention_backward_dK_dV_internal_kernel[grid_lvl](
+    #            DS, Q, Weights, grad_output_4d, gather_table,
+    #            dK, dV,
+    #            *DS.stride(), *Q.stride(), *Weights.stride(),
+    #            *grad_output_4d.stride(),
+    #            *dK.stride(),
+    #            *gather_table.stride(),
+    #            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
+    #        
+    #            START_NODE_ID=current_start_node,
+    #            TARGET_LEVEL=lvl,
+    #            SPLIT_K=current_split_k, # <--- Pass the split factor
+    #        
+    #            num_warps=4
+    #        )
+    #        
+    #        # Update offset for the next level
+    #        current_start_node += num_nodes_in_level
+    #
+    #    return dQ, dK, dV, None, None, None
+
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # 1. Retrieve Tensors
+        Q, K, V, idx_table, gather_table, Weights, mask_table = ctx.saved_tensors
+        sm_scale, H, BLOCK_H, D, BLOCK_D, LEVELS, BLOCK_LEVELS = ctx.constants
+        
+        # View as 4D
+        grad_output = grad_output.contiguous()
+        B, N = Q.shape[0], Q.shape[1]
+        grad_output_4d = grad_output.view(B, N, H, D) 
+
+        # 2. Compute dS (Main Stream)
+        DS = torch.empty_like(Weights)
+        grid_ds = (N, B)
+        HAS_MASK = (mask_table is not None)
+        mask_ptr_safe = mask_table if HAS_MASK else Weights
+
+        hierarchical_attention_backward_dS_kernel[grid_ds](
+            grad_output_4d, Weights, V, idx_table, DS, mask_ptr_safe,
+            *grad_output_4d.stride(), *Weights.stride(), *V.stride(), 
+            *idx_table.stride(), *DS.stride(),            
+            sm_scale, H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=32, 
+            LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS, HAS_MASK=HAS_MASK, num_warps=4
+        )
+
+        # --- SETUP PARALLELISM ---
+        dK = torch.zeros_like(K)
+        dV = torch.zeros_like(V)
+        dQ = torch.empty_like(Q)
+
+        # --- BRANCH 1: dQ (Independent) ---
+        grid_dq = (N, B)
+        hierarchical_attention_backward_dQ_kernel[grid_dq](
+            DS, K, idx_table, dQ, mask_ptr_safe, 
+            *DS.stride(), *K.stride(), *idx_table.stride(), *dQ.stride(),
+            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=32, LEVELS=LEVELS,
+            HAS_MASK=HAS_MASK, num_warps=4
+        )
+
+        # --- BRANCH 2: dK/dV (Dependent on dS) ---
+        
+        # Step A: Leaf Kernel (Level 0)
+        grid_leaf = (N, B)
+        hierarchical_attention_backward_dK_dV_leaf_kernel[grid_leaf](
+            DS, Q, Weights, grad_output_4d, gather_table,
+            dK, dV,
+            *DS.stride(), *Q.stride(), *Weights.stride(), 
+            *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
+            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, num_warps=4
+        )
+
+        # Step B: Fused Internal Kernel (Level 1+)
+        # [OPTIMIZATION] Retrieve cached metadata instantly
+        task_tensor = HierarchicalAttentionFunc._get_or_create_backward_metadata(N, LEVELS, Q.device)
+        total_blocks = task_tensor.shape[0]
+
+        grid_fused = (total_blocks, B)
+        
+        hierarchical_attention_backward_dK_dV_fused_kernel[grid_fused](
+            DS, Q, Weights, grad_output_4d, gather_table, 
+            task_tensor, # <--- Passing the cached tensor
+            dK, dV,
+            *DS.stride(), *Q.stride(), *Weights.stride(), 
+            *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
+            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, 
+            num_warps=4
+        )
+            
+        return dQ, dK, dV, None, None, None
 
 def hierarchical_fused_attention(Q, K, V, idx_table, gather_table, mask_table=None):
     """
