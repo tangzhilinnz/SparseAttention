@@ -918,7 +918,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         grid = (N, B)
         BLOCK_H = triton.next_power_of_2(H)
         BLOCK_LEVELS = triton.next_power_of_2(LEVELS)
-        BLOCK_D = min(32, triton.next_power_of_2(D))
+        BLOCK_D = min(64, triton.next_power_of_2(D))
         sm_scale = 1.0 / math.sqrt(D)
         
         hierarchical_attention_forward_kernel[grid](
