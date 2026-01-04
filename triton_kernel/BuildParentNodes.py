@@ -730,16 +730,16 @@ def hierarchical_attention_backward_dK_dV_internal_kernel(
     mask_h = offs_h < H
     
     # 1. Gather Table
-    child_start_base = tl.load(Gather_Table_ptr + node_id * sg_node, other=-1)
+    # [FIX] Removed 'other=-1'. We load the value directly. 
+    # If the node has no children, the table itself contains -1.
+    child_start_base = tl.load(Gather_Table_ptr + node_id * sg_node)
+    
     has_children = (child_start_base != -1)
 
     # 2. Output Pointer (Base)
     off_out_base = (b_idx * sdk_b) + (node_id * sdk_node) + (offs_h[:, None] * sdk_h)
 
     # 3. Input Base Pointers (Hoisted Invariants)
-    # We pre-calculate the parts of the pointer that DO NOT change per child
-    # to save integer math in the inner loop.
-    
     # DS Base: [Batch] + [Level]
     ptr_ds_batch = DS_ptr + (b_idx * sds_b) + (W_IDX * sds_lvl)
     
@@ -779,10 +779,8 @@ def hierarchical_attention_backward_dK_dV_internal_kernel(
                 child_idx = child_start_base + k
 
                 # --- Optimized Pointer Math ---
-                # We simply add (child_idx * stride) to the batch base
                 
                 # A. Load DS / W [BLOCK_H, 1]
-                # ptr = Base + (Child * stride) + (Head * stride)
                 ptr_ds = ptr_ds_batch + (child_idx * sds_n) + (offs_h * sds_h)
                 ptr_w  = ptr_w_batch  + (child_idx * sw_n)  + (offs_h * sw_h)
 
@@ -790,7 +788,6 @@ def hierarchical_attention_backward_dK_dV_internal_kernel(
                 w  = tl.load(ptr_w,  mask=mask_h & valid_child, other=0.0)[:, None]
 
                 # B. Load Q / DO [BLOCK_H, BLOCK_D]
-                # ptr = Base + (Child * stride) + (Head/D offset)
                 ptr_q  = ptr_q_batch  + (child_idx * sq_n)  + off_hq_d
                 ptr_do = ptr_do_batch + (child_idx * sdo_n) + off_hdo_d
 
@@ -804,7 +801,6 @@ def hierarchical_attention_backward_dK_dV_internal_kernel(
         # --------------------------------------------------------
         # Write output (Atomic or Store)
         # --------------------------------------------------------
-        # ptr = Base + D offset
         ptr_dk = DK_ptr + off_out_base + (offs_d[None, :] * sdk_d)
         ptr_dv = DV_ptr + off_out_base + (offs_d[None, :] * sdk_d)
 
