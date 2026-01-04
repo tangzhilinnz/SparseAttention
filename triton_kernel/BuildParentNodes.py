@@ -1009,13 +1009,6 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         
         for lvl in range(1, LEVELS):
             num_nodes_in_level = N >> lvl  
-            
-            #if lvl < 8:
-            #    current_split_k = 1
-            #elif lvl < 10:
-            #    current_split_k = 4
-            #else:
-            #    current_split_k = 16
 
             # --- Dynamic Split-K Logic ---
             if lvl < 8:
@@ -1042,7 +1035,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
                 TARGET_LEVEL=lvl,
                 SPLIT_K=current_split_k, # <--- Pass the split factor
             
-                num_warps=4
+                num_warps=8
             )
             
             # Update offset for the next level
