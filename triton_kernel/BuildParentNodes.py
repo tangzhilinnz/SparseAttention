@@ -788,13 +788,10 @@ def hierarchical_attention_backward_dK_dV_internal_kernel(
 
 
 @triton.jit
-def hierarchical_attention_backward_dK_dV_fused_kernel(
+def hierarchical_attention_backward_dK_dV_fused_math_kernel(
     # Inputs
-    DS_ptr, Q_ptr, W_ptr, DO_ptr, Gather_Table_ptr, 
-    Task_Metadata_ptr, # <--- NEW: Pointer to pre-calculated task list
-    # Outputs
+    DS_ptr, Q_ptr, W_ptr, DO_ptr, Gather_Table_ptr,
     DK_ptr, DV_ptr,
-
     # Strides
     sds_b, sds_n, sds_h, sds_lvl,
     sq_b, sq_n, sq_h, sq_d,
@@ -802,63 +799,115 @@ def hierarchical_attention_backward_dK_dV_fused_kernel(
     sdo_b, sdo_n, sdo_h, sdo_d,
     sdk_b, sdk_node, sdk_h, sdk_d,
     sg_node, sg_dim,
-
-    # Constants (Invariant)
+    # Constants
     H: tl.constexpr, BLOCK_H: tl.constexpr,
-    D: tl.constexpr, BLOCK_D: tl.constexpr
+    D: tl.constexpr, BLOCK_D: tl.constexpr,
+    LEVELS: tl.constexpr, 
+    N: tl.constexpr       
 ):
     pid = tl.program_id(0)
     b_idx = tl.program_id(1)
 
-    # ------------------------------------------------------------
-    # 1. Load Task Metadata (The "Routing" Step)
-    # ------------------------------------------------------------
-    # Each task entry is 4 integers: [Node_ID, Level, Split_ID, Split_K_Total]
-    # We use int32, so offset is pid * 4
-    task_offset = pid * 4
+    # ------------------------------------------------------------------
+    # 1. OPTIMIZED PID DECODING (O(1) for High Levels)
+    # ------------------------------------------------------------------
     
-    # Load all 4 values. 
-    # Note: We assume Task_Metadata_ptr is int32 pointer.
-    node_id   = tl.load(Task_Metadata_ptr + task_offset + 0)
-    level     = tl.load(Task_Metadata_ptr + task_offset + 1)
-    split_id  = tl.load(Task_Metadata_ptr + task_offset + 2)
-    split_k   = tl.load(Task_Metadata_ptr + task_offset + 3)
+    # Constants for Grid Math
+    # Zone 1 ends after Level 7.
+    # Total blocks in Lvl 1-7 = N * (1/2 + ... + 1/128) = N - (N >> 7)
+    ZONE2_START_PID: tl.constexpr = N - (N >> 7)
+    
+    # In Zone 2 (Level 8+), every level has exactly the same number of blocks:
+    # Blocks = (N >> L) * 2^(L-8) = N >> 8
+    BLOCKS_PER_LVL_ZONE2: tl.constexpr = N >> 8
 
-    # ------------------------------------------------------------
-    # 2. Compute Derived Constants (Dynamic)
-    # ------------------------------------------------------------
-    # Previous constexprs are now runtime variables
-    num_children = 1 << level
-    w_idx = level + 1
+    # Init variables
+    target_level = 0
+    node_id = 0
+    split_id = 0
+    split_k = 0
+
+    # --- PATH A: High Levels (Direct Math) ---
+    # This handles the "Long Tail" (Levels 8, 9, 10...) without looping.
+    if pid >= ZONE2_START_PID:
+        # 1. Relative PID inside Zone 2
+        rel_pid = pid - ZONE2_START_PID
+        
+        # 2. Determine Level (Integer Division)
+        # Since BLOCKS_PER_LVL_ZONE2 is power of 2, Triton compiles this to a bit shift.
+        lvl_offset = rel_pid // BLOCKS_PER_LVL_ZONE2
+        target_level = lvl_offset + 8
+        
+        # 3. Determine Index inside that level
+        rem = rel_pid % BLOCKS_PER_LVL_ZONE2
+        
+        # 4. Calculate Split-K (Formula: 2^(L-8))
+        split_k = 1 << (target_level - 8)
+        
+        # 5. Decode Node vs Split
+        # pid = node_local * split_k + split_id
+        node_local = rem // split_k
+        split_id = rem % split_k
+        
+        # 6. Global Node ID
+        # Formula: Start(L) = 2N - N / 2^(L-1)
+        start_node_global = (2 * N) - (N >> (target_level - 1))
+        node_id = start_node_global + node_local
+
+    # --- PATH B: Low Levels (Small Loop) ---
+    # Levels 1-7. Loop runs max 7 times.
+    else:
+        current_block_offset = 0
+        current_node_offset = N
+        
+        # Static unroll hint for compiler
+        for lvl in range(1, 8): 
+            nodes_in_lvl = N >> lvl
+            # Split-K is always 1 here
+            
+            # Check if PID belongs to this level
+            if pid >= current_block_offset and pid < (current_block_offset + nodes_in_lvl):
+                target_level = lvl
+                split_k = 1
+                split_id = 0
+                
+                node_local = pid - current_block_offset
+                node_id = current_node_offset + node_local
+                
+            # Accumulate offsets
+            current_block_offset += nodes_in_lvl
+            current_node_offset += nodes_in_lvl
+
+    # ------------------------------------------------------------------
+    # 2. Rest of Kernel (Gather Logic)
+    # ------------------------------------------------------------------
     
-    # Calculate Child Range for this Split
-    # Equivalent to: (num_children + split_k - 1) // split_k
+    # Derived Constants
+    num_children = 1 << target_level
+    w_idx = target_level + 1
+    
+    # Calculate Child Range
     children_per_split = (num_children + split_k - 1) // split_k
-    
     start_k = split_id * children_per_split
     
-    # ------------------------------------------------------------
-    # 3. Gather Logic (Standard)
-    # ------------------------------------------------------------
+    # Gather Table Lookup
     tab_ptr = Gather_Table_ptr + (node_id * sg_node)
     child_start_base = tl.load(tab_ptr + 0)
     has_children = (child_start_base != -1)
 
-    # Pointers Invariant to D
+    # Pointers
     offs_h = tl.arange(0, BLOCK_H)
     mask_h = offs_h < H
     
-    # Base Pointers (Hoisted)
     off_out_base = (b_idx * sdk_b) + (node_id * sdk_node) + (offs_h[:, None] * sdk_h)
     
-    ptr_ds_batch = DS_ptr + (b_idx * sds_b) + (w_idx * sds_lvl)
-    ptr_w_batch  = W_ptr  + (b_idx * sw_b)  + (w_idx * sw_lvl)
-    ptr_q_batch  = Q_ptr  + (b_idx * sq_b)
-    ptr_do_batch = DO_ptr + (b_idx * sdo_b)
+    # Hoisted Base Pointers
+    ptr_ds_base = DS_ptr + (b_idx * sds_b) + (w_idx * sds_lvl)
+    ptr_w_base  = W_ptr  + (b_idx * sw_b)  + (w_idx * sw_lvl)
+    ptr_q_base  = Q_ptr  + (b_idx * sq_b)
+    ptr_do_base = DO_ptr + (b_idx * sdo_b)
 
-    # ------------------------------------------------------------
-    # 4. Main Loop
-    # ------------------------------------------------------------
+    # Loop D
     for off_d_start in range(0, D, BLOCK_D):
         offs_d = off_d_start + tl.arange(0, BLOCK_D)
         mask_d = offs_d < D
@@ -871,22 +920,20 @@ def hierarchical_attention_backward_dK_dV_fused_kernel(
             off_hq_d  = (offs_h[:, None] * sq_h)  + (offs_d[None, :] * sq_d)
             off_hdo_d = (offs_h[:, None] * sdo_h) + (offs_d[None, :] * sdo_d)
 
-            # Dynamic Inner Loop
             for k_offset in range(children_per_split):
                 k = start_k + k_offset
-                # Safety check for last split
                 if k < num_children:
                     child_idx = child_start_base + k
                     
-                    # Pointer Math
-                    ptr_ds = ptr_ds_batch + (child_idx * sds_n) + (offs_h * sds_h)
-                    ptr_w  = ptr_w_batch  + (child_idx * sw_n)  + (offs_h * sw_h)
+                    # Compute pointers (Child * stride)
+                    ptr_ds = ptr_ds_base + (child_idx * sds_n) + (offs_h * sds_h)
+                    ptr_w  = ptr_w_base  + (child_idx * sw_n)  + (offs_h * sw_h)
                     
                     ds = tl.load(ptr_ds, mask=mask_h, other=0.0)[:, None]
                     w  = tl.load(ptr_w,  mask=mask_h, other=0.0)[:, None]
                     
-                    ptr_q  = ptr_q_batch  + (child_idx * sq_n)  + off_hq_d
-                    ptr_do = ptr_do_batch + (child_idx * sdo_n) + off_hdo_d
+                    ptr_q  = ptr_q_base  + (child_idx * sq_n)  + off_hq_d
+                    ptr_do = ptr_do_base + (child_idx * sdo_n) + off_hdo_d
                     
                     q  = tl.load(ptr_q,  mask=mask_op, other=0.0)
                     do = tl.load(ptr_do, mask=mask_op, other=0.0)
@@ -894,11 +941,10 @@ def hierarchical_attention_backward_dK_dV_fused_kernel(
                     dk_acc += ds * q
                     dv_acc += w * do
 
-        # 5. Write Output
+        # Store / Atomic Add
         ptr_dk = DK_ptr + off_out_base + (offs_d[None, :] * sdk_d)
         ptr_dv = DV_ptr + off_out_base + (offs_d[None, :] * sdk_d)
 
-        # Dynamic Atomic Decision
         if split_k > 1:
             tl.atomic_add(ptr_dk, dk_acc, mask=mask_op)
             tl.atomic_add(ptr_dv, dv_acc, mask=mask_op)
@@ -1263,24 +1309,41 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, num_warps=4
         )
 
-        # Step B: Fused Internal Kernel (Level 1+)
-        # [OPTIMIZATION] Retrieve cached metadata instantly
-        task_tensor = HierarchicalAttentionFunc._get_or_create_backward_metadata(N, LEVELS, Q.device)
-        total_blocks = task_tensor.shape[0]
+        # --- 1. CALCULATE TOTAL GRID SIZE (CPU Math) ---
+        # We need the total number of thread blocks to launch.
+        # This loop is extremely fast on CPU (runs ~15 times).
+        total_blocks = 0
+        
+        # Zone 1 (Levels 1-7)
+        if LEVELS >= 1:
+            # Sum of geometric series: N - N/128 (clamped by LEVELS if < 7)
+            limit = min(LEVELS, 7)
+            total_blocks += N - (N >> limit)
+            
+        # Zone 2 (Levels 8+)
+        if LEVELS >= 7:
+            # Each level has constant blocks: N >> 8
+            blocks_per_lvl = N >> 8
+            num_levels_zone2 = LEVELS - 7
+            total_blocks += blocks_per_lvl * num_levels_zone2
 
+        # --- 2. LAUNCH FUSED KERNEL ---
         grid_fused = (total_blocks, B)
         
-        hierarchical_attention_backward_dK_dV_fused_kernel[grid_fused](
-            DS, Q, Weights, grad_output_4d, gather_table, 
-            task_tensor, # <--- Passing the cached tensor
+        hierarchical_attention_backward_dK_dV_fused_math_kernel[grid_fused](
+            DS, Q, Weights, grad_output_4d, gather_table,
             dK, dV,
-            *DS.stride(), *Q.stride(), *Weights.stride(), 
+            *DS.stride(), *Q.stride(), *Weights.stride(),
             *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
-            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, 
+            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
+            
+            LEVELS=LEVELS,
+            N=N,
+            
             num_warps=4
         )
-            
-        return dQ, dK, dV, None, None, None
+        
+        return dQ, dK, dV, None, None, None, None
 
 def hierarchical_fused_attention(Q, K, V, idx_table, gather_table, mask_table=None):
     """
