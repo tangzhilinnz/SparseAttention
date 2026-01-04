@@ -1280,6 +1280,155 @@ def hierarchical_attention_backward_dQ_kernel(
         tl.store(dq_base + off_dq_out, dq_acc.to(DQ_ptr.dtype.element_ty), mask=mask_op)
 
 
+
+@triton.jit
+def hierarchical_attention_backward_dS_dQ_fused_kernel(
+    # Pointers
+    DO_ptr, W_ptr, V_ptr, K_ptr, Lookup_ptr, 
+    DS_ptr, DQ_ptr, Mask_ptr,
+    
+    # Strides (Combined from both)
+    sdo_b, sdo_n, sdo_h, sdo_d,       # dO
+    sw_b, sw_n, sw_h, sw_lvl,         # W
+    sv_b, sv_n, sv_h, sv_d,           # V
+    sk_b, sk_n, sk_h, sk_d,           # K
+    sds_b, sds_n, sds_h, sds_lvl,     # DS
+    sdq_b, sdq_n, sdq_h, sdq_d,       # DQ
+    sl_n, sl_lvl,                     # Lookup
+    
+    # Constants
+    sm_scale,
+    H: tl.constexpr, BLOCK_H: tl.constexpr,
+    D: tl.constexpr, BLOCK_D: tl.constexpr,
+    LEVELS: tl.constexpr, BLOCK_LEVELS: tl.constexpr,
+    HAS_MASK: tl.constexpr
+):
+    node_idx = tl.program_id(0)
+    b_idx = tl.program_id(1)
+
+    h_idx = tl.arange(0, BLOCK_H)
+    mask_h = h_idx < H
+    offs_lvl = tl.arange(0, BLOCK_LEVELS)
+
+    # -----------------------------------------------------------
+    # 1. Topology & Mask Loading (Shared)
+    # -----------------------------------------------------------
+    mask_lvl_bounds = offs_lvl < LEVELS
+    off_lookup = node_idx * sl_n + offs_lvl * sl_lvl
+    
+    # Load Topology (Parents)
+    neighbor_indices = tl.load(Lookup_ptr + off_lookup, mask=mask_lvl_bounds, other=0)
+
+    # Compute Valid Mask
+    mask_valid_cross = mask_lvl_bounds
+    if HAS_MASK:
+        val_int8 = tl.load(Mask_ptr + off_lookup, mask=mask_lvl_bounds, other=1).to(tl.int8)
+        mask_valid_cross = mask_valid_cross & (val_int8 == 0)
+
+    # -----------------------------------------------------------
+    # 2. Load Weights (W)
+    # -----------------------------------------------------------
+    w_base = W_ptr + (b_idx * sw_b) + (node_idx * sw_n) + (h_idx * sw_h)
+    
+    w_self = tl.load(w_base + (0 * sw_lvl), mask=mask_h, other=0.0)
+    
+    w_cross = tl.load(w_base[:, None] + ((1 + offs_lvl[None, :]) * sw_lvl), 
+                      mask=mask_h[:, None] & mask_valid_cross[None, :], other=0.0)
+
+    # -----------------------------------------------------------
+    # 3. PHASE 1: Compute dP = dot(dO, V)
+    # -----------------------------------------------------------
+    dp_self = tl.zeros([BLOCK_H], dtype=tl.float32)
+    dp_cross = tl.zeros([BLOCK_H, BLOCK_LEVELS], dtype=tl.float32)
+
+    v_batch_base = V_ptr + b_idx * sv_b
+    do_batch_base = DO_ptr + (b_idx * sdo_b) + (node_idx * sdo_n)
+    
+    off_node_self_v = node_idx * sv_n
+    off_node_cross_v = neighbor_indices * sv_n
+
+    # Loop 1: Iterate D to compute gradients w.r.t Score
+    for off_d in range(0, D, BLOCK_D):
+        offs_d = off_d + tl.arange(0, BLOCK_D)
+        mask_d = offs_d < D
+        mask_op = mask_h[:, None] & mask_d[None, :]
+
+        # Load dO
+        do = tl.load(do_batch_base + (h_idx[:, None]*sdo_h) + (offs_d[None, :]*sdo_d), 
+                     mask=mask_op, other=0.0)
+        
+        # Load V Self
+        ptr_v_self = v_batch_base + off_node_self_v + (h_idx[:, None]*sv_h) + (offs_d[None, :]*sv_d)
+        v_self = tl.load(ptr_v_self, mask=mask_op, other=0.0)
+        
+        # Load V Cross (Vectorized across Levels)
+        ptr_v_cross = v_batch_base + off_node_cross_v[None, :, None] + \
+                      (h_idx[:, None, None]*sv_h) + (offs_d[None, None, :]*sv_d)
+        
+        # Mask V: mask_h & mask_valid & mask_d
+        mask_v_cross = mask_h[:, None, None] & mask_valid_cross[None, :, None] & mask_d[None, None, :]
+        v_cross = tl.load(ptr_v_cross, mask=mask_v_cross, other=0.0)
+
+        dp_self += tl.sum(do * v_self, axis=1)
+        dp_cross += tl.sum(do[:, None, :] * v_cross, axis=2)
+
+    # -----------------------------------------------------------
+    # 4. PHASE 2: Compute dS (In Registers)
+    # -----------------------------------------------------------
+    sum_wdp = (w_self * dp_self) + tl.sum(w_cross * dp_cross, axis=1)
+    
+    # These variables hold dS. We will use them immediately for dQ.
+    ds_self = w_self * (dp_self - sum_wdp) * sm_scale
+    ds_cross = w_cross * (dp_cross - sum_wdp[:, None]) * sm_scale
+
+    # WRITE DS (Still needed for dK/dV kernels later)
+    ds_base = DS_ptr + (b_idx * sds_b) + (node_idx * sds_n) + (h_idx * sds_h)
+    tl.store(ds_base + (0 * sds_lvl), ds_self, mask=mask_h)
+    
+    ds_cross_ptr = ds_base[:, None] + ((1 + offs_lvl[None, :]) * sds_lvl)
+    tl.store(ds_cross_ptr, ds_cross, mask=mask_h[:, None] & mask_lvl_bounds[None, :])
+
+    # -----------------------------------------------------------
+    # 5. PHASE 3: Compute dQ = dot(dS, K)
+    # -----------------------------------------------------------
+    # We reuse ds_self and ds_cross from registers.
+    
+    k_batch_base = K_ptr + b_idx * sk_b
+    dq_batch_base = DQ_ptr + (b_idx * sdq_b) + (node_idx * sdq_n)
+    
+    off_node_self_k = node_idx * sk_n
+    off_node_cross_k = neighbor_indices * sk_n
+
+    # Loop 2: Iterate D again to compute dQ
+    for off_d in range(0, D, BLOCK_D):
+        offs_d = off_d + tl.arange(0, BLOCK_D)
+        mask_d = offs_d < D
+        mask_op = mask_h[:, None] & mask_d[None, :]
+
+        # Load K Self
+        ptr_k_self = k_batch_base + off_node_self_k + (h_idx[:, None]*sk_h) + (offs_d[None, :]*sk_d)
+        k_self = tl.load(ptr_k_self, mask=mask_op, other=0.0)
+
+        # Load K Cross (Vectorized)
+        ptr_k_cross = k_batch_base + off_node_cross_k[None, :, None] + \
+                      (h_idx[:, None, None]*sk_h) + (offs_d[None, None, :]*sk_d)
+        
+        mask_k_cross = mask_h[:, None, None] & mask_valid_cross[None, :, None] & mask_d[None, None, :]
+        k_cross = tl.load(ptr_k_cross, mask=mask_k_cross, other=0.0)
+
+        # Accumulate dQ
+        # Term 1: Self
+        dq_acc = ds_self[:, None].to(tl.float32) * k_self.to(tl.float32)
+        
+        # Term 2: Cross (Sum over levels)
+        # ds_cross [H, L] * k_cross [H, L, D] -> Sum over L -> [H, D]
+        dq_acc += tl.sum(ds_cross[:, :, None].to(tl.float32) * k_cross.to(tl.float32), axis=1)
+
+        # Store dQ
+        off_dq_out = (h_idx[:, None] * sdq_h) + (offs_d[None, :] * sdq_d)
+        tl.store(dq_batch_base + off_dq_out, dq_acc.to(DQ_ptr.dtype.element_ty), mask=mask_op)
+
+
 class HierarchicalAttentionFunc(torch.autograd.Function):
     
     # Cache for backward task metadata: Key=(N, device), Value=task_tensor
@@ -1486,37 +1635,51 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         B, N = Q.shape[0], Q.shape[1]
         grad_output_4d = grad_output.view(B, N, H, D) 
 
-        # 2. Compute dS (Main Stream)
+        # -----------------------------------------------------------
+        # 2. FUSED STEP: Compute dS and dQ together
+        # -----------------------------------------------------------
+        # Allocations
         DS = torch.empty_like(Weights)
-        grid_ds = (N, B)
+        dQ = torch.empty_like(Q)
+        
+        # Mask Setup
         HAS_MASK = (mask_table is not None)
-        mask_ptr_safe = mask_table if HAS_MASK else Weights
+        mask_ptr_safe = mask_table if HAS_MASK else Weights # Dummy
+        
+        # Grid: (Nodes, Batch) - Same as before
+        grid_fused_ds_dq = (N, B)
 
-        hierarchical_attention_backward_dS_kernel[grid_ds](
-            grad_output_4d, Weights, V, idx_table, DS, mask_ptr_safe,
-            *grad_output_4d.stride(), *Weights.stride(), *V.stride(), 
-            *idx_table.stride(), *DS.stride(),            
-            sm_scale, H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=32, 
-            LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS, HAS_MASK=HAS_MASK, num_warps=4
+        hierarchical_attention_backward_dS_dQ_fused_kernel[grid_fused_ds_dq](
+            # Pointers
+            grad_output_4d, Weights, V, K, idx_table, 
+            DS, dQ, mask_ptr_safe,
+            
+            # Strides (All 4D/3D strides)
+            *grad_output_4d.stride(), # sdo
+            *Weights.stride(),        # sw
+            *V.stride(),              # sv
+            *K.stride(),              # sk
+            *DS.stride(),             # sds
+            *dQ.stride(),             # sdq
+            *idx_table.stride(),      # sl
+            
+            # Constants
+            sm_scale,
+            H=H, BLOCK_H=BLOCK_H, 
+            D=D, BLOCK_D=BLOCK_D, # Standard Block size for register reuse
+            LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS,
+            HAS_MASK=HAS_MASK,
+            num_warps=4
         )
 
-        # --- SETUP PARALLELISM ---
+        # -----------------------------------------------------------
+        # 3. Compute dK / dV (Dependent on dS)
+        # -----------------------------------------------------------
+        # Allocations
         dK = torch.zeros_like(K)
         dV = torch.zeros_like(V)
-        dQ = torch.empty_like(Q)
 
-        # --- BRANCH 1: dQ (Independent) ---
-        grid_dq = (N, B)
-        hierarchical_attention_backward_dQ_kernel[grid_dq](
-            DS, K, idx_table, dQ, mask_ptr_safe, 
-            *DS.stride(), *K.stride(), *idx_table.stride(), *dQ.stride(),
-            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=32, LEVELS=LEVELS,
-            HAS_MASK=HAS_MASK, num_warps=4
-        )
-
-        # --- BRANCH 2: dK/dV (Dependent on dS) ---
-        
-        # Step A: Leaf Kernel (Level 0)
+        # --- Step A: Leaf Kernel (Level 0) ---
         grid_leaf = (N, B)
         hierarchical_attention_backward_dK_dV_leaf_kernel[grid_leaf](
             DS, Q, Weights, grad_output_4d, gather_table,
@@ -1526,15 +1689,13 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, num_warps=4
         )
 
-        # CUTOFF: Levels 1-8 use Kernel A. Levels 9+ use Kernel B.
+        # --- Step B: Internal Levels (Split Strategy) ---
         CUTOFF_LEVEL = 8
         
-        # --- KERNEL A: Low Levels (Split=1) ---
+        # Kernel 1: Low Levels (Split=1, Loop-Based)
         if LEVELS >= 1:
             limit = min(LEVELS, CUTOFF_LEVEL)
-            # Total blocks = N - (N >> limit)
             total_blocks_low = N - (N >> limit)
-            
             grid_low = (total_blocks_low, B)
             
             hierarchical_attention_backward_low_level_kernel[grid_low](
@@ -1548,17 +1709,11 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
                 num_warps=4
             )
 
-        # --- KERNEL B: High Levels (Split>1) ---
+        # Kernel 2: High Levels (Split>1, Math-Based)
         if LEVELS > CUTOFF_LEVEL:
             num_high_levels = LEVELS - CUTOFF_LEVEL
-            
-            # Constant blocks per level = N >> (CUTOFF)
-            # Actually, logic dictates: N >> (START_LEVEL - 1)
-            # If START_LEVEL=9, we need N >> 8.
             blocks_per_lvl = N >> CUTOFF_LEVEL
-            
             total_blocks_high = blocks_per_lvl * num_high_levels
-            
             grid_high = (total_blocks_high, B)
             
             hierarchical_attention_backward_high_level_kernel[grid_high](
@@ -1568,11 +1723,11 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
                 *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
                 H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
                 N=N,
-                START_LEVEL=CUTOFF_LEVEL + 1, # Start at Level 9
+                START_LEVEL=CUTOFF_LEVEL + 1, 
                 num_warps=4
             )
-            
-        return dQ, dK, dV, None, None, None
+        
+        return dQ, dK, dV, None, None, None, None
 
 def hierarchical_fused_attention(Q, K, V, idx_table, gather_table, mask_table=None):
     """
