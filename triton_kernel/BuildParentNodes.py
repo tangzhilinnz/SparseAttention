@@ -1995,7 +1995,7 @@ def run_full_suite_update_X_from_Y():
 
     # Config: Large scale to saturate GPU
     # B, N, D, H = 32, 4096, 64, 8
-    B, N, D, H = 32, 2048, 64, 8
+    B, N, D, H = 2, 2048 * 64, 64, 8
     dim = D * H
 
     print(f"Config: B={B}, N={N}, D={dim} (HeadDim={D}), H={H}, dtype={check_dtype}")
