@@ -1675,31 +1675,49 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, num_warps=4
         )
 
-        total_blocks = 0
+        # CUTOFF: Levels 1-8 use Kernel A. Levels 9+ use Kernel B.
+        CUTOFF_LEVEL = 8
         
-        # Zone 1 (Levels 1-7): Geometric Decay
+        # --- KERNEL A: Low Levels (Split=1) ---
         if LEVELS >= 1:
-            limit = min(LEVELS, 7)
-            # Sum of N/2 + N/4 ... = N - N/(2^limit)
-            total_blocks += N - (N >> limit)
+            limit = min(LEVELS, CUTOFF_LEVEL)
+            # Total blocks = N - (N >> limit)
+            total_blocks_low = N - (N >> limit)
             
-        # Zone 2 (Levels 8+): Constant Blocks (N/256)
-        if LEVELS >= 8:
-            blocks_per_lvl = N >> 8
-            num_levels_zone2 = LEVELS - 7
-            total_blocks += blocks_per_lvl * num_levels_zone2
-
-        if total_blocks > 0:
-            grid_fused = (total_blocks, B)
+            grid_low = (total_blocks_low, B)
             
-            hierarchical_attention_backward_dK_dV_fused_math_kernel[grid_fused](
+            hierarchical_attention_backward_low_level_kernel[grid_low](
                 DS, Q, Weights, grad_output_4d, gather_table,
                 dK, dV,
                 *DS.stride(), *Q.stride(), *Weights.stride(),
                 *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
                 H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
-                LEVELS=LEVELS,
+                N=N, 
+                MAX_LEVEL=limit, 
+                num_warps=4
+            )
+
+        # --- KERNEL B: High Levels (Split>1) ---
+        if LEVELS > CUTOFF_LEVEL:
+            num_high_levels = LEVELS - CUTOFF_LEVEL
+            
+            # Constant blocks per level = N >> (CUTOFF)
+            # Actually, logic dictates: N >> (START_LEVEL - 1)
+            # If START_LEVEL=9, we need N >> 8.
+            blocks_per_lvl = N >> CUTOFF_LEVEL
+            
+            total_blocks_high = blocks_per_lvl * num_high_levels
+            
+            grid_high = (total_blocks_high, B)
+            
+            hierarchical_attention_backward_high_level_kernel[grid_high](
+                DS, Q, Weights, grad_output_4d, gather_table,
+                dK, dV,
+                *DS.stride(), *Q.stride(), *Weights.stride(),
+                *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
+                H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
                 N=N,
+                START_LEVEL=CUTOFF_LEVEL + 1, # Start at Level 9
                 num_warps=4
             )
             
