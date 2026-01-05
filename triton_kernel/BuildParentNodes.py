@@ -1703,6 +1703,11 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         if LEVELS > CUTOFF_LEVEL:
             # ... calculate total_blocks_high ...
             
+            # 1. Calculate the raw total blocks first
+            num_high_levels = LEVELS - CUTOFF_LEVEL
+            blocks_per_lvl = N >> CUTOFF_LEVEL
+            total_blocks_high = blocks_per_lvl * num_high_levels  # <--- MISSING LINE
+
             if HAS_MASK:
                 grid_high = (total_blocks_high // 2, B)
             else:
