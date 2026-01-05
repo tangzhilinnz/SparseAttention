@@ -1802,9 +1802,9 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
     
         # 2. Allocate Outputs
         # dS is intermediate, but needed for dK/dV kernels later
-        DS = torch.empty_like(Weights) 
+        dS = torch.empty_like(Weights) 
         # dQ is the main output of this fused kernel
-        DQ = torch.empty_like(Q) 
+        dQ = torch.empty_like(Q) 
 
         # Handle Mask Pointer (avoid NoneType error in Triton)
         HAS_MASK = (mask_table is not None)
@@ -1820,8 +1820,8 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             V,               # V_ptr
             K,               # K_ptr      <-- Was missing
             idx_table,       # Lookup_ptr <-- Was misplaced
-            DS,              # DS_ptr
-            DQ,              # DQ_ptr     <-- Was missing
+            dS,              # dS_ptr
+            dQ,              # dQ_ptr     <-- Was missing
             mask_ptr_safe,   # Mask_ptr
 
             # --- Strides ---
@@ -1829,8 +1829,8 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             *Weights.stride(),        # sw  (4 args)
             *V.stride(),              # sv  (4 args)
             *K.stride(),              # sk  (4 args) <-- Was missing
-            *DS.stride(),             # sds (4 args)
-            *DQ.stride(),             # sdq (4 args) <-- Was missing
+            *dS.stride(),             # sds (4 args)
+            *dQ.stride(),             # sdq (4 args) <-- Was missing
             idx_table.stride(0),      # sl_n   (Assuming idx_table is [N, LEVELS])
             idx_table.stride(1),      # sl_lvl 
         
