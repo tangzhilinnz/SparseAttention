@@ -1907,6 +1907,28 @@ def build_tree_topology(seq_len, is_causal=True, device="cuda", dtype=torch.int3
     gather_info[valid_nodes, 1] = subtree_ranges[valid_siblings, 1].to(dtype)
     gather_info[valid_nodes, 2] = node_levels[valid_nodes] # Now uses the corrected levels
 
+
+    # ===============================================================
+    # 3. DEBUG: Print Line by Line
+    # ===============================================================
+    print("\n=== Gather Info Table ===")
+    print(f"{'Node':<6} | {'Start':<6} | {'End':<6} | {'Level':<6}")
+    print("-" * 30)
+    
+    # Convert to CPU list for clean iteration
+    gi_cpu = gather_info.detach().cpu().numpy()
+    
+    for i in range(total_nodes):
+        s, e, l = gi_cpu[i]
+        # Only print nodes that actually gather something (optional, remove 'if' to see all)
+        if s != -1: 
+            print(f"{i:<6} | {s:<6} | {e:<6} | {l:<6}")
+        else:
+            print(f"{i:<6} | {'-1':<6} | {'-1':<6} | {'-1':<6}")
+            
+    print("=========================\n")
+
+
     return {
         "forward_idx": forward_idx,
         "forward_mask": forward_mask,
