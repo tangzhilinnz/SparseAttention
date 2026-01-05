@@ -980,65 +980,65 @@ def hierarchical_attention_backward_low_level_kernel(
     # ------------------------------------------------------------------
     # We assume Split-K is ALWAYS 1 for these levels.
     
-    target_level = 0
-    node_id = 0
-    
-    current_block_offset = 0
-    current_node_offset = N # Start after leaves
-    
-    # Iterate only up to MAX_LEVEL
-    for lvl in range(1, MAX_LEVEL + 1):
-        nodes_in_lvl = N >> lvl
-        
-        # Check if PID belongs to this level
-        if pid >= current_block_offset and pid < (current_block_offset + nodes_in_lvl):
-            target_level = lvl
-            
-            node_local = pid - current_block_offset
-            node_id = current_node_offset + node_local
-            
-        # Accumulate offsets
-        current_block_offset += nodes_in_lvl
-        current_node_offset += nodes_in_lvl
-
-    ## ------------------------------------------------------------------
-    ## 1. OPTIMIZED GEOMETRIC LOOP (Fully Unrolled & Constant Folded)
-    ## ------------------------------------------------------------------
-    ## Pre-calculate the constant shift for Node ID.
-    ## Mathematical Fact: (current_node_offset - current_block_offset) is ALWAYS == N.
-    ## Therefore, node_id is ALWAYS (N + pid) regardless of the level.
-    ## This removes 2 additions from inside the loop.
-    #node_id = N + pid
-    #
-    ## Use static_range to ensure the compiler unrolls this loop 100%.
-    ## Each iteration becomes a standalone block of PTX code.
     #target_level = 0
+    #node_id = 0
     #
-    ## We maintain the 'if' structure because it allows for "Early Exit".
-    ## (Threads that match Level 1 don't need to do work for Level 2).
-    ## We use a 'found' flag to prevent overwriting if we continue checking.
-    #found = 0
+    #current_block_offset = 0
+    #current_node_offset = N # Start after leaves
     #
-    #for lvl in tl.static_range(1, MAX_LEVEL + 1):
-    #    # 1. Calculate Bounds CONSTANTLY (No accumulation dependency)
-    #    # Level starts at: N - N/(2^(L-1))
-    #    # Level ends at:   N - N/(2^L)
-    #    # Since N and lvl are constants, Triton calculates these at compile time.
+    ## Iterate only up to MAX_LEVEL
+    #for lvl in range(1, MAX_LEVEL + 1):
+    #    nodes_in_lvl = N >> lvl
     #    
-    #    # e.g. Level 1: Start=0, End=N/2
-    #    # e.g. Level 2: Start=N/2, End=3N/4
-    #    lvl_start = N - (N >> (lvl - 1))
-    #    lvl_end   = N - (N >> lvl)
-    #    
-    #    # 2. Check (Pure Comparison, No Arithmetic)
-    #    # We check 'if not found' first to simulate an 'else-if' chain efficiently
-    #    if found == 0:
-    #        # We only need to check the upper bound 'lvl_end' 
-    #        # because the lower bound is implicitly handled by the previous iteration's failure
-    #        # (or it's 0 for the first level).
-    #        if pid < lvl_end:
-    #            target_level = lvl
-    #            # We already calculated node_id = N + pid outside!
+    #    # Check if PID belongs to this level
+    #    if pid >= current_block_offset and pid < (current_block_offset + nodes_in_lvl):
+    #        target_level = lvl
+    #        
+    #        node_local = pid - current_block_offset
+    #        node_id = current_node_offset + node_local
+    #        
+    #    # Accumulate offsets
+    #    current_block_offset += nodes_in_lvl
+    #    current_node_offset += nodes_in_lvl
+
+    # ------------------------------------------------------------------
+    # 1. OPTIMIZED GEOMETRIC LOOP (Fully Unrolled & Constant Folded)
+    # ------------------------------------------------------------------
+    # Pre-calculate the constant shift for Node ID.
+    # Mathematical Fact: (current_node_offset - current_block_offset) is ALWAYS == N.
+    # Therefore, node_id is ALWAYS (N + pid) regardless of the level.
+    # This removes 2 additions from inside the loop.
+    node_id = N + pid
+    
+    # Use static_range to ensure the compiler unrolls this loop 100%.
+    # Each iteration becomes a standalone block of PTX code.
+    target_level = 0
+    
+    # We maintain the 'if' structure because it allows for "Early Exit".
+    # (Threads that match Level 1 don't need to do work for Level 2).
+    # We use a 'found' flag to prevent overwriting if we continue checking.
+    found = 0
+    
+    for lvl in tl.static_range(1, MAX_LEVEL + 1):
+        # 1. Calculate Bounds CONSTANTLY (No accumulation dependency)
+        # Level starts at: N - N/(2^(L-1))
+        # Level ends at:   N - N/(2^L)
+        # Since N and lvl are constants, Triton calculates these at compile time.
+        
+        # e.g. Level 1: Start=0, End=N/2
+        # e.g. Level 2: Start=N/2, End=3N/4
+        lvl_start = N - (N >> (lvl - 1))
+        lvl_end   = N - (N >> lvl)
+        
+        # 2. Check (Pure Comparison, No Arithmetic)
+        # We check 'if not found' first to simulate an 'else-if' chain efficiently
+        if found == 0:
+            # We only need to check the upper bound 'lvl_end' 
+            # because the lower bound is implicitly handled by the previous iteration's failure
+            # (or it's 0 for the first level).
+            if pid < lvl_end:
+                target_level = lvl
+                # We already calculated node_id = N + pid outside!
     #            found = 1
 
     # ------------------------------------------------------------------
