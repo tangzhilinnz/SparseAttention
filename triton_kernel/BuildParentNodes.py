@@ -1296,8 +1296,8 @@ def hierarchical_attention_backward_low_level_causal_kernel(
     child_start_base = tl.load(tab_ptr + 0)
 
     # [SAFETY] Mandatory because padding nodes (even if even-indexed) can be -1
-    if child_start_base == -1:
-        return
+    #if child_start_base == -1:
+    #    return
 
     num_children = 1 << target_level
     w_idx = target_level + 1
@@ -1402,8 +1402,8 @@ def hierarchical_attention_backward_high_level_causal_kernel(
     tab_ptr = Gather_Table_ptr + (node_id * sg_node)
     child_start_base = tl.load(tab_ptr + 0)
     
-    if child_start_base == -1:
-        return
+    #if child_start_base == -1:
+    #    return
 
     # ------------------------------------------------------------------
     # 3. MATH LOOP
@@ -2563,8 +2563,8 @@ def run_full_suite_update_X_from_Y():
     
     # Optional mask (can be None, but good to test with None first for basic sanity)
     #mask = True
-    #mask = torch.ones((B, N), dtype=torch.bool, device='cuda')
-    mask=None
+    mask = torch.ones((B, N), dtype=torch.bool, device='cuda')
+    #mask=None
 
     print(f"Input Shapes -> X: {x.shape}, Y: {y.shape}, Dtype: {x.dtype}")
 
