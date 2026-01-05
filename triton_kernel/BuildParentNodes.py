@@ -1621,53 +1621,6 @@ def hierarchical_attention_backward_dS_dQ_fused_kernel(
 
 
 class HierarchicalAttentionFunc(torch.autograd.Function):
-    
-    # Cache for backward task metadata: Key=(N, device), Value=task_tensor
-    _backward_task_cache = {}
-
-    @staticmethod
-    def _get_or_create_backward_metadata(N, LEVELS, device):
-        """
-        Retrieves pre-calculated task metadata for Fused Backward Kernel.
-        Generates it once per (N, Device) configuration.
-        """
-        cache_key = (N, device)
-        
-        if cache_key in HierarchicalAttentionFunc._backward_task_cache:
-            return HierarchicalAttentionFunc._backward_task_cache[cache_key]
-        
-        # --- GENERATE METADATA (Run Once) ---
-        tasks = []
-        current_start_node = N # Start after leaves
-        
-        # Iterate Levels 1 to Root
-        for lvl in range(1, LEVELS + 1):
-            num_nodes = N >> lvl
-            
-            # Split-K Logic
-            split_k = 1
-            if lvl >= 9:
-                split_k = 1 << (lvl - 8)
-            
-            # Generate tasks for this level
-            for i in range(num_nodes):
-                global_node_id = current_start_node + i
-                
-                # Create 'split_k' tasks for this single node
-                for s in range(split_k):
-                    # Format: [Node_ID, Level, Split_ID, Split_K_Total]
-                    tasks.append([global_node_id, lvl, s, split_k])
-            
-            current_start_node += num_nodes
-
-        # Create Tensor and Cache It
-        # Note: We use int32 for efficiency
-        task_tensor = torch.tensor(tasks, dtype=torch.int32, device=device)
-        
-        HierarchicalAttentionFunc._backward_task_cache[cache_key] = task_tensor
-        return task_tensor
-    
-
     @staticmethod
     def forward(ctx, Q, K, V, idx_table, gather_table, mask_table=None):
         # Alignment checks
@@ -1867,7 +1820,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         )
 
         
-        CUTOFF_LEVEL = 6
+        CUTOFF_LEVEL = 9
         
         # --- KERNEL A: Low Levels (Split=1) ---
         if LEVELS >= 1:
@@ -2778,8 +2731,8 @@ def run_full_suite_update_X_from_Y():
 
     # Config: Large scale to saturate GPU
     #B, N, D, H = 32, 4096, 64, 8
-    B, N, D, H = 32, 2048, 64, 8
-    #B, N, D, H = 4, 2048 * 32, 64, 8
+    #B, N, D, H = 32, 2048, 64, 8
+    B, N, D, H = 4, 2048 * 32, 64, 8
     dim = D * H
 
     print(f"Config: B={B}, N={N}, D={dim} (HeadDim={D}), H={H}, dtype={check_dtype}")
