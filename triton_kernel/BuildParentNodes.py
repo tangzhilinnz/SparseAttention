@@ -246,7 +246,7 @@ class BuildParentNodesFunc(torch.autograd.Function):
             *Q_p.stride(), *K_p.stride(), *K_c.stride(),
             *Out.stride(), *Weights.stride(),
             sm_scale, H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_SIZE=BLOCK_SIZE,
-            num_warps=4
+            num_warps=2
         )
         
         ctx.save_for_backward(Q_p, K_p, V_p, K_c, V_c, Weights)
@@ -295,7 +295,7 @@ class BuildParentNodesFunc(torch.autograd.Function):
             # Constants
             sm_scale=sm_scale,
             H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_SIZE=BLOCK_SIZE,
-            num_warps=4
+            num_warps=2
         )
         
         return dQ, dKp, dVp, dKc, dVc
