@@ -1239,29 +1239,39 @@ def hierarchical_attention_backward_high_level_kernel(
     b_idx = tl.program_id(1)
 
     # ------------------------------------------------------------------
-    # 1. O(1) PID DECODING (Constant Block Count)
+    # 1. BITWISE PID DECODING (Extreme Optimization)
     # ------------------------------------------------------------------
-    # In this zone, Blocks Per Level is Constant = N >> (START_LEVEL - 1)
-    # e.g., Level 9 has N/512 nodes. Split-K=2. Total Blocks = N/256.
-    # Level 10 has N/1024 nodes. Split-K=4. Total Blocks = N/256.
-    BLOCKS_PER_LVL: tl.constexpr = N >> (START_LEVEL - 1)
+    # Constants derived from N and START_LEVEL
+    # SHIFT_GRID = log2(BLOCKS_PER_LVL) = log2(N) - (START_LEVEL - 1)
+    # Note: We rely on the compiler to fold these constants.
     
-    # 1. Which Level?
+    # Blocks Per Level = N / 2^(START_LEVEL - 1)
+    BLOCKS_PER_LVL: tl.constexpr = N >> (START_LEVEL - 1)
+    BLOCK_MASK: tl.constexpr = BLOCKS_PER_LVL - 1
+    
+    # 1. Which Level? (Integer Div -> Right Shift?)
+    # Since BLOCKS_PER_LVL is power of 2, 'pid // BLOCKS' is a Shift.
+    # However, 'pid' is dynamic, so we can just use integer div, 
+    # Triton/LLVM optimizes 'div by power-of-2' into a shift automatically.
+    # But for 'rem', using AND is explicitly cleaner.
+    
     lvl_offset = pid // BLOCKS_PER_LVL
     target_level = START_LEVEL + lvl_offset
     
-    # 2. Relative Index inside Level
-    rem = pid % BLOCKS_PER_LVL
+    # 2. Relative Index (Modulo -> Bitwise AND)
+    rem = pid & BLOCK_MASK
     
-    # 3. Calculate Split-K 
-    # Formula: 2^(L - (START_LEVEL - 1))
-    # e.g., if Start=9: Lvl 9 -> Split 2. Lvl 10 -> Split 4.
+    # 3. Calculate Split-K Parameters
+    # shift_val = L - (START_LEVEL - 1)
     shift_val = target_level - (START_LEVEL - 1)
-    split_k = 1 << shift_val 
     
-    # 4. Decode Node vs Split
-    node_local = rem // split_k
-    split_id = rem % split_k
+    # split_k = 1 << shift_val. 
+    # split_k_mask = split_k - 1 = (1 << shift_val) - 1.
+    split_k_mask = (1 << shift_val) - 1
+    
+    # 4. Decode Node vs Split (Bitwise)
+    node_local = rem >> shift_val           # Division by split_k
+    split_id   = rem & split_k_mask         # Modulo split_k
     
     # 5. Global Node ID
     start_node_global = (2 * N) - (N >> (target_level - 1))
