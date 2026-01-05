@@ -1579,7 +1579,8 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         Out = torch.empty_like(Q)
         
         # Save weights for backward: [B, N, H, 1 + LEVELS]
-        Weights = torch.empty((B, N, H, 1 + LEVELS), device=Q.device, dtype=torch.float32)
+        #Weights = torch.empty((B, N, H, 1 + LEVELS), device=Q.device, dtype=torch.float32)
+        Weights = torch.empty((B, N, H, 1 + LEVELS), device=Q.device, dtype=torch.float16)
         
         HAS_MASK = (mask_table is not None)
         mask_ptr_safe = mask_table if HAS_MASK else Q # Dummy ptr
@@ -1673,8 +1674,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
                 H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
                 N=N, 
                 MAX_LEVEL=limit, 
-                num_warps=4,
-                num_stages=4
+                num_warps=4
             )
         
         # --- KERNEL B: High Levels (Split>1) ---
