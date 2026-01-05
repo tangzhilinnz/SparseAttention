@@ -2821,6 +2821,6 @@ def run_full_suite_update_X_from_Y():
 
 
 if __name__ == "__main__":
-    #run_full_suite()
+    run_full_suite()
 
     run_full_suite_update_X_from_Y()
