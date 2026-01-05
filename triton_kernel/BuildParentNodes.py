@@ -1052,8 +1052,8 @@ def hierarchical_attention_backward_low_level_kernel(
     # If this node has no children, we are done. 
     # Since dK and dV are initialized to 0.0 by torch.zeros_like(), 
     # we don't need to write anything.
-    if child_start_base == -1:
-        return
+    #if child_start_base == -1:
+    #    return
 
     # --- Everything below is SKIPPED for leaf/invalid nodes ---
 
@@ -1173,8 +1173,8 @@ def hierarchical_attention_backward_high_level_kernel(
     
     # If -1, this node is empty. Exit immediately.
     # This prevents all subsequent math, pointer arithmetic, and atomic locking.
-    if child_start_base == -1:
-        return
+    #if child_start_base == -1:
+    #    return
 
     # ------------------------------------------------------------------
     # 3. CONSTANT LOOP SETUP
