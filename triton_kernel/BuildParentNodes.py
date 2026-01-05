@@ -1773,86 +1773,30 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         # 1. Retrieve Tensors
         Q, K, V, idx_table, gather_table, Weights, mask_table = ctx.saved_tensors
         sm_scale, H, BLOCK_H, D, BLOCK_D, LEVELS, BLOCK_LEVELS = ctx.constants
-        #
-        # View as 4D
-        #grad_output = grad_output.contiguous()
-        #B, N = Q.shape[0], Q.shape[1]
-        #grad_output_4d = grad_output.view(B, N, H, D) 
-        #
-        ## 2. Compute dS (Main Stream)
-        #DS = torch.empty_like(Weights)
-        #grid_ds = (N, B)
-        #HAS_MASK = (mask_table is not None)
-        #mask_ptr_safe = mask_table if HAS_MASK else Weights
-        #
-        ##hierarchical_attention_backward_dS_kernel[grid_ds](
-        #hierarchical_attention_backward_dS_dQ_fused_kernel[grid_ds](
-        #    grad_output_4d, Weights, V, idx_table, DS, mask_ptr_safe,
-        #    *grad_output_4d.stride(), *Weights.stride(), *V.stride(), 
-        #    *idx_table.stride(), *DS.stride(),            
-        #    sm_scale, H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=32, 
-        #    LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS, HAS_MASK=HAS_MASK, num_warps=2
-        #)
 
-        # 1. Prepare Inputs
         # View as 4D
         grad_output = grad_output.contiguous()
         B, N = Q.shape[0], Q.shape[1]
         grad_output_4d = grad_output.view(B, N, H, D) 
-    
-        # 2. Allocate Outputs
-        # DS is intermediate, but needed for dK/dV kernels later
-        DS = torch.empty_like(Weights) 
-        # dQ is the main output of this fused kernel
-        dQ = torch.empty_like(Q) 
-
-        # Handle Mask Pointer (avoid NoneType error in Triton)
-        HAS_MASK = (mask_table is not None)
-        mask_ptr_safe = mask_table if HAS_MASK else Weights # fallback pointer
-
+        
+        # 2. Compute dS (Main Stream)
+        DS = torch.empty_like(Weights)
         grid_ds = (N, B)
-
-        # 3. Launch Kernel
-        hierarchical_attention_backward_dS_dQ_fused_kernel[grid_ds](
-            # --- Pointers (Order must match kernel signature) ---
-            grad_output_4d,  # DO_ptr
-            Weights,         # W_ptr
-            V,               # V_ptr
-            K,               # K_ptr      <-- Was missing
-            idx_table,       # Lookup_ptr <-- Was misplaced
-            DS,              # dS_ptr
-            dQ,              # dQ_ptr     <-- Was missing
-            mask_ptr_safe,   # Mask_ptr
-
-            # --- Strides ---
-            *grad_output_4d.stride(), # sdo (4 args)
-            *Weights.stride(),        # sw  (4 args)
-            *V.stride(),              # sv  (4 args)
-            *K.stride(),              # sk  (4 args) <-- Was missing
-            *DS.stride(),             # sds (4 args)
-            *dQ.stride(),             # sdq (4 args) <-- Was missing
-            idx_table.stride(0),      # sl_n   (Assuming idx_table is [N, LEVELS])
-            idx_table.stride(1),      # sl_lvl 
+        HAS_MASK = (mask_table is not None)
+        mask_ptr_safe = mask_table if HAS_MASK else Weights
         
-            # --- Constants ---
-            sm_scale,
-        
-            # --- Meta-parameters ---
-            H=H, 
-            BLOCK_H=BLOCK_H, 
-            D=D, 
-            BLOCK_D=32, # Ensure D is divisible by 32 or masking handles it
-            LEVELS=LEVELS, 
-            BLOCK_LEVELS=BLOCK_LEVELS, 
-            HAS_MASK=HAS_MASK, 
-        
-            num_warps=2  # 4 warps is usually better for fused kernels involving reductions
+        hierarchical_attention_backward_dS_kernel[grid_ds](
+            grad_output_4d, Weights, V, idx_table, DS, mask_ptr_safe,
+            *grad_output_4d.stride(), *Weights.stride(), *V.stride(), 
+            *idx_table.stride(), *DS.stride(),            
+            sm_scale, H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=32, 
+            LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS, HAS_MASK=HAS_MASK, num_warps=2
         )
 
         # --- SETUP PARALLELISM ---
         dK = torch.zeros_like(K)
         dV = torch.zeros_like(V)
-        #dQ = torch.empty_like(Q)
+        dQ = torch.empty_like(Q)
 
         ## --- BRANCH 1: dQ (Independent) ---
         #grid_dq = (N, B)
@@ -1921,14 +1865,14 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
                 num_warps=2
             )
 
-        ## --- BRANCH 1: dQ (Independent) ---
-        #grid_dq = (N, B)
-        #hierarchical_attention_backward_dQ_kernel[grid_dq](
-        #    DS, K, idx_table, dQ, mask_ptr_safe, 
-        #    *DS.stride(), *K.stride(), *idx_table.stride(), *dQ.stride(),
-        #    H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=32, LEVELS=LEVELS,
-        #    HAS_MASK=HAS_MASK, num_warps=2
-        #)
+        # --- BRANCH 1: dQ (Independent) ---
+        grid_dq = (N, B)
+        hierarchical_attention_backward_dQ_kernel[grid_dq](
+            DS, K, idx_table, dQ, mask_ptr_safe, 
+            *DS.stride(), *K.stride(), *idx_table.stride(), *dQ.stride(),
+            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=32, LEVELS=LEVELS,
+            HAS_MASK=HAS_MASK, num_warps=2
+        )
             
         return dQ, dK, dV, None, None, None
 
