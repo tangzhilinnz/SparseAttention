@@ -1042,15 +1042,23 @@ def hierarchical_attention_backward_low_level_kernel(
                 found = 1
 
     # ------------------------------------------------------------------
-    # 2. GATHER LOGIC (No Atomics)
-    # ------------------------------------------------------------------
-    num_children = 1 << target_level
-    w_idx = target_level + 1
-    
+    # 2. GATHER LOGIC (With Early Stop)
+    # ------------------------------------------------------------------  
     # Gather Table Lookup
     tab_ptr = Gather_Table_ptr + (node_id * sg_node)
     child_start_base = tl.load(tab_ptr + 0)
-    has_children = (child_start_base != -1)
+
+    # [OPTIMIZATION] EARLY STOP
+    # If this node has no children, we are done. 
+    # Since dK and dV are initialized to 0.0 by torch.zeros_like(), 
+    # we don't need to write anything.
+    if child_start_base == -1:
+        return
+
+    # --- Everything below is SKIPPED for leaf/invalid nodes ---
+
+    num_children = 1 << target_level
+    w_idx = target_level + 1
 
     offs_h = tl.arange(0, BLOCK_H)
     mask_h = offs_h < H
@@ -1070,27 +1078,27 @@ def hierarchical_attention_backward_low_level_kernel(
         dk_acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
         dv_acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
 
-        if has_children:
-            off_hq_d  = (offs_h[:, None] * sq_h)  + (offs_d[None, :] * sq_d)
-            off_hdo_d = (offs_h[:, None] * sdo_h) + (offs_d[None, :] * sdo_d)
+        # We already checked has_children above, so we know it's True here
+        off_hq_d  = (offs_h[:, None] * sq_h)  + (offs_d[None, :] * sq_d)
+        off_hdo_d = (offs_h[:, None] * sdo_h) + (offs_d[None, :] * sdo_d)
 
-            for k in range(num_children): # Simple loop
-                child_idx = child_start_base + k
-                
-                ptr_ds = ptr_ds_base + (child_idx * sds_n) + (offs_h * sds_h)
-                ptr_w  = ptr_w_base  + (child_idx * sw_n)  + (offs_h * sw_h)
-                ds = tl.load(ptr_ds, mask=mask_h, other=0.0)[:, None]
-                w  = tl.load(ptr_w,  mask=mask_h, other=0.0)[:, None]
-                
-                ptr_q  = ptr_q_base  + (child_idx * sq_n)  + off_hq_d
-                ptr_do = ptr_do_base + (child_idx * sdo_n) + off_hdo_d
-                q  = tl.load(ptr_q,  mask=mask_op, other=0.0)
-                do = tl.load(ptr_do, mask=mask_op, other=0.0)
-                
-                dk_acc += ds * q
-                dv_acc += w * do
+        for k in range(num_children):
+            child_idx = child_start_base + k
+            
+            ptr_ds = ptr_ds_base + (child_idx * sds_n) + (offs_h * sds_h)
+            ptr_w  = ptr_w_base  + (child_idx * sw_n)  + (offs_h * sw_h)
+            ds = tl.load(ptr_ds, mask=mask_h, other=0.0)[:, None]
+            w  = tl.load(ptr_w,  mask=mask_h, other=0.0)[:, None]
+            
+            ptr_q  = ptr_q_base  + (child_idx * sq_n)  + off_hq_d
+            ptr_do = ptr_do_base + (child_idx * sdo_n) + off_hdo_d
+            q  = tl.load(ptr_q,  mask=mask_op, other=0.0)
+            do = tl.load(ptr_do, mask=mask_op, other=0.0)
+            
+            dk_acc += ds * q
+            dv_acc += w * do
 
-        # [FAST STORE] No atomic contention risk here
+        # Store Result
         ptr_dk = DK_ptr + off_out_base + (offs_d[None, :] * sdk_d)
         ptr_dv = DV_ptr + off_out_base + (offs_d[None, :] * sdk_d)
         tl.store(ptr_dk, dk_acc, mask=mask_op)
@@ -1270,24 +1278,29 @@ def hierarchical_attention_backward_high_level_kernel(
     node_id = start_node_global + node_local
 
     # ------------------------------------------------------------------
-    # 2. CONSTANT LOOP SETUP
+    # 2. EARLY EXIT (The Optimization)
     # ------------------------------------------------------------------
-    # CRITICAL INSIGHT: 
-    # num_children / split_k is CONSTANT across all levels in this kernel.
+    # Load Table Entry FIRST.
+    tab_ptr = Gather_Table_ptr + (node_id * sg_node)
+    child_start_base = tl.load(tab_ptr + 0)
+    
+    # If -1, this node is empty. Exit immediately.
+    # This prevents all subsequent math, pointer arithmetic, and atomic locking.
+    if child_start_base == -1:
+        return
+
+    # ------------------------------------------------------------------
+    # 3. CONSTANT LOOP SETUP
+    # ------------------------------------------------------------------
+    # Only reached if node has children.
+    
     # Ratio = 2^L / 2^(L - (START-1)) = 2^(START-1)
-    # This allows the compiler to generate fixed-size loops.
     CHILDREN_PER_SPLIT: tl.constexpr = 1 << (START_LEVEL - 1)
     
     w_idx = target_level + 1
     
-    # Start K (Simple Multiply)
+    # Start K
     start_k = split_id * CHILDREN_PER_SPLIT
-    
-    # Gather Table Lookup
-    # Using 'tl.load' with 'cache_modifier=".ca"' (Cache All) since this is reused
-    tab_ptr = Gather_Table_ptr + (node_id * sg_node)
-    child_start_base = tl.load(tab_ptr + 0) # Hint: cache this heavily
-    has_children = (child_start_base != -1)
 
     # Base Pointers (Hoisted)
     offs_h = tl.arange(0, BLOCK_H)
@@ -1300,7 +1313,7 @@ def hierarchical_attention_backward_high_level_kernel(
     ptr_do_base = DO_ptr + (b_idx * sdo_b)
 
     # ------------------------------------------------------------------
-    # 3. MAIN LOOP
+    # 4. MAIN LOOP
     # ------------------------------------------------------------------
     for off_d_start in range(0, D, BLOCK_D):
         offs_d = off_d_start + tl.arange(0, BLOCK_D)
@@ -1310,39 +1323,37 @@ def hierarchical_attention_backward_high_level_kernel(
         dk_acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
         dv_acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
 
-        if has_children:
-            off_hq_d  = (offs_h[:, None] * sq_h)  + (offs_d[None, :] * sq_d)
-            off_hdo_d = (offs_h[:, None] * sdo_h) + (offs_d[None, :] * sdo_d)
+        # Note: We don't need 'if has_children' check here because 
+        # we would have returned above if it was False.
+        off_hq_d  = (offs_h[:, None] * sq_h)  + (offs_d[None, :] * sq_d)
+        off_hdo_d = (offs_h[:, None] * sdo_h) + (offs_d[None, :] * sdo_d)
 
-            # EXTREME OPTIMIZATION:
-            # 1. No 'range(dynamic)'. Range is CONSTANT.
-            # 2. No 'if k < num_children'. Math guarantees safety.
-            # 3. Compiler can fully unroll or pipeline this.
-            for k_offset in range(CHILDREN_PER_SPLIT):
-                # Calculate offsets (Pure ALU, no branches)
-                k = start_k + k_offset
-                child_idx = child_start_base + k
-                
-                # Pointers
-                # Using 'offs_h' and 'offs_d' which are registers
-                ptr_ds = ptr_ds_base + (child_idx * sds_n) + (offs_h * sds_h)
-                ptr_w  = ptr_w_base  + (child_idx * sw_n)  + (offs_h * sw_h)
-                
-                # Load (Masked only by Head/Dim, not by Child index)
-                ds = tl.load(ptr_ds, mask=mask_h, other=0.0)[:, None]
-                w  = tl.load(ptr_w,  mask=mask_h, other=0.0)[:, None]
-                
-                ptr_q  = ptr_q_base  + (child_idx * sq_n)  + off_hq_d
-                ptr_do = ptr_do_base + (child_idx * sdo_n) + off_hdo_d
-                
-                q  = tl.load(ptr_q,  mask=mask_op, other=0.0)
-                do = tl.load(ptr_do, mask=mask_op, other=0.0)
-                
-                # FMA (Fused Multiply Add)
-                dk_acc += ds * q
-                dv_acc += w * do
+        # Constant Unrolled Loop
+        for k_offset in range(CHILDREN_PER_SPLIT):
+            # Calculate offsets (Pure ALU, no branches)
+            k = start_k + k_offset
+            child_idx = child_start_base + k
+            
+            # Pointers
+            ptr_ds = ptr_ds_base + (child_idx * sds_n) + (offs_h * sds_h)
+            ptr_w  = ptr_w_base  + (child_idx * sw_n)  + (offs_h * sw_h)
+            
+            # Load
+            ds = tl.load(ptr_ds, mask=mask_h, other=0.0)[:, None]
+            w  = tl.load(ptr_w,  mask=mask_h, other=0.0)[:, None]
+            
+            ptr_q  = ptr_q_base  + (child_idx * sq_n)  + off_hq_d
+            ptr_do = ptr_do_base + (child_idx * sdo_n) + off_hdo_d
+            
+            q  = tl.load(ptr_q,  mask=mask_op, other=0.0)
+            do = tl.load(ptr_do, mask=mask_op, other=0.0)
+            
+            # FMA
+            dk_acc += ds * q
+            dv_acc += w * do
 
-        # Atomic Store (Required for Zone 2)
+        # [ATOMIC STORE] 
+        # We only reach here if children exist, so we never atomic_add to empty nodes.
         ptr_dk = DK_ptr + off_out_base + (offs_d[None, :] * sdk_d)
         ptr_dv = DV_ptr + off_out_base + (offs_d[None, :] * sdk_d)
         tl.atomic_add(ptr_dk, dk_acc, mask=mask_op)
