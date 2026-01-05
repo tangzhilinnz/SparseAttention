@@ -1659,7 +1659,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             D=D, LEVELS=LEVELS,
             BLOCK_D=BLOCK_D, BLOCK_LEVELS=BLOCK_LEVELS,
             HAS_MASK=HAS_MASK,
-            num_warps=1
+            num_warps=2
         )
         
         # [UPDATE] Save mask_table for backward. PyTorch handles 'None' correctly.
@@ -1790,7 +1790,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             *grad_output_4d.stride(), *Weights.stride(), *V.stride(), 
             *idx_table.stride(), *DS.stride(),            
             sm_scale, H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=32, 
-            LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS, HAS_MASK=HAS_MASK, num_warps=1
+            LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS, HAS_MASK=HAS_MASK, num_warps=2
         )
 
         # --- SETUP PARALLELISM ---
@@ -1816,7 +1816,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             dK, dV,
             *DS.stride(), *Q.stride(), *Weights.stride(), 
             *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
-            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, num_warps=1
+            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, num_warps=2
         )
 
         
@@ -1838,7 +1838,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
                 H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
                 N=N, 
                 MAX_LEVEL=limit, 
-                num_warps=1
+                num_warps=2
             )
 
         # --- KERNEL B: High Levels (Split>1) ---
@@ -1862,7 +1862,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
                 H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
                 N=N,
                 START_LEVEL=CUTOFF_LEVEL + 1, # Start at Level 9
-                num_warps=1
+                num_warps=2
             )
 
          # --- BRANCH 1: dQ (Independent) ---
@@ -1871,7 +1871,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             DS, K, idx_table, dQ, mask_ptr_safe, 
             *DS.stride(), *K.stride(), *idx_table.stride(), *dQ.stride(),
             H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=32, LEVELS=LEVELS,
-            HAS_MASK=HAS_MASK, num_warps=1
+            HAS_MASK=HAS_MASK, num_warps=2
         )
             
         return dQ, dK, dV, None, None, None
