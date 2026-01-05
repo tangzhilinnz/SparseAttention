@@ -1711,7 +1711,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             if HAS_MASK:
                 # 1. Causal Mode: Launch HALF blocks, use Causal Kernel
                 grid_low = (total_blocks_low // 2, B)
-                hierarchical_attention_backward_low_level_kernel_causal[grid_low](
+                hierarchical_attention_backward_low_level_causal_kernel[grid_low](
                     DS, Q, Weights, grad_output_4d, gather_table,
                     dK, dV,
                     *DS.stride(), *Q.stride(), *Weights.stride(),
@@ -1743,7 +1743,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             if HAS_MASK:
                 # 1. Causal Mode: Launch HALF blocks, use Causal Kernel
                 grid_high = (total_blocks_high // 2, B)
-                hierarchical_attention_backward_high_level_kernel_causal[grid_high](
+                hierarchical_attention_backward_high_level_causal_kernel[grid_high](
                     DS, Q, Weights, grad_output_4d, gather_table,
                     dK, dV,
                     *DS.stride(), *Q.stride(), *Weights.stride(),
