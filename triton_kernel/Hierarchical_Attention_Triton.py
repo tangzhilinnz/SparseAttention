@@ -423,10 +423,12 @@ def hierarchical_attention_forward_kernel(
 
     # Save Weights
     w_base_ptr = W_ptr + (b_idx * sw_b) + (node_idx * sw_n) + (h_idx * sw_h)
-    tl.store(w_base_ptr + (0 * sw_lvl), w_self, mask=mask_h)
+    #tl.store(w_base_ptr + (0 * sw_lvl), w_self, mask=mask_h)
+    tl.store(w_base_ptr + (0 * sw_lvl), w_self.to(tl.float16), mask=mask_h)
     
     w_cross_ptr = w_base_ptr[:, None] + ((1 + offs_lvl[None, :]) * sw_lvl)
-    tl.store(w_cross_ptr, w_cross, mask=mask_h[:, None] & mask_lvl[None, :])
+    #tl.store(w_cross_ptr, w_cross, mask=mask_h[:, None] & mask_lvl[None, :])
+    tl.store(w_cross_ptr, w_cross.to(tl.float16), mask=mask_h[:, None] & mask_lvl[None, :])
 
     # 6. Weighted Sum Loop
     out_base_ptr = Out_ptr + (b_idx * so_b) + (node_idx * so_n) + \
@@ -514,12 +516,15 @@ def hierarchical_attention_backward_dS_kernel(
     w_base = W_ptr + (b_idx * sw_b) + (node_idx * sw_n) + (h_idx * sw_h)
     
     # Self Weight
-    w_self = tl.load(w_base + (0 * sw_lvl), mask=mask_h, other=0.0)
+    #w_self = tl.load(w_base + (0 * sw_lvl), mask=mask_h, other=0.0)
+    w_self = tl.load(w_base + (0 * sw_lvl), mask=mask_h, other=0.0).to(tl.float32)
     
     # Cross Weight
     # DEFENSIVE: Apply mask_valid_cross. If masked, w_cross becomes 0.0.
-    w_cross = tl.load(w_base[:, None] + ((1 + offs_lvl[None, :]) * sw_lvl), 
-                      mask=mask_h[:, None] & mask_valid_cross[None, :], other=0.0)
+    #w_cross = tl.load(w_base[:, None] + ((1 + offs_lvl[None, :]) * sw_lvl), 
+    #                  mask=mask_h[:, None] & mask_valid_cross[None, :], other=0.0)
+    load(w_base[:, None] + ((1 + offs_lvl[None, :]) * sw_lvl), 
+                      mask=mask_h[:, None] & mask_valid_cross[None, :], other=0.0).to(tl.float32)
 
     # -----------------------------------------------------------
     # 3. Compute dP = dot(dO, V)
@@ -619,8 +624,11 @@ def hierarchical_attention_backward_dK_dV_leaf_kernel(
     off_ds = (b_idx * sds_b) + (node_id * sds_n)
     off_w = (b_idx * sw_b) + (node_id * sw_n)
     
-    ds_self = tl.load(DS_ptr + off_ds + (offs_h[:, None] * sds_h), mask=mask_h[:, None], other=0.0)
-    w_self = tl.load(W_ptr + off_w + (offs_h[:, None] * sw_h), mask=mask_h[:, None], other=0.0)
+    #ds_self = tl.load(DS_ptr + off_ds + (offs_h[:, None] * sds_h), mask=mask_h[:, None], other=0.0)
+    #w_self = tl.load(W_ptr + off_w + (offs_h[:, None] * sw_h), mask=mask_h[:, None], other=0.0)
+
+    w_self = tl.load(W_ptr + off_w + (offs_h[:, None] * sw_h), mask=mask_h[:, None], other=0.0).to(tl.float32)
+    ds_self = tl.load(DS_ptr + off_ds + (offs_h[:, None] * sds_h), mask=mask_h[:, None], other=0.0).to(tl.float32)
 
     # --- Sibling Pointers & Check ---
     tab_ptr = Gather_Table_ptr + (node_id * sg_node)
@@ -635,8 +643,10 @@ def hierarchical_attention_backward_dK_dV_leaf_kernel(
         off_ds_sib = (b_idx * sds_b) + (sibling_leaf * sds_n) + (w_idx * sds_lvl)
         off_w_sib = (b_idx * sw_b) + (sibling_leaf * sw_n) + (w_idx * sw_lvl)
         
-        ds_sib = tl.load(DS_ptr + off_ds_sib + (offs_h[:, None] * sds_h), mask=mask_h[:, None], other=0.0)
-        w_sib = tl.load(W_ptr + off_w_sib + (offs_h[:, None] * sw_h), mask=mask_h[:, None], other=0.0)
+        #ds_sib = tl.load(DS_ptr + off_ds_sib + (offs_h[:, None] * sds_h), mask=mask_h[:, None], other=0.0)
+        #w_sib = tl.load(W_ptr + off_w_sib + (offs_h[:, None] * sw_h), mask=mask_h[:, None], other=0.0)
+        ds_sib = tl.load(DS_ptr + off_ds_sib + (offs_h[:, None] * sds_h), mask=mask_h[:, None], other=0.0).to(tl.float32)
+        w_sib = tl.load(W_ptr + off_w_sib + (offs_h[:, None] * sw_h), mask=mask_h[:, None], other=0.0).to(tl.float32)
 
     # -----------------------------------------------------------
     # 2. Loop over Dimension D (The Fix)
@@ -782,8 +792,10 @@ def hierarchical_attention_backward_low_level_kernel(
             
             ptr_ds = ptr_ds_base + (child_idx * sds_n) + (offs_h * sds_h)
             ptr_w  = ptr_w_base  + (child_idx * sw_n)  + (offs_h * sw_h)
-            ds = tl.load(ptr_ds, mask=mask_h, other=0.0)[:, None]
-            w  = tl.load(ptr_w,  mask=mask_h, other=0.0)[:, None]
+            #ds = tl.load(ptr_ds, mask=mask_h, other=0.0)[:, None]
+            #w  = tl.load(ptr_w,  mask=mask_h, other=0.0)[:, None]
+            ds = tl.load(ptr_ds, mask=mask_h, other=0.0).to(tl.float32)[:, None]
+            w  = tl.load(ptr_w,  mask=mask_h, other=0.0).to(tl.float32)[:, None]
             
             ptr_q  = ptr_q_base  + (child_idx * sq_n)  + off_hq_d
             ptr_do = ptr_do_base + (child_idx * sdo_n) + off_hdo_d
@@ -921,8 +933,10 @@ def hierarchical_attention_backward_high_level_kernel(
             ptr_w  = ptr_w_base  + (child_idx * sw_n)  + (offs_h * sw_h)
             
             # Load
-            ds = tl.load(ptr_ds, mask=mask_h, other=0.0)[:, None]
-            w  = tl.load(ptr_w,  mask=mask_h, other=0.0)[:, None]
+            #ds = tl.load(ptr_ds, mask=mask_h, other=0.0)[:, None]
+            #w  = tl.load(ptr_w,  mask=mask_h, other=0.0)[:, None]
+            ds = tl.load(ptr_ds, mask=mask_h, other=0.0).to(tl.float32)[:, None]
+            w  = tl.load(ptr_w,  mask=mask_h, other=0.0).to(tl.float32)[:, None]
             
             ptr_q  = ptr_q_base  + (child_idx * sq_n)  + off_hq_d
             ptr_do = ptr_do_base + (child_idx * sdo_n) + off_hdo_d
@@ -1065,7 +1079,8 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         Out = torch.empty_like(Q)
         
         # Save weights for backward: [B, N, H, 1 + LEVELS]
-        Weights = torch.empty((B, N, H, 1 + LEVELS), device=Q.device, dtype=torch.float32)
+        #Weights = torch.empty((B, N, H, 1 + LEVELS), device=Q.device, dtype=torch.float32)
+        Weights = torch.empty((B, N, H, 1 + LEVELS), device=Q.device, dtype=torch.float16)
         
         HAS_MASK = (mask_table is not None)
         mask_ptr_safe = mask_table if HAS_MASK else Q # Dummy ptr
