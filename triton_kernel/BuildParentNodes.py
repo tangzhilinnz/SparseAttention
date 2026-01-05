@@ -1816,7 +1816,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             dK, dV,
             *DS.stride(), *Q.stride(), *Weights.stride(), 
             *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
-            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, num_warps=1
+            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, num_warps=2
         )
 
         
@@ -1862,7 +1862,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
                 H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
                 N=N,
                 START_LEVEL=CUTOFF_LEVEL + 1, # Start at Level 9
-                num_warps=4
+                num_warps=2
             )
 
          # --- BRANCH 1: dQ (Independent) ---
