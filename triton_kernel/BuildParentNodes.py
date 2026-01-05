@@ -1039,7 +1039,7 @@ def hierarchical_attention_backward_low_level_kernel(
             if pid < lvl_end:
                 target_level = lvl
                 # We already calculated node_id = N + pid outside!
-    #            found = 1
+                found = 1
 
     # ------------------------------------------------------------------
     # 2. GATHER LOGIC (No Atomics)
