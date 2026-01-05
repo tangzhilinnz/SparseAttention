@@ -1801,8 +1801,8 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         grad_output_4d = grad_output.view(B, N, H, D) 
     
         # 2. Allocate Outputs
-        # dS is intermediate, but needed for dK/dV kernels later
-        dS = torch.empty_like(Weights) 
+        # DS is intermediate, but needed for dK/dV kernels later
+        DS = torch.empty_like(Weights) 
         # dQ is the main output of this fused kernel
         dQ = torch.empty_like(Q) 
 
@@ -1820,7 +1820,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             V,               # V_ptr
             K,               # K_ptr      <-- Was missing
             idx_table,       # Lookup_ptr <-- Was misplaced
-            dS,              # dS_ptr
+            DS,              # dS_ptr
             dQ,              # dQ_ptr     <-- Was missing
             mask_ptr_safe,   # Mask_ptr
 
@@ -1829,7 +1829,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             *Weights.stride(),        # sw  (4 args)
             *V.stride(),              # sv  (4 args)
             *K.stride(),              # sk  (4 args) <-- Was missing
-            *dS.stride(),             # sds (4 args)
+            *DS.stride(),             # sds (4 args)
             *dQ.stride(),             # sdq (4 args) <-- Was missing
             idx_table.stride(0),      # sl_n   (Assuming idx_table is [N, LEVELS])
             idx_table.stride(1),      # sl_lvl 
