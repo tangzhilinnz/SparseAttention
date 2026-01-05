@@ -1770,11 +1770,11 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        ## 1. Retrieve Tensors
-        #Q, K, V, idx_table, gather_table, Weights, mask_table = ctx.saved_tensors
-        #sm_scale, H, BLOCK_H, D, BLOCK_D, LEVELS, BLOCK_LEVELS = ctx.constants
+        # 1. Retrieve Tensors
+        Q, K, V, idx_table, gather_table, Weights, mask_table = ctx.saved_tensors
+        sm_scale, H, BLOCK_H, D, BLOCK_D, LEVELS, BLOCK_LEVELS = ctx.constants
         #
-        ## View as 4D
+        # View as 4D
         #grad_output = grad_output.contiguous()
         #B, N = Q.shape[0], Q.shape[1]
         #grad_output_4d = grad_output.view(B, N, H, D) 
