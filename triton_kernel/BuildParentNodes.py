@@ -1364,7 +1364,7 @@ def hierarchical_attention_backward_high_level_kernel(
 #  Backward Kernel 3: Compute dQ (Small Kernel)
 # ------------------------------------------------------------------
 @triton.jit
-def hierarchical_attention_backward_dQ_kernel(
+def hierarchical_attention_backward_dQ_kernel_bk(
     DS_ptr, K_ptr, Lookup_ptr, DQ_ptr, Mask_ptr,
     sds_b, sds_n, sds_h, sds_lvl,
     sk_b, sk_n, sk_h, sk_d,
@@ -1471,154 +1471,130 @@ def hierarchical_attention_backward_dQ_kernel(
         tl.store(dq_base + off_dq_out, dq_acc.to(DQ_ptr.dtype.element_ty), mask=mask_op)
 
 
-
 @triton.jit
-def hierarchical_attention_backward_dS_dQ_fused_kernel(
-    # Pointers
-    DO_ptr, W_ptr, V_ptr, K_ptr, Lookup_ptr, 
-    DS_ptr, DQ_ptr, Mask_ptr,
-    
-    # Strides (Combined from both)
-    sdo_b, sdo_n, sdo_h, sdo_d,       # dO
-    sw_b, sw_n, sw_h, sw_lvl,         # W
-    sv_b, sv_n, sv_h, sv_d,           # V
-    sk_b, sk_n, sk_h, sk_d,           # K
-    sds_b, sds_n, sds_h, sds_lvl,     # DS
-    sdq_b, sdq_n, sdq_h, sdq_d,       # DQ
-    sl_n, sl_lvl,                     # Lookup
-    
-    # Constants
-    sm_scale,
+def hierarchical_attention_backward_dQ_kernel(
+    DS_ptr, K_ptr, Lookup_ptr, DQ_ptr, Mask_ptr,
+    sds_b, sds_n, sds_h, sds_lvl,
+    sk_b, sk_n, sk_h, sk_d,
+    sl_n, sl_lvl,
+    sdq_b, sdq_n, sdq_h, sdq_d,
     H: tl.constexpr, BLOCK_H: tl.constexpr,
     D: tl.constexpr, BLOCK_D: tl.constexpr,
-    LEVELS: tl.constexpr, BLOCK_LEVELS: tl.constexpr,
+    LEVELS: tl.constexpr, 
+    BLOCK_LEVELS: tl.constexpr, # Must be next power of 2 >= LEVELS
     HAS_MASK: tl.constexpr
 ):
     node_idx = tl.program_id(0)
     b_idx = tl.program_id(1)
 
+    # -----------------------------------------------------------
+    # 0. Setup Dimensions
+    # -----------------------------------------------------------
     h_idx = tl.arange(0, BLOCK_H)
     mask_h = h_idx < H
+    
+    # Vectorized Levels
     offs_lvl = tl.arange(0, BLOCK_LEVELS)
+    mask_lvl_bounds = offs_lvl < LEVELS
 
     # -----------------------------------------------------------
-    # 1. Topology & Mask Loading (Shared)
+    # 1. Vectorized Topology Load (Independent of D loop)
     # -----------------------------------------------------------
-    mask_lvl_bounds = offs_lvl < LEVELS
+    # Shape: [BLOCK_LEVELS]
     off_lookup = node_idx * sl_n + offs_lvl * sl_lvl
     
-    # Load Topology (Parents)
-    neighbor_indices = tl.load(Lookup_ptr + off_lookup, mask=mask_lvl_bounds, other=0)
-
-    # Compute Valid Mask
-    mask_valid_cross = mask_lvl_bounds
+    # Load Parent Indices
+    # Note: Invalid levels get 0 temporarily to ensure safe pointers, 
+    # but we will mask their accumulation out later.
+    p_idx = tl.load(Lookup_ptr + off_lookup, mask=mask_lvl_bounds, other=-1)
+    
+    # Determine Validity
+    is_valid_edge = (p_idx != -1) & mask_lvl_bounds
+    
     if HAS_MASK:
-        val_int8 = tl.load(Mask_ptr + off_lookup, mask=mask_lvl_bounds, other=1).to(tl.int8)
-        mask_valid_cross = mask_valid_cross & (val_int8 == 0)
+        mask_val = tl.load(Mask_ptr + off_lookup, mask=mask_lvl_bounds, other=1).to(tl.int8)
+        is_valid_edge = is_valid_edge & (mask_val == 0)
+
+    # Safe Parent Index for pointer arithmetic (avoid out-of-bounds access)
+    safe_p_idx = tl.where(is_valid_edge, p_idx, 0)
 
     # -----------------------------------------------------------
-    # 2. Load Weights (W)
+    # 2. Base Pointers
     # -----------------------------------------------------------
-    w_base = W_ptr + (b_idx * sw_b) + (node_idx * sw_n) + (h_idx * sw_h)
-    
-    w_self = tl.load(w_base + (0 * sw_lvl), mask=mask_h, other=0.0)
-    
-    w_cross = tl.load(w_base[:, None] + ((1 + offs_lvl[None, :]) * sw_lvl), 
-                      mask=mask_h[:, None] & mask_valid_cross[None, :], other=0.0)
-
-    # -----------------------------------------------------------
-    # 3. PHASE 1: Compute dP = dot(dO, V)
-    # -----------------------------------------------------------
-    dp_self = tl.zeros([BLOCK_H], dtype=tl.float32)
-    dp_cross = tl.zeros([BLOCK_H, BLOCK_LEVELS], dtype=tl.float32)
-
-    v_batch_base = V_ptr + b_idx * sv_b
-    do_batch_base = DO_ptr + (b_idx * sdo_b) + (node_idx * sdo_n)
-    
-    off_node_self_v = node_idx * sv_n
-    off_node_cross_v = neighbor_indices * sv_n
-
-    # Loop 1: Iterate D to compute gradients w.r.t Score
-    for off_d in range(0, D, BLOCK_D):
-        offs_d = off_d + tl.arange(0, BLOCK_D)
-        mask_d = offs_d < D
-        mask_op = mask_h[:, None] & mask_d[None, :]
-
-        # Load dO
-        do = tl.load(do_batch_base + (h_idx[:, None]*sdo_h) + (offs_d[None, :]*sdo_d), 
-                     mask=mask_op, other=0.0)
-        
-        # Load V Self
-        ptr_v_self = v_batch_base + off_node_self_v + (h_idx[:, None]*sv_h) + (offs_d[None, :]*sv_d)
-        v_self = tl.load(ptr_v_self, mask=mask_op, other=0.0)
-        
-        # Load V Cross (Vectorized across Levels)
-        ptr_v_cross = v_batch_base + off_node_cross_v[None, :, None] + \
-                      (h_idx[:, None, None]*sv_h) + (offs_d[None, None, :]*sv_d)
-        
-        # Mask V: mask_h & mask_valid & mask_d
-        mask_v_cross = mask_h[:, None, None] & mask_valid_cross[None, :, None] & mask_d[None, None, :]
-        v_cross = tl.load(ptr_v_cross, mask=mask_v_cross, other=0.0)
-
-        dp_self += tl.sum(do * v_self, axis=1)
-        dp_cross += tl.sum(do[:, None, :] * v_cross, axis=2)
-
-    # -----------------------------------------------------------
-    # 4. PHASE 2: Compute dS (In Registers)
-    # -----------------------------------------------------------
-    sum_wdp = (w_self * dp_self) + tl.sum(w_cross * dp_cross, axis=1)
-    
-    # These variables hold dS. We will use them immediately for dQ.
-    ds_self = w_self * (dp_self - sum_wdp) * sm_scale
-    ds_cross = w_cross * (dp_cross - sum_wdp[:, None]) * sm_scale
-
-    # WRITE DS (Still needed for dK/dV kernels later)
     ds_base = DS_ptr + (b_idx * sds_b) + (node_idx * sds_n) + (h_idx * sds_h)
-    tl.store(ds_base + (0 * sds_lvl), ds_self, mask=mask_h)
-    
-    ds_cross_ptr = ds_base[:, None] + ((1 + offs_lvl[None, :]) * sds_lvl)
-    tl.store(ds_cross_ptr, ds_cross, mask=mask_h[:, None] & mask_lvl_bounds[None, :])
-
-    # -----------------------------------------------------------
-    # 5. PHASE 3: Compute dQ = dot(dS, K)
-    # -----------------------------------------------------------
-    # We reuse ds_self and ds_cross from registers.
-    
+    dq_base = DQ_ptr + (b_idx * sdq_b) + (node_idx * sdq_n) + (h_idx[:, None] * sdq_h)
     k_batch_base = K_ptr + b_idx * sk_b
-    dq_batch_base = DQ_ptr + (b_idx * sdq_b) + (node_idx * sdq_n)
+
+    # Pre-load dS Self (Scalar broadcast over D)
+    ds_self = tl.load(ds_base + (0 * sds_lvl), mask=mask_h, other=0.0)
+
+    # Pre-load dS Cross (Vectorized over Levels)
+    # Shape: [BLOCK_H, BLOCK_LEVELS]
+    # We shift offset by +1 because index 0 is self
+    ds_cross_ptrs = ds_base[:, None] + ((1 + offs_lvl[None, :]) * sds_lvl)
     
-    off_node_self_k = node_idx * sk_n
-    off_node_cross_k = neighbor_indices * sk_n
+    # Mask: Head valid AND Level valid
+    mask_ds_cross = mask_h[:, None] & is_valid_edge[None, :]
+    ds_cross = tl.load(ds_cross_ptrs, mask=mask_ds_cross, other=0.0)
 
-    # Loop 2: Iterate D again to compute dQ
-    for off_d in range(0, D, BLOCK_D):
-        offs_d = off_d + tl.arange(0, BLOCK_D)
+    # -----------------------------------------------------------
+    # 3. Main Loop over D
+    # -----------------------------------------------------------
+    for off_d_start in range(0, D, BLOCK_D):
+        offs_d = off_d_start + tl.arange(0, BLOCK_D)
         mask_d = offs_d < D
-        mask_op = mask_h[:, None] & mask_d[None, :]
+        mask_op_2d = mask_h[:, None] & mask_d[None, :]
 
-        # Load K Self
-        ptr_k_self = k_batch_base + off_node_self_k + (h_idx[:, None]*sk_h) + (offs_d[None, :]*sk_d)
-        k_self = tl.load(ptr_k_self, mask=mask_op, other=0.0)
-
-        # Load K Cross (Vectorized)
-        ptr_k_cross = k_batch_base + off_node_cross_k[None, :, None] + \
-                      (h_idx[:, None, None]*sk_h) + (offs_d[None, None, :]*sk_d)
+        # -------------------------------------------------------
+        # A. Self Attention Term
+        # -------------------------------------------------------
+        off_k_self = (node_idx * sk_n) + \
+                     (h_idx[:, None] * sk_h) + \
+                     (offs_d[None, :] * sk_d)
         
-        mask_k_cross = mask_h[:, None, None] & mask_valid_cross[None, :, None] & mask_d[None, None, :]
-        k_cross = tl.load(ptr_k_cross, mask=mask_k_cross, other=0.0)
-
-        # Accumulate dQ
-        # Term 1: Self
+        k_self = tl.load(k_batch_base + off_k_self, mask=mask_op_2d, other=0.0)
+        
+        # dQ_acc initialized with Self contribution
         dq_acc = ds_self[:, None].to(tl.float32) * k_self.to(tl.float32)
+
+        # -------------------------------------------------------
+        # B. Cross Attention Term (Vectorized)
+        # -------------------------------------------------------
+        # We need to load K for all parents at once.
+        # Shape: [BLOCK_H, BLOCK_LEVELS, BLOCK_D]
         
-        # Term 2: Cross (Sum over levels)
-        # ds_cross [H, L] * k_cross [H, L, D] -> Sum over L -> [H, D]
-        dq_acc += tl.sum(ds_cross[:, :, None].to(tl.float32) * k_cross.to(tl.float32), axis=1)
+        # Pointer Arithmetic:
+        # Batch base is constant.
+        # Node offset: safe_p_idx [1, LEVELS, 1] * sk_n
+        # Head offset: h_idx      [H, 1, 1]      * sk_h
+        # Dim offset:  offs_d     [1, 1, D]      * sk_d
+        
+        off_k_cross = (safe_p_idx[None, :, None] * sk_n) + \
+                      (h_idx[:, None, None] * sk_h) + \
+                      (offs_d[None, None, :] * sk_d)
+                      
+        # Mask: Head valid & Edge valid & Dim valid
+        # Shape: [H, L, D]
+        mask_k_cross = mask_h[:, None, None] & \
+                       is_valid_edge[None, :, None] & \
+                       mask_d[None, None, :]
+                       
+        k_cross = tl.load(k_batch_base + off_k_cross, mask=mask_k_cross, other=0.0)
 
-        # Store dQ
-        off_dq_out = (h_idx[:, None] * sdq_h) + (offs_d[None, :] * sdq_d)
-        tl.store(dq_batch_base + off_dq_out, dq_acc.to(DQ_ptr.dtype.element_ty), mask=mask_op)
+        # Computation:
+        # ds_cross [H, L] -> broadcast to [H, L, 1]
+        # k_cross  [H, L, D]
+        # product  [H, L, D]
+        term_cross = ds_cross[:, :, None].to(tl.float32) * k_cross.to(tl.float32)
+        
+        # Sum over Levels (axis 1) -> [H, D]
+        dq_acc += tl.sum(term_cross, axis=1)
 
+        # -------------------------------------------------------
+        # C. Store Result
+        # -------------------------------------------------------
+        off_dq_out = offs_d[None, :] * sdq_d
+        tl.store(dq_base + off_dq_out, dq_acc.to(DQ_ptr.dtype.element_ty), mask=mask_op_2d)
 
 class HierarchicalAttentionFunc(torch.autograd.Function):
     @staticmethod
@@ -1868,9 +1844,9 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         # --- BRANCH 1: dQ (Independent) ---
         grid_dq = (N, B)
         hierarchical_attention_backward_dQ_kernel[grid_dq](
-            DS, K, idx_table, dQ, mask_ptr_safe, 
+            DS, K, idx_table, dQ, mask_ptr_safe,
             *DS.stride(), *K.stride(), *idx_table.stride(), *dQ.stride(),
-            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=32, LEVELS=LEVELS,
+            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=32, LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS,
             HAS_MASK=HAS_MASK, num_warps=2
         )
             
