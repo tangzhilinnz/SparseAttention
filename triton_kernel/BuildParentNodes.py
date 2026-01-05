@@ -970,7 +970,6 @@ def hierarchical_attention_backward_low_level_kernel(
     H: tl.constexpr, BLOCK_H: tl.constexpr,
     D: tl.constexpr, BLOCK_D: tl.constexpr,
     N: tl.constexpr,
-    LOG_N: tl.constexpr, # <--- NEW: Pass this from Python
     MAX_LEVEL: tl.constexpr
 ):
     pid = tl.program_id(0)
