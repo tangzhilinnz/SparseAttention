@@ -523,7 +523,7 @@ def hierarchical_attention_backward_dS_kernel(
     # DEFENSIVE: Apply mask_valid_cross. If masked, w_cross becomes 0.0.
     #w_cross = tl.load(w_base[:, None] + ((1 + offs_lvl[None, :]) * sw_lvl), 
     #                  mask=mask_h[:, None] & mask_valid_cross[None, :], other=0.0)
-    load(w_base[:, None] + ((1 + offs_lvl[None, :]) * sw_lvl), 
+    w_cross = load(w_base[:, None] + ((1 + offs_lvl[None, :]) * sw_lvl), 
                       mask=mask_h[:, None] & mask_valid_cross[None, :], other=0.0).to(tl.float32)
 
     # -----------------------------------------------------------
