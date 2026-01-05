@@ -1655,117 +1655,50 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         )
 
         
-        #CUTOFF_LEVEL = 6
-        #
-        ## --- KERNEL A: Low Levels (Split=1) ---
-        #if LEVELS >= 1:
-        #    limit = min(LEVELS, CUTOFF_LEVEL)
-        #    # Total blocks = N - (N >> limit)
-        #    total_blocks_low = N - (N >> limit)
-        #    
-        #    grid_low = (total_blocks_low, B)
-        #    
-        #    hierarchical_attention_backward_low_level_kernel[grid_low](
-        #        DS, Q, Weights, grad_output_4d, gather_table,
-        #        dK, dV,
-        #        *DS.stride(), *Q.stride(), *Weights.stride(),
-        #        *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
-        #        H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
-        #        N=N, 
-        #        MAX_LEVEL=limit, 
-        #        num_warps=4
-        #    )
-        #
-        ## --- KERNEL B: High Levels (Split>1) ---
-        #if LEVELS > CUTOFF_LEVEL:
-        #    num_high_levels = LEVELS - CUTOFF_LEVEL
-        #    
-        #    # Constant blocks per level = N >> (CUTOFF)
-        #    # Actually, logic dictates: N >> (START_LEVEL - 1)
-        #    # If START_LEVEL=9, we need N >> 8.
-        #    blocks_per_lvl = N >> CUTOFF_LEVEL
-        #    
-        #    total_blocks_high = blocks_per_lvl * num_high_levels
-        #    
-        #    grid_high = (total_blocks_high, B)
-        #    
-        #    hierarchical_attention_backward_high_level_kernel[grid_high](
-        #        DS, Q, Weights, grad_output_4d, gather_table,
-        #        dK, dV,
-        #        *DS.stride(), *Q.stride(), *Weights.stride(),
-        #        *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
-        #        H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
-        #        N=N,
-        #        START_LEVEL=CUTOFF_LEVEL + 1, # Start at Level 9
-        #        num_warps=2
-        #    )
-
         CUTOFF_LEVEL = 9
         
         # --- KERNEL A: Low Levels (Split=1) ---
         if LEVELS >= 1:
             limit = min(LEVELS, CUTOFF_LEVEL)
+            # Total blocks = N - (N >> limit)
             total_blocks_low = N - (N >> limit)
             
-            # [OPTIMIZATION] Split Logic based on Mask
-            if HAS_MASK:
-                # 1. Causal Mode: Launch HALF blocks, use Causal Kernel
-                grid_low = (total_blocks_low // 2, B)
-                hierarchical_attention_backward_low_level_causal_kernel[grid_low](
-                    DS, Q, Weights, grad_output_4d, gather_table,
-                    dK, dV,
-                    *DS.stride(), *Q.stride(), *Weights.stride(),
-                    *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
-                    H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
-                    N=N, MAX_LEVEL=limit, 
-                    num_warps=4
-                )
-            else:
-                # 2. Dense Mode: Launch FULL blocks, use Standard Kernel
-                grid_low = (total_blocks_low, B)
-                hierarchical_attention_backward_low_level_kernel[grid_low](
-                    DS, Q, Weights, grad_output_4d, gather_table,
-                    dK, dV,
-                    *DS.stride(), *Q.stride(), *Weights.stride(),
-                    *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
-                    H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
-                    N=N, MAX_LEVEL=limit, 
-                    num_warps=4
-                )
+            grid_low = (total_blocks_low, B)
+            
+            hierarchical_attention_backward_low_level_kernel[grid_low](
+                DS, Q, Weights, grad_output_4d, gather_table,
+                dK, dV,
+                *DS.stride(), *Q.stride(), *Weights.stride(),
+                *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
+                H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
+                N=N, 
+                MAX_LEVEL=limit, 
+                num_warps=4
+            )
         
         # --- KERNEL B: High Levels (Split>1) ---
         if LEVELS > CUTOFF_LEVEL:
             num_high_levels = LEVELS - CUTOFF_LEVEL
+            
+            # Constant blocks per level = N >> (CUTOFF)
+            # Actually, logic dictates: N >> (START_LEVEL - 1)
+            # If START_LEVEL=9, we need N >> 8.
             blocks_per_lvl = N >> CUTOFF_LEVEL
+            
             total_blocks_high = blocks_per_lvl * num_high_levels
             
-            # [OPTIMIZATION] Split Logic based on Mask
-            if HAS_MASK:
-                # 1. Causal Mode: Launch HALF blocks, use Causal Kernel
-                grid_high = (total_blocks_high // 2, B)
-                hierarchical_attention_backward_high_level_causal_kernel[grid_high](
-                    DS, Q, Weights, grad_output_4d, gather_table,
-                    dK, dV,
-                    *DS.stride(), *Q.stride(), *Weights.stride(),
-                    *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
-                    H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
-                    N=N, 
-                    START_LEVEL=CUTOFF_LEVEL + 1, 
-                    num_warps=2
-                )
-            else:
-                # 2. Dense Mode: Launch FULL blocks, use Standard Kernel
-                grid_high = (total_blocks_high, B)
-                hierarchical_attention_backward_high_level_kernel[grid_high](
-                    DS, Q, Weights, grad_output_4d, gather_table,
-                    dK, dV,
-                    *DS.stride(), *Q.stride(), *Weights.stride(),
-                    *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
-                    H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
-                    N=N, 
-                    START_LEVEL=CUTOFF_LEVEL + 1, 
-                    num_warps=2
-                )
+            grid_high = (total_blocks_high, B)
+            
+            hierarchical_attention_backward_high_level_kernel[grid_high](
+                DS, Q, Weights, grad_output_4d, gather_table,
+                dK, dV,
+                *DS.stride(), *Q.stride(), *Weights.stride(),
+                *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
+                H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
+                N=N,
+                START_LEVEL=CUTOFF_LEVEL + 1, # Start at Level 9
+                num_warps=2
+            )
 
         # --- BRANCH 1: dQ (Independent) ---
         grid_dq = (N, B)
