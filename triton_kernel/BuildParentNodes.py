@@ -1838,7 +1838,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
                 H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
                 N=N, 
                 MAX_LEVEL=limit, 
-                num_warps=2
+                num_warps=4
             )
 
         # --- KERNEL B: High Levels (Split>1) ---
@@ -1862,7 +1862,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
                 H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
                 N=N,
                 START_LEVEL=CUTOFF_LEVEL + 1, # Start at Level 9
-                num_warps=2
+                num_warps=4
             )
 
          # --- BRANCH 1: dQ (Independent) ---
