@@ -1052,8 +1052,8 @@ def hierarchical_attention_backward_low_level_kernel(
     # If this node has no children, we are done. 
     # Since dK and dV are initialized to 0.0 by torch.zeros_like(), 
     # we don't need to write anything.
-    #if child_start_base == -1:
-    #    return
+    if child_start_base == -1:
+        return
 
     # --- Everything below is SKIPPED for leaf/invalid nodes ---
 
@@ -1173,8 +1173,8 @@ def hierarchical_attention_backward_high_level_kernel(
     
     # If -1, this node is empty. Exit immediately.
     # This prevents all subsequent math, pointer arithmetic, and atomic locking.
-    #if child_start_base == -1:
-    #    return
+    if child_start_base == -1:
+        return
 
     # ------------------------------------------------------------------
     # 3. CONSTANT LOOP SETUP
@@ -1296,8 +1296,8 @@ def hierarchical_attention_backward_low_level_causal_kernel(
     child_start_base = tl.load(tab_ptr + 0)
 
     # [SAFETY] Mandatory because padding nodes (even if even-indexed) can be -1
-    #if child_start_base == -1:
-    #    return
+    if child_start_base == -1:
+        return
 
     num_children = 1 << target_level
     w_idx = target_level + 1
@@ -1402,8 +1402,8 @@ def hierarchical_attention_backward_high_level_causal_kernel(
     tab_ptr = Gather_Table_ptr + (node_id * sg_node)
     child_start_base = tl.load(tab_ptr + 0)
     
-    #if child_start_base == -1:
-    #    return
+    if child_start_base == -1:
+        return
 
     # ------------------------------------------------------------------
     # 3. MATH LOOP
@@ -1700,7 +1700,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         #        num_warps=2
         #    )
 
-        CUTOFF_LEVEL = 6
+        CUTOFF_LEVEL = 9
         
         # --- KERNEL A: Low Levels (Split=1) ---
         if LEVELS >= 1:
@@ -1908,25 +1908,25 @@ def build_tree_topology(seq_len, is_causal=True, device="cuda", dtype=torch.int3
     gather_info[valid_nodes, 2] = node_levels[valid_nodes] # Now uses the corrected levels
 
 
-    # ===============================================================
-    # 3. DEBUG: Print Line by Line
-    # ===============================================================
-    print("\n=== Gather Info Table ===")
-    print(f"{'Node':<6} | {'Start':<6} | {'End':<6} | {'Level':<6}")
-    print("-" * 30)
-    
-    # Convert to CPU list for clean iteration
-    gi_cpu = gather_info.detach().cpu().numpy()
-    
-    for i in range(total_nodes):
-        s, e, l = gi_cpu[i]
-        # Only print nodes that actually gather something (optional, remove 'if' to see all)
-        if s != -1: 
-            print(f"{i:<6} | {s:<6} | {e:<6} | {l:<6}")
-        else:
-            print(f"{i:<6} | {'-1':<6} | {'-1':<6} | {'-1':<6}")
-            
-    print("=========================\n")
+    ## ===============================================================
+    ## 3. DEBUG: Print Line by Line
+    ## ===============================================================
+    #print("\n=== Gather Info Table ===")
+    #print(f"{'Node':<6} | {'Start':<6} | {'End':<6} | {'Level':<6}")
+    #print("-" * 30)
+    #
+    ## Convert to CPU list for clean iteration
+    #gi_cpu = gather_info.detach().cpu().numpy()
+    #
+    #for i in range(total_nodes):
+    #    s, e, l = gi_cpu[i]
+    #    # Only print nodes that actually gather something (optional, remove 'if' to see all)
+    #    if s != -1: 
+    #        print(f"{i:<6} | {s:<6} | {e:<6} | {l:<6}")
+    #    else:
+    #        print(f"{i:<6} | {'-1':<6} | {'-1':<6} | {'-1':<6}")
+    #        
+    #print("=========================\n")
 
 
     return {
@@ -2585,8 +2585,8 @@ def run_full_suite_update_X_from_Y():
     
     # Optional mask (can be None, but good to test with None first for basic sanity)
     #mask = True
-    #mask = torch.ones((B, N), dtype=torch.bool, device='cuda')
-    mask=None
+    mask = torch.ones((B, N), dtype=torch.bool, device='cuda')
+    #mask=None
 
     print(f"Input Shapes -> X: {x.shape}, Y: {y.shape}, Dtype: {x.dtype}")
 
@@ -2656,8 +2656,8 @@ def run_full_suite_update_X_from_Y():
 
     # Config: Large scale to saturate GPU
     #B, N, D, H = 32, 4096, 64, 8
-    B, N, D, H = 64, 2048, 64, 8
-    #B, N, D, H = 2, 2048 * 64, 64, 8
+    #B, N, D, H = 64, 2048, 64, 8
+    B, N, D, H = 2, 2048 * 64, 64, 8
     dim = D * H
 
     print(f"Config: B={B}, N={N}, D={dim} (HeadDim={D}), H={H}, dtype={check_dtype}")
