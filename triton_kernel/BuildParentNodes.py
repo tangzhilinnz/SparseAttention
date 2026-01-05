@@ -2545,7 +2545,7 @@ def run_full_suite():
     print(f"{'='*60}")
 
     # Config: Massive scale
-    B, N, D, H = 64, 2048, 512, 8 
+    B, N, D, H = 32, 2048, 512, 8 
     # B, N, D, H = 16, 4096, 1024, 16 # Alternative config
 
     print(f"Config: B={B}, N={N}, D={D}, H={H}, dtype={dtype}")
@@ -2625,7 +2625,7 @@ def run_full_suite():
 
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
         with record_function("Triton_Step"):
-            for _ in range(3): 
+            for _ in range(5): 
                 out = model.cross_update_Y(x, y_in)
                 out.sum().backward()
                 model.zero_grad(); x.grad = None; y_in.grad = None
