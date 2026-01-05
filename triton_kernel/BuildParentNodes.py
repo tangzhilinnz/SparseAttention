@@ -1659,7 +1659,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             D=D, LEVELS=LEVELS,
             BLOCK_D=BLOCK_D, BLOCK_LEVELS=BLOCK_LEVELS,
             HAS_MASK=HAS_MASK,
-            num_warps=2
+            num_warps=1
         )
         
         # [UPDATE] Save mask_table for backward. PyTorch handles 'None' correctly.
@@ -1790,7 +1790,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             *grad_output_4d.stride(), *Weights.stride(), *V.stride(), 
             *idx_table.stride(), *DS.stride(),            
             sm_scale, H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=32, 
-            LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS, HAS_MASK=HAS_MASK, num_warps=2
+            LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS, HAS_MASK=HAS_MASK, num_warps=1
         )
 
         # --- SETUP PARALLELISM ---
@@ -1816,11 +1816,11 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             dK, dV,
             *DS.stride(), *Q.stride(), *Weights.stride(), 
             *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
-            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, num_warps=2
+            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, num_warps=1
         )
 
         
-        CUTOFF_LEVEL = 6
+        CUTOFF_LEVEL = 9
         
         # --- KERNEL A: Low Levels (Split=1) ---
         if LEVELS >= 1:
@@ -1838,7 +1838,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
                 H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
                 N=N, 
                 MAX_LEVEL=limit, 
-                num_warps=2
+                num_warps=1
             )
 
         # --- KERNEL B: High Levels (Split>1) ---
@@ -1862,7 +1862,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
                 H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
                 N=N,
                 START_LEVEL=CUTOFF_LEVEL + 1, # Start at Level 9
-                num_warps=2
+                num_warps=1
             )
 
          # --- BRANCH 1: dQ (Independent) ---
@@ -1871,7 +1871,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             DS, K, idx_table, dQ, mask_ptr_safe, 
             *DS.stride(), *K.stride(), *idx_table.stride(), *dQ.stride(),
             H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=32, LEVELS=LEVELS,
-            HAS_MASK=HAS_MASK, num_warps=2
+            HAS_MASK=HAS_MASK, num_warps=1
         )
             
         return dQ, dK, dV, None, None, None
@@ -2731,8 +2731,8 @@ def run_full_suite_update_X_from_Y():
 
     # Config: Large scale to saturate GPU
     #B, N, D, H = 32, 4096, 64, 8
-    B, N, D, H = 32, 2048, 32, 16
-    #B, N, D, H = 2, 2048 * 64, 64, 8
+    #B, N, D, H = 32, 2048, 32, 16
+    B, N, D, H = 2, 2048 * 64, 64, 8
     dim = D * H
 
     print(f"Config: B={B}, N={N}, D={dim} (HeadDim={D}), H={H}, dtype={check_dtype}")
