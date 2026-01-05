@@ -1790,7 +1790,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             *grad_output_4d.stride(), *Weights.stride(), *V.stride(), 
             *idx_table.stride(), *DS.stride(),            
             sm_scale, H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=32, 
-            LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS, HAS_MASK=HAS_MASK, num_warps=2
+            LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS, HAS_MASK=HAS_MASK, num_warps=4
         )
 
         # --- SETUP PARALLELISM ---
