@@ -2625,7 +2625,7 @@ def run_full_suite():
 
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
         with record_function("Triton_Step"):
-            for _ in range(5): 
+            for _ in range(3): 
                 out = model.cross_update_Y(x, y_in)
                 out.sum().backward()
                 model.zero_grad(); x.grad = None; y_in.grad = None
@@ -2662,7 +2662,6 @@ def run_full_suite_update_X_from_Y():
     # Optional mask (can be None, but good to test with None first for basic sanity)
     #mask = True
     mask = torch.ones((B, N), dtype=torch.bool, device='cuda')
-    #mask = None
 
     print(f"Input Shapes -> X: {x.shape}, Y: {y.shape}, Dtype: {x.dtype}")
 
