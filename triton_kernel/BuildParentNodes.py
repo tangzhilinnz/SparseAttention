@@ -970,7 +970,8 @@ def hierarchical_attention_backward_low_level_kernel(
     H: tl.constexpr, BLOCK_H: tl.constexpr,
     D: tl.constexpr, BLOCK_D: tl.constexpr,
     N: tl.constexpr,
-    MAX_LEVEL: tl.constexpr
+    MAX_LEVEL: tl.constexpr,
+    IS_CAUSAL: tl.constexpr  # <--- NEW CONSTANT
 ):
     pid = tl.program_id(0)
     b_idx = tl.program_id(1)
@@ -1004,41 +1005,69 @@ def hierarchical_attention_backward_low_level_kernel(
     # ------------------------------------------------------------------
     # 1. OPTIMIZED GEOMETRIC LOOP (Fully Unrolled & Constant Folded)
     # ------------------------------------------------------------------
-    # Pre-calculate the constant shift for Node ID.
-    # Mathematical Fact: (current_node_offset - current_block_offset) is ALWAYS == N.
-    # Therefore, node_id is ALWAYS (N + pid) regardless of the level.
-    # This removes 2 additions from inside the loop.
-    node_id = N + pid
+    ## Pre-calculate the constant shift for Node ID.
+    ## Mathematical Fact: (current_node_offset - current_block_offset) is ALWAYS == N.
+    ## Therefore, node_id is ALWAYS (N + pid) regardless of the level.
+    ## This removes 2 additions from inside the loop.
+    #node_id = N + pid
+    #
+    ## Use static_range to ensure the compiler unrolls this loop 100%.
+    ## Each iteration becomes a standalone block of PTX code.
+    #target_level = 0
+    #
+    ## We maintain the 'if' structure because it allows for "Early Exit".
+    ## (Threads that match Level 1 don't need to do work for Level 2).
+    ## We use a 'found' flag to prevent overwriting if we continue checking.
+    #found = 0
+    #
+    #for lvl in tl.static_range(1, MAX_LEVEL + 1):
+    #    # 1. Calculate Bounds CONSTANTLY (No accumulation dependency)
+    #    # Level starts at: N - N/(2^(L-1))
+    #    # Level ends at:   N - N/(2^L)
+    #    # Since N and lvl are constants, Triton calculates these at compile time.
+    #    
+    #    # e.g. Level 1: Start=0, End=N/2
+    #    # e.g. Level 2: Start=N/2, End=3N/4
+    #    lvl_start = N - (N >> (lvl - 1))
+    #    lvl_end   = N - (N >> lvl)
+    #    
+    #    # 2. Check (Pure Comparison, No Arithmetic)
+    #    # We check 'if not found' first to simulate an 'else-if' chain efficiently
+    #    if found == 0:
+    #        # We only need to check the upper bound 'lvl_end' 
+    #        # because the lower bound is implicitly handled by the previous iteration's failure
+    #        # (or it's 0 for the first level).
+    #        if pid < lvl_end:
+    #            target_level = lvl
+    #            # We already calculated node_id = N + pid outside!
+    #            found = 1
+
+    # ------------------------------------------------------------------
+    # 1. CAUSAL INDEX MAPPING (The 2x Speedup)
+    # ------------------------------------------------------------------
+    # If Causal, this thread (pid) is responsible for the (pid*2)-th node.
+    # We skip all odd nodes entirely.
     
-    # Use static_range to ensure the compiler unrolls this loop 100%.
-    # Each iteration becomes a standalone block of PTX code.
+    if IS_CAUSAL:
+        target_pid = pid * 2
+    else:
+        target_pid = pid
+
+    # ------------------------------------------------------------------
+    # 2. PID DECODING (Using Remapped PID)
+    # ------------------------------------------------------------------
+    # Use 'target_pid' for all logic now
+    node_id = N + target_pid
+    
     target_level = 0
-    
-    # We maintain the 'if' structure because it allows for "Early Exit".
-    # (Threads that match Level 1 don't need to do work for Level 2).
-    # We use a 'found' flag to prevent overwriting if we continue checking.
     found = 0
     
     for lvl in tl.static_range(1, MAX_LEVEL + 1):
-        # 1. Calculate Bounds CONSTANTLY (No accumulation dependency)
-        # Level starts at: N - N/(2^(L-1))
-        # Level ends at:   N - N/(2^L)
-        # Since N and lvl are constants, Triton calculates these at compile time.
-        
-        # e.g. Level 1: Start=0, End=N/2
-        # e.g. Level 2: Start=N/2, End=3N/4
-        lvl_start = N - (N >> (lvl - 1))
-        lvl_end   = N - (N >> lvl)
-        
-        # 2. Check (Pure Comparison, No Arithmetic)
-        # We check 'if not found' first to simulate an 'else-if' chain efficiently
+        lvl_end = N - (N >> lvl)
         if found == 0:
-            # We only need to check the upper bound 'lvl_end' 
-            # because the lower bound is implicitly handled by the previous iteration's failure
-            # (or it's 0 for the first level).
-            if pid < lvl_end:
+            # Use 'target_pid' here too!
+            if target_pid < lvl_end:
                 target_level = lvl
-                # We already calculated node_id = N + pid outside!
                 found = 1
 
     # ------------------------------------------------------------------
@@ -1052,8 +1081,8 @@ def hierarchical_attention_backward_low_level_kernel(
     # If this node has no children, we are done. 
     # Since dK and dV are initialized to 0.0 by torch.zeros_like(), 
     # we don't need to write anything.
-    if child_start_base == -1:
-        return
+    #if child_start_base == -1:
+    #    return
 
     # --- Everything below is SKIPPED for leaf/invalid nodes ---
 
@@ -1233,7 +1262,8 @@ def hierarchical_attention_backward_high_level_kernel(
     H: tl.constexpr, BLOCK_H: tl.constexpr,
     D: tl.constexpr, BLOCK_D: tl.constexpr,
     N: tl.constexpr,
-    START_LEVEL: tl.constexpr 
+    START_LEVEL: tl.constexpr,
+    IS_CAUSAL: tl.constexpr # <--- NEW CONSTANT
 ):
     pid = tl.program_id(0)
     b_idx = tl.program_id(1)
@@ -1241,39 +1271,80 @@ def hierarchical_attention_backward_high_level_kernel(
     # ------------------------------------------------------------------
     # 1. BITWISE PID DECODING (Extreme Optimization)
     # ------------------------------------------------------------------
-    # Constants derived from N and START_LEVEL
-    # SHIFT_GRID = log2(BLOCKS_PER_LVL) = log2(N) - (START_LEVEL - 1)
-    # Note: We rely on the compiler to fold these constants.
-    
-    # Blocks Per Level = N / 2^(START_LEVEL - 1)
+    ## Constants derived from N and START_LEVEL
+    ## SHIFT_GRID = log2(BLOCKS_PER_LVL) = log2(N) - (START_LEVEL - 1)
+    ## Note: We rely on the compiler to fold these constants.
+    #
+    ## Blocks Per Level = N / 2^(START_LEVEL - 1)
+    #BLOCKS_PER_LVL: tl.constexpr = N >> (START_LEVEL - 1)
+    #BLOCK_MASK: tl.constexpr = BLOCKS_PER_LVL - 1
+    #
+    ## 1. Which Level? (Integer Div -> Right Shift?)
+    ## Since BLOCKS_PER_LVL is power of 2, 'pid // BLOCKS' is a Shift.
+    ## However, 'pid' is dynamic, so we can just use integer div, 
+    ## Triton/LLVM optimizes 'div by power-of-2' into a shift automatically.
+    ## But for 'rem', using AND is explicitly cleaner.
+    #
+    #lvl_offset = pid // BLOCKS_PER_LVL
+    #target_level = START_LEVEL + lvl_offset
+    #
+    ## 2. Relative Index (Modulo -> Bitwise AND)
+    #rem = pid & BLOCK_MASK
+    #
+    ## 3. Calculate Split-K Parameters
+    ## shift_val = L - (START_LEVEL - 1)
+    #shift_val = target_level - (START_LEVEL - 1)
+    #
+    ## split_k = 1 << shift_val. 
+    ## split_k_mask = split_k - 1 = (1 << shift_val) - 1.
+    #split_k_mask = (1 << shift_val) - 1
+    #
+    ## 4. Decode Node vs Split (Bitwise)
+    #node_local = rem >> shift_val           # Division by split_k
+    #split_id   = rem & split_k_mask         # Modulo split_k
+    #
+    ## 5. Global Node ID
+    #start_node_global = (2 * N) - (N >> (target_level - 1))
+    #node_id = start_node_global + node_local
+
+    # ------------------------------------------------------------------
+    # 2. DECODING & CAUSAL REMAPPING
+    # ------------------------------------------------------------------
+    # Total blocks per level in a non-causal (dense) setting
     BLOCKS_PER_LVL: tl.constexpr = N >> (START_LEVEL - 1)
-    BLOCK_MASK: tl.constexpr = BLOCKS_PER_LVL - 1
     
-    # 1. Which Level? (Integer Div -> Right Shift?)
-    # Since BLOCKS_PER_LVL is power of 2, 'pid // BLOCKS' is a Shift.
-    # However, 'pid' is dynamic, so we can just use integer div, 
-    # Triton/LLVM optimizes 'div by power-of-2' into a shift automatically.
-    # But for 'rem', using AND is explicitly cleaner.
-    
-    lvl_offset = pid // BLOCKS_PER_LVL
+    # A. Level Decoding
+    # If CAUSAL, the grid we launched is physically smaller (compressed).
+    # We must decode relative to the *launched* grid size.
+    if IS_CAUSAL:
+        LAUNCHED_BLOCKS = BLOCKS_PER_LVL // 2
+    else:
+        LAUNCHED_BLOCKS = BLOCKS_PER_LVL
+        
+    lvl_offset = pid // LAUNCHED_BLOCKS
     target_level = START_LEVEL + lvl_offset
     
-    # 2. Relative Index (Modulo -> Bitwise AND)
-    rem = pid & BLOCK_MASK
+    # B. Relative Index in this Level
+    rem = pid % LAUNCHED_BLOCKS
     
-    # 3. Calculate Split-K Parameters
-    # shift_val = L - (START_LEVEL - 1)
+    # C. Split Parameters (Power of 2 Optimization)
     shift_val = target_level - (START_LEVEL - 1)
+    split_k = 1 << shift_val 
+    split_k_mask = split_k - 1
     
-    # split_k = 1 << shift_val. 
-    # split_k_mask = split_k - 1 = (1 << shift_val) - 1.
-    split_k_mask = (1 << shift_val) - 1
+    # D. Node vs Split Decoding
+    # 'node_local_compressed' is the index in the 0..N/2 space if Causal
+    node_local_compressed = rem >> shift_val 
+    split_id = rem & split_k_mask
     
-    # 4. Decode Node vs Split (Bitwise)
-    node_local = rem >> shift_val           # Division by split_k
-    split_id   = rem & split_k_mask         # Modulo split_k
-    
-    # 5. Global Node ID
+    # E. Expand to Real Node ID
+    # If Causal, we map 0->0, 1->2, 2->4 to skip the empty odd nodes.
+    if IS_CAUSAL:
+        node_local = node_local_compressed * 2
+    else:
+        node_local = node_local_compressed
+
+    # F. Final Global Node ID
     start_node_global = (2 * N) - (N >> (target_level - 1))
     node_id = start_node_global + node_local
 
@@ -1286,8 +1357,8 @@ def hierarchical_attention_backward_high_level_kernel(
     
     # If -1, this node is empty. Exit immediately.
     # This prevents all subsequent math, pointer arithmetic, and atomic locking.
-    if child_start_base == -1:
-        return
+    #if child_start_base == -1:
+    #    return
 
     # ------------------------------------------------------------------
     # 3. CONSTANT LOOP SETUP
@@ -1517,107 +1588,6 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         ctx.constants = (sm_scale, H, BLOCK_H, D, BLOCK_D, LEVELS, BLOCK_LEVELS)
         return Out
 
-    #@staticmethod
-    #def backward(ctx, grad_output):
-    #    # 1. Retrieve Tensors
-    #    Q, K, V, idx_table, gather_table, Weights, mask_table = ctx.saved_tensors
-    #    sm_scale, H, BLOCK_H, D, BLOCK_D, LEVELS, BLOCK_LEVELS = ctx.constants
-    #    
-    #    # [CRITICAL FIX] View as 4D to generate 4 stride values
-    #    grad_output = grad_output.contiguous()
-    #    B, N = Q.shape[0], Q.shape[1]
-    #    grad_output_4d = grad_output.view(B, N, H, D) 
-    #
-    #    # 2. Compute dS (Runs on Main Stream)
-    #    DS = torch.empty_like(Weights)
-    #    grid_ds = (N, B)
-    #    
-    #    HAS_MASK = (mask_table is not None)
-    #    mask_ptr_safe = mask_table if HAS_MASK else Weights
-    #
-    #    hierarchical_attention_backward_dS_kernel[grid_ds](
-    #        grad_output_4d, Weights, V, idx_table, DS, mask_ptr_safe,
-    #        *grad_output_4d.stride(), 
-    #        *Weights.stride(),            
-    #        *V.stride(),            
-    #        *idx_table.stride(),    
-    #        *DS.stride(),            
-    #        sm_scale, H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, 
-    #        LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS,
-    #        HAS_MASK=HAS_MASK,
-    #        num_warps=4
-    #    )
-    #
-    #    # --- SETUP PARALLELISM ---
-    #    dK = torch.zeros_like(K)
-    #    dV = torch.zeros_like(V)
-    #    dQ = torch.empty_like(Q)
-    #
-    #    # --- BRANCH 1: dQ ---
-    #    grid_dq = (N, B)
-    #    hierarchical_attention_backward_dQ_kernel[grid_dq](
-    #        DS, K, idx_table, dQ, mask_ptr_safe, 
-    #        *DS.stride(), *K.stride(), *idx_table.stride(), *dQ.stride(),
-    #        H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, LEVELS=LEVELS, #BLOCK_LEVELS=BLOCK_LEVELS,
-    #        HAS_MASK=HAS_MASK,
-    #        num_warps=4
-    #    )
-    #
-    #    # --- BRANCH 2: dK/dV Per Level (Main Stream) ---
-    #    
-    #    # Step A: Launch Specialized Leaf Kernel (Level 0)
-    #    grid_leaf = (N, B)
-    #    hierarchical_attention_backward_dK_dV_leaf_kernel[grid_leaf](
-    #        DS, Q, Weights, grad_output_4d, gather_table, # <--- Use 4D
-    #        dK, dV,
-    #        *DS.stride(), *Q.stride(), *Weights.stride(), 
-    #        *grad_output_4d.stride(), # <--- Use 4D Strides
-    #        *dK.stride(),
-    #        *gather_table.stride(),
-    #        H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
-    #        num_warps=4
-    #    )
-    #
-    #    # Step B: Loop Over Internal Levels
-    #    current_start_node = N 
-    #    
-    #    for lvl in range(1, LEVELS+1):
-    #        num_nodes_in_level = N >> lvl
-    #
-    #        # --- Dynamic Split-K Logic ---
-    #        if lvl < 9:
-    #            current_split_k = 1
-    #        else:
-    #            # 2^(lvl - 7) implementation using bit shift
-    #            current_split_k = 1 << (lvl - 8)    
-    #
-    #
-    #        # Calculate Grid
-    #        # Multiply node count by split factor to launch more blocks
-    #        grid_lvl = (num_nodes_in_level * current_split_k, B)
-    #    
-    #        hierarchical_attention_backward_dK_dV_internal_kernel[grid_lvl](
-    #            DS, Q, Weights, grad_output_4d, gather_table,
-    #            dK, dV,
-    #            *DS.stride(), *Q.stride(), *Weights.stride(),
-    #            *grad_output_4d.stride(),
-    #            *dK.stride(),
-    #            *gather_table.stride(),
-    #            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
-    #        
-    #            START_NODE_ID=current_start_node,
-    #            TARGET_LEVEL=lvl,
-    #            SPLIT_K=current_split_k, # <--- Pass the split factor
-    #        
-    #            num_warps=4
-    #        )
-    #        
-    #        # Update offset for the next level
-    #        current_start_node += num_nodes_in_level
-    #
-    #    return dQ, dK, dV, None, None, None
-
-
     @staticmethod
     def backward(ctx, grad_output):
         # 1. Retrieve Tensors
@@ -1648,15 +1618,6 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         dV = torch.zeros_like(V)
         dQ = torch.empty_like(Q)
 
-        ## --- BRANCH 1: dQ (Independent) ---
-        #grid_dq = (N, B)
-        #hierarchical_attention_backward_dQ_kernel[grid_dq](
-        #    DS, K, idx_table, dQ, mask_ptr_safe, 
-        #    *DS.stride(), *K.stride(), *idx_table.stride(), *dQ.stride(),
-        #    H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=32, LEVELS=LEVELS,
-        #    HAS_MASK=HAS_MASK, num_warps=4
-        #)
-
         # --- BRANCH 2: dK/dV (Dependent on dS) ---
         
         # Step A: Leaf Kernel (Level 0)
@@ -1672,37 +1633,80 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         
         CUTOFF_LEVEL = 6
         
-        # --- KERNEL A: Low Levels (Split=1) ---
+        ## --- KERNEL A: Low Levels (Split=1) ---
+        #if LEVELS >= 1:
+        #    limit = min(LEVELS, CUTOFF_LEVEL)
+        #    # Total blocks = N - (N >> limit)
+        #    total_blocks_low = N - (N >> limit)
+        #    
+        #    grid_low = (total_blocks_low, B)
+        #    
+        #    hierarchical_attention_backward_low_level_kernel[grid_low](
+        #        DS, Q, Weights, grad_output_4d, gather_table,
+        #        dK, dV,
+        #        *DS.stride(), *Q.stride(), *Weights.stride(),
+        #        *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
+        #        H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
+        #        N=N, 
+        #        MAX_LEVEL=limit, 
+        #        num_warps=4
+        #    )
+        #
+        ## --- KERNEL B: High Levels (Split>1) ---
+        #if LEVELS > CUTOFF_LEVEL:
+        #    num_high_levels = LEVELS - CUTOFF_LEVEL
+        #    
+        #    # Constant blocks per level = N >> (CUTOFF)
+        #    # Actually, logic dictates: N >> (START_LEVEL - 1)
+        #    # If START_LEVEL=9, we need N >> 8.
+        #    blocks_per_lvl = N >> CUTOFF_LEVEL
+        #    
+        #    total_blocks_high = blocks_per_lvl * num_high_levels
+        #    
+        #    grid_high = (total_blocks_high, B)
+        #    
+        #    hierarchical_attention_backward_high_level_kernel[grid_high](
+        #        DS, Q, Weights, grad_output_4d, gather_table,
+        #        dK, dV,
+        #        *DS.stride(), *Q.stride(), *Weights.stride(),
+        #        *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
+        #        H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
+        #        N=N,
+        #        START_LEVEL=CUTOFF_LEVEL + 1, # Start at Level 9
+        #        num_warps=2
+        #    )
+   
+        # --- KERNEL A: Low Levels ---
         if LEVELS >= 1:
             limit = min(LEVELS, CUTOFF_LEVEL)
-            # Total blocks = N - (N >> limit)
+            
+            # 1. Determine Grid Size
             total_blocks_low = N - (N >> limit)
-            
-            grid_low = (total_blocks_low, B)
-            
+            if HAS_MASK:
+                # Launch HALF the blocks
+                grid_low = (total_blocks_low // 2, B)
+            else:
+                grid_low = (total_blocks_low, B)
+
             hierarchical_attention_backward_low_level_kernel[grid_low](
-                DS, Q, Weights, grad_output_4d, gather_table,
-                dK, dV,
+                DS, Q, Weights, grad_output_4d, gather_table, dK, dV,
                 *DS.stride(), *Q.stride(), *Weights.stride(),
                 *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
                 H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
                 N=N, 
                 MAX_LEVEL=limit, 
-                num_warps=4
+                IS_CAUSAL=HAS_MASK,  # <--- Pass Flag
+                num_warps=2
             )
 
-        # --- KERNEL B: High Levels (Split>1) ---
+        # --- KERNEL B: High Levels ---
         if LEVELS > CUTOFF_LEVEL:
-            num_high_levels = LEVELS - CUTOFF_LEVEL
+            # ... calculate total_blocks_high ...
             
-            # Constant blocks per level = N >> (CUTOFF)
-            # Actually, logic dictates: N >> (START_LEVEL - 1)
-            # If START_LEVEL=9, we need N >> 8.
-            blocks_per_lvl = N >> CUTOFF_LEVEL
-            
-            total_blocks_high = blocks_per_lvl * num_high_levels
-            
-            grid_high = (total_blocks_high, B)
+            if HAS_MASK:
+                grid_high = (total_blocks_high // 2, B)
+            else:
+                grid_high = (total_blocks_high, B)
             
             hierarchical_attention_backward_high_level_kernel[grid_high](
                 DS, Q, Weights, grad_output_4d, gather_table,
@@ -1712,6 +1716,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
                 H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
                 N=N,
                 START_LEVEL=CUTOFF_LEVEL + 1, # Start at Level 9
+                IS_CAUSAL=HAS_MASK, # <--- Pass Flag
                 num_warps=2
             )
 
