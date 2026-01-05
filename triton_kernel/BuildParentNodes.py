@@ -2661,7 +2661,8 @@ def run_full_suite_update_X_from_Y():
     
     # Optional mask (can be None, but good to test with None first for basic sanity)
     #mask = True
-    mask = torch.ones((B, N), dtype=torch.bool, device='cuda')
+    #mask = torch.ones((B, N), dtype=torch.bool, device='cuda')
+    mask = None
 
     print(f"Input Shapes -> X: {x.shape}, Y: {y.shape}, Dtype: {x.dtype}")
 
