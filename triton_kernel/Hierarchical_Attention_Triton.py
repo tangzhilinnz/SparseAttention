@@ -1727,9 +1727,9 @@ class HierarchicalSparseAttentionTriton(nn.Module):
         # The Triton kernel does pointer arithmetic. While Linear() outputs are usually 
         # contiguous, operations like Dropout or View can sometimes create strides 
         # that break optimized kernels. We enforce it here to be safe.
-        if not Q.is_contiguous(): Q = Q.contiguous()
-        if not K_full.is_contiguous(): K_full = K_full.contiguous()
-        if not V_full.is_contiguous(): V_full = V_full.contiguous()
+        #if not Q.is_contiguous(): Q = Q.contiguous()
+        #if not K_full.is_contiguous(): K_full = K_full.contiguous()
+        #if not V_full.is_contiguous(): V_full = V_full.contiguous()
 
         # 4. Get Topology Tables
         # Determine causality based on user input (mask presence implies causal)
