@@ -3,7 +3,7 @@ import os
 # CRITICAL FIX: GPU SELECTION MUST BE FIRST
 # ==========================================
 # Set this before importing torch or calling torch.cuda to avoid OOM
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 
 
 import torch
@@ -676,7 +676,7 @@ def hierarchical_attention_backward_dK_dV_leaf_kernel(
         tl.store(DV_ptr + off_out + (offs_h[:, None] * sdk_h) + (offs_d[None, :] * sdk_d), dv_acc, mask=mask_op)
 
 @triton.jit
-def hierarchical_attention_backward_low_level_kernel(
+def hierarchical_attention_backward_low_level_kernel_bk(
     # Inputs
     DS_ptr, Q_ptr, W_ptr, DO_ptr, Gather_Table_ptr,
     DK_ptr, DV_ptr,
@@ -796,6 +796,142 @@ def hierarchical_attention_backward_low_level_kernel(
         # Store Result
         ptr_dk = DK_ptr + off_out_base + (offs_d[None, :] * sdk_d)
         ptr_dv = DV_ptr + off_out_base + (offs_d[None, :] * sdk_d)
+        tl.store(ptr_dk, dk_acc, mask=mask_op)
+        tl.store(ptr_dv, dv_acc, mask=mask_op)
+
+
+@triton.jit
+def hierarchical_attention_backward_low_level_kernel(
+    # Inputs
+    DS_ptr, Q_ptr, W_ptr, DO_ptr, Gather_Table_ptr,
+    DK_ptr, DV_ptr,
+    # Strides
+    sds_b, sds_n, sds_h, sds_lvl,
+    sq_b, sq_n, sq_h, sq_d,
+    sw_b, sw_n, sw_h, sw_lvl,
+    sdo_b, sdo_n, sdo_h, sdo_d,
+    sdk_b, sdk_node, sdk_h, sdk_d,
+    sg_node, sg_dim,
+    # Constants
+    H: tl.constexpr, BLOCK_H: tl.constexpr,
+    D: tl.constexpr, BLOCK_D: tl.constexpr,
+    N: tl.constexpr,
+    MAX_LEVEL: tl.constexpr
+):
+    pid = tl.program_id(0)
+    b_idx = tl.program_id(1)
+
+    # ------------------------------------------------------------------
+    # 1. UNIFIED LEVEL DETECTION
+    # ------------------------------------------------------------------
+    node_id = pid
+    target_level = -1
+
+    if node_id < N:
+        target_level = 0
+    else:
+        # Parent Logic (Geometric Search)
+        rel_pid = node_id - N
+        found = 0
+        for lvl in tl.static_range(1, MAX_LEVEL + 1):
+            lvl_start = N - (N >> (lvl - 1))
+            lvl_end   = N - (N >> lvl)
+            if found == 0:
+                if rel_pid < lvl_end:
+                    target_level = lvl
+                    found = 1
+
+    # ------------------------------------------------------------------
+    # 2. SETUP & EARLY EXIT LOGIC
+    # ------------------------------------------------------------------
+    # Load neighbor info (Sibling for Leaves, Child Start for Parents)
+    tab_ptr = Gather_Table_ptr + (node_id * sg_node)
+    neighbor_base = tl.load(tab_ptr + 0)
+    
+    has_neighbors = (neighbor_base != -1)
+
+    # [OPTIMIZATION RESTORED]
+    # If this is a Parent (Level > 0) and it has no children, we do nothing.
+    if target_level > 0 and not has_neighbors:
+        return
+
+    # For Leaves (Level 0), we continue even if has_neighbors is False (for Self term)
+
+    # ------------------------------------------------------------------
+    # 3. POINTER MATH
+    # ------------------------------------------------------------------
+    # Calculate loop count: 
+    # If neighbors exist: 2^L (Children) or 1 (Sibling)
+    # If no neighbors: 0 (Skip loop)
+    loop_count = 0
+    if has_neighbors:
+        loop_count = 1 << target_level
+
+    # Base pointers
+    w_idx_neighbor = target_level + 1
+    ptr_ds_base = DS_ptr + (b_idx * sds_b) + (w_idx_neighbor * sds_lvl)
+    ptr_w_base  = W_ptr  + (b_idx * sw_b)  + (w_idx_neighbor * sw_lvl)
+    ptr_q_base  = Q_ptr  + (b_idx * sq_b)
+    ptr_do_base = DO_ptr + (b_idx * sdo_b)
+
+    # Self pointers (Only used if Level 0)
+    ptr_ds_self = DS_ptr + (b_idx * sds_b) + (node_id * sds_n) # w_idx=0
+    ptr_w_self  = W_ptr  + (b_idx * sw_b) + (node_id * sw_n) # w_idx=0
+    
+    off_out_base = (b_idx * sdk_b) + (node_id * sdk_node)
+    
+    offs_h = tl.arange(0, BLOCK_H)
+    mask_h = offs_h < H
+
+    # ------------------------------------------------------------------
+    # 4. MAIN LOOP OVER D
+    # ------------------------------------------------------------------
+    for off_d_start in range(0, D, BLOCK_D):
+        offs_d = off_d_start + tl.arange(0, BLOCK_D)
+        mask_d = offs_d < D
+        mask_op = mask_h[:, None] & mask_d[None, :]
+
+        off_hq_d  = (offs_h[:, None] * sq_h)  + (offs_d[None, :] * sq_d)
+        off_hdo_d = (offs_h[:, None] * sdo_h) + (offs_d[None, :] * sdo_d)
+
+        dk_acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
+        dv_acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
+
+        # --- A. SELF TERM (Level 0 Only) ---
+        if target_level == 0:
+            ds_self = tl.load(ptr_ds_self + (offs_h * sds_h), mask=mask_h, other=0.0)[:, None]
+            w_self  = tl.load(ptr_w_self  + (offs_h * sw_h),  mask=mask_h, other=0.0)[:, None]
+            
+            q_self  = tl.load(ptr_q_base + (node_id * sq_n) + off_hq_d, mask=mask_op, other=0.0)
+            do_self = tl.load(ptr_do_base + (node_id * sdo_n) + off_hdo_d, mask=mask_op, other=0.0)
+
+            dk_acc += ds_self * q_self
+            dv_acc += w_self  * do_self
+
+        # --- B. NEIGHBOR LOOP (Sibling or Children) ---
+        # If loop_count is 0, this is skipped entirely (efficient!)
+        for k in range(loop_count):
+            neighbor_idx = neighbor_base + k
+            
+            # Pointers
+            ptr_ds = ptr_ds_base + (neighbor_idx * sds_n) + (offs_h * sds_h)
+            ptr_w  = ptr_w_base  + (neighbor_idx * sw_n)  + (offs_h * sw_h)
+            
+            ds = tl.load(ptr_ds, mask=mask_h, other=0.0)[:, None]
+            w  = tl.load(ptr_w,  mask=mask_h, other=0.0)[:, None]
+            
+            ptr_q  = ptr_q_base  + (neighbor_idx * sq_n)  + off_hq_d
+            ptr_do = ptr_do_base + (neighbor_idx * sdo_n) + off_hdo_d
+            q  = tl.load(ptr_q,  mask=mask_op, other=0.0)
+            do = tl.load(ptr_do, mask=mask_op, other=0.0)
+            
+            dk_acc += ds * q
+            dv_acc += w * do
+
+        # --- C. STORE RESULT ---
+        ptr_dk = DK_ptr + off_out_base + (offs_h[:, None] * sdk_h) + (offs_d[None, :] * sdk_d)
+        ptr_dv = DV_ptr + off_out_base + (offs_h[:, None] * sdk_h) + (offs_d[None, :] * sdk_d)
+        
         tl.store(ptr_dk, dk_acc, mask=mask_op)
         tl.store(ptr_dv, dv_acc, mask=mask_op)
 
@@ -1098,6 +1234,105 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         ctx.constants = (sm_scale, H, BLOCK_H, D, BLOCK_D, LEVELS, BLOCK_LEVELS)
         return Out
 
+    #@staticmethod
+    #def backward(ctx, grad_output):
+    #    # 1. Retrieve Tensors
+    #    Q, K, V, idx_table, gather_table, Weights, mask_table = ctx.saved_tensors
+    #    sm_scale, H, BLOCK_H, D, BLOCK_D, LEVELS, BLOCK_LEVELS = ctx.constants
+    #
+    #    # View as 4D
+    #    grad_output = grad_output.contiguous()
+    #    B, N = Q.shape[0], Q.shape[1]
+    #    grad_output_4d = grad_output.view(B, N, H, D)
+    #    
+    #    # 2. Compute dS (Main Stream)
+    #    DS = torch.empty_like(Weights)
+    #    grid_ds = (N, B)
+    #    HAS_MASK = (mask_table is not None)
+    #    mask_ptr_safe = mask_table if HAS_MASK else Weights
+    #    
+    #    hierarchical_attention_backward_dS_kernel[grid_ds](
+    #        grad_output_4d, Weights, V, idx_table, DS, mask_ptr_safe,
+    #        *grad_output_4d.stride(), *Weights.stride(), *V.stride(), 
+    #        *idx_table.stride(), *DS.stride(),            
+    #        sm_scale, H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=32, 
+    #        LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS, HAS_MASK=HAS_MASK, num_warps=2
+    #    )
+    #
+    #    # --- SETUP PARALLELISM ---
+    #    dK = torch.zeros_like(K)
+    #    dV = torch.zeros_like(V)
+    #    dQ = torch.empty_like(Q)
+    #
+    #    # --- BRANCH 2: dK/dV (Dependent on dS) ---
+    #    
+    #    # Step A: Leaf Kernel (Level 0)
+    #    grid_leaf = (N, B)
+    #    hierarchical_attention_backward_dK_dV_leaf_kernel[grid_leaf](
+    #        DS, Q, Weights, grad_output_4d, gather_table,
+    #        dK, dV,
+    #        *DS.stride(), *Q.stride(), *Weights.stride(), 
+    #        *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
+    #        H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, num_warps=2
+    #    )
+    #
+    #    
+    #    CUTOFF_LEVEL = 10
+    #    
+    #    # --- KERNEL A: Low Levels (Split=1) ---
+    #    if LEVELS >= 1:
+    #        limit = min(LEVELS, CUTOFF_LEVEL)
+    #        # Total blocks = N - (N >> limit)
+    #        total_blocks_low = N - (N >> limit)
+    #        
+    #        grid_low = (total_blocks_low, B)
+    #        
+    #        hierarchical_attention_backward_low_level_kernel[grid_low](
+    #            DS, Q, Weights, grad_output_4d, gather_table,
+    #            dK, dV,
+    #            *DS.stride(), *Q.stride(), *Weights.stride(),
+    #            *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
+    #            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
+    #            N=N, 
+    #            MAX_LEVEL=limit, 
+    #            num_warps=4
+    #        )
+    #    
+    #    # --- KERNEL B: High Levels (Split>1) ---
+    #    if LEVELS > CUTOFF_LEVEL:
+    #        num_high_levels = LEVELS - CUTOFF_LEVEL
+    #        
+    #        # Constant blocks per level = N >> (CUTOFF)
+    #        # Actually, logic dictates: N >> (START_LEVEL - 1)
+    #        # If START_LEVEL=9, we need N >> 8.
+    #        blocks_per_lvl = N >> CUTOFF_LEVEL
+    #        
+    #        total_blocks_high = blocks_per_lvl * num_high_levels
+    #        
+    #        grid_high = (total_blocks_high, B)
+    #        
+    #        hierarchical_attention_backward_high_level_kernel[grid_high](
+    #            DS, Q, Weights, grad_output_4d, gather_table,
+    #            dK, dV,
+    #            *DS.stride(), *Q.stride(), *Weights.stride(),
+    #            *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
+    #            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
+    #            N=N,
+    #            START_LEVEL=CUTOFF_LEVEL + 1, # Start at Level 9
+    #            num_warps=2
+    #        )
+    #
+    #    # --- BRANCH 1: dQ (Independent) ---
+    #    grid_dq = (N, B)
+    #    hierarchical_attention_backward_dQ_kernel[grid_dq](
+    #        DS, K, idx_table, dQ, mask_ptr_safe,
+    #        *DS.stride(), *K.stride(), *idx_table.stride(), *dQ.stride(),
+    #        H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=32, LEVELS=LEVELS,
+    #        HAS_MASK=HAS_MASK, num_warps=2
+    #    )
+    #        
+    #    return dQ, dK, dV, None, None, None
+
     @staticmethod
     def backward(ctx, grad_output):
         # 1. Retrieve Tensors
@@ -1130,47 +1365,35 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
 
         # --- BRANCH 2: dK/dV (Dependent on dS) ---
         
-        # Step A: Leaf Kernel (Level 0)
-        grid_leaf = (N, B)
-        hierarchical_attention_backward_dK_dV_leaf_kernel[grid_leaf](
+        # [UPDATED] Merged Kernel (Leaves + Low Levels)
+        # We calculate the total nodes needed for Levels 0 to 10.
+        CUTOFF_LEVEL = 10
+        limit = min(LEVELS, CUTOFF_LEVEL)
+        
+        # Count Parents: Sum of N/2^L for L=1..limit -> N - (N >> limit)
+        num_parents = (N - (N >> limit)) if LEVELS >= 1 else 0
+        
+        # Total Grid = Leaves (N) + Parents
+        total_nodes_low = N + num_parents
+        grid_merged = (total_nodes_low, B)
+        
+        hierarchical_attention_backward_low_level_kernel[grid_merged](
             DS, Q, Weights, grad_output_4d, gather_table,
             dK, dV,
             *DS.stride(), *Q.stride(), *Weights.stride(), 
             *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
-            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, num_warps=2
+            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
+            N=N, 
+            MAX_LEVEL=limit, 
+            num_warps=4 # 4 warps generally better for this heavier merged kernel
         )
-
-        
-        CUTOFF_LEVEL = 10
-        
-        # --- KERNEL A: Low Levels (Split=1) ---
-        if LEVELS >= 1:
-            limit = min(LEVELS, CUTOFF_LEVEL)
-            # Total blocks = N - (N >> limit)
-            total_blocks_low = N - (N >> limit)
-            
-            grid_low = (total_blocks_low, B)
-            
-            hierarchical_attention_backward_low_level_kernel[grid_low](
-                DS, Q, Weights, grad_output_4d, gather_table,
-                dK, dV,
-                *DS.stride(), *Q.stride(), *Weights.stride(),
-                *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
-                H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
-                N=N, 
-                MAX_LEVEL=limit, 
-                num_warps=4
-            )
         
         # --- KERNEL B: High Levels (Split>1) ---
+        # Handles Levels 11+ (if any)
         if LEVELS > CUTOFF_LEVEL:
             num_high_levels = LEVELS - CUTOFF_LEVEL
             
-            # Constant blocks per level = N >> (CUTOFF)
-            # Actually, logic dictates: N >> (START_LEVEL - 1)
-            # If START_LEVEL=9, we need N >> 8.
             blocks_per_lvl = N >> CUTOFF_LEVEL
-            
             total_blocks_high = blocks_per_lvl * num_high_levels
             
             grid_high = (total_blocks_high, B)
@@ -1182,7 +1405,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
                 *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
                 H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
                 N=N,
-                START_LEVEL=CUTOFF_LEVEL + 1, # Start at Level 9
+                START_LEVEL=CUTOFF_LEVEL + 1,
                 num_warps=2
             )
 
