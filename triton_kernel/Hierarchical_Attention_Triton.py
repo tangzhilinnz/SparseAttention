@@ -659,8 +659,8 @@ def hierarchical_attention_backward_dK_dV_leaf_kernel(
         do_self = tl.load(DO_ptr + off_do + (offs_h[:, None] * sdo_h) + (offs_d[None, :] * sdo_d), mask=mask_op, other=0.0)
         
         # dK = dS * Q | dV = W * dO
-        dk_acc = ds_self * q_self
-        dv_acc = w_self * do_self
+        dk_acc = ds_self * q_self.to(tl.float32)
+        dv_acc = w_self * do_self.to(tl.float32)
 
         # --- Sibling Computation ---
         if has_sibling:
@@ -669,8 +669,8 @@ def hierarchical_attention_backward_dK_dV_leaf_kernel(
             
             #dk_acc += ds_sib * q_sib
             #dv_acc += w_sib * do_sib
-            dk_acc += ds * q.to(tl.float32)
-            dv_acc += w * do.to(tl.float32)
+            dk_acc += ds_sib * q.to(tl.float32)
+            dv_acc += w_sib * do.to(tl.float32)
 
 
         # --- Store Chunk ---
