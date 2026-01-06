@@ -1827,7 +1827,7 @@ def run_full_suite():
     model = HierarchicalSparseAttentionTriton(dim, H, dropout=0.0).cuda().to(torch.float16)
     
     # 3. Create Inputs (Float16)
-    dtype = torch.float32
+    dtype = torch.float16
     #x = torch.randn(B, N, dim, device='cuda', dtype=dtype)
     #y = torch.randn(B, N - 1, dim, device='cuda', dtype=dtype)
 
