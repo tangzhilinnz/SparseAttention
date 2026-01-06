@@ -667,8 +667,11 @@ def hierarchical_attention_backward_dK_dV_leaf_kernel(
             q_sib = tl.load(Q_ptr + off_q_sib + (offs_h[:, None] * sq_h) + (offs_d[None, :] * sq_d), mask=mask_op, other=0.0)
             do_sib = tl.load(DO_ptr + off_do_sib + (offs_h[:, None] * sdo_h) + (offs_d[None, :] * sdo_d), mask=mask_op, other=0.0)
             
-            dk_acc += ds_sib * q_sib
-            dv_acc += w_sib * do_sib
+            #dk_acc += ds_sib * q_sib
+            #dv_acc += w_sib * do_sib
+            dk_acc += ds * q.to(tl.float32)
+            dv_acc += w * do.to(tl.float32)
+
 
         # --- Store Chunk ---
         off_out = (b_idx * sdk_b) + (node_id * sdk_node)
@@ -792,8 +795,8 @@ def hierarchical_attention_backward_low_level_kernel(
             
             #dk_acc += ds * q
             #dv_acc += w * do
-            dk_acc += ds.to(tl.float32) * q.to(tl.float32)
-            dv_acc += w.to(tl.float32)  * do.to(tl.float32)
+            dk_acc += ds * q.to(tl.float32)
+            dv_acc += w * do.to(tl.float32)
 
         # Store Result
         ptr_dk = DK_ptr + off_out_base + (offs_d[None, :] * sdk_d)
@@ -935,8 +938,8 @@ def hierarchical_attention_backward_high_level_kernel(
             # FMA
             #dk_acc += ds * q
             #dv_acc += w * do
-            dk_acc += ds.to(tl.float32) * q.to(tl.float32)
-            dv_acc += w.to(tl.float32)  * do.to(tl.float32)
+            dk_acc += ds * q.to(tl.float32)
+            dv_acc += w * do.to(tl.float32)
 
         # [ATOMIC STORE] 
         # We only reach here if children exist, so we never atomic_add to empty nodes.
@@ -1996,7 +1999,7 @@ def run_full_suite_update_X_from_Y():
     # 1. SETUP & CORRECTNESS CHECK
     # ==========================================================================
     # [CONFIG] Choose your dtype here: torch.float32 or torch.float16
-    check_dtype = torch.float32
+    check_dtype = torch.float16
     
     print(f"{'='*60}")
     print(f"1. CORRECTNESS CHECK ({check_dtype}) - update_X_from_Y")
