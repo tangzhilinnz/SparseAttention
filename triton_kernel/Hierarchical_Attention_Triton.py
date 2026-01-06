@@ -1727,9 +1727,9 @@ class HierarchicalSparseAttentionTriton(nn.Module):
         # The Triton kernel does pointer arithmetic. While Linear() outputs are usually 
         # contiguous, operations like Dropout or View can sometimes create strides 
         # that break optimized kernels. We enforce it here to be safe.
-        #if not Q.is_contiguous(): Q = Q.contiguous()
-        #if not K_full.is_contiguous(): K_full = K_full.contiguous()
-        #if not V_full.is_contiguous(): V_full = V_full.contiguous()
+        if not Q.is_contiguous(): Q = Q.contiguous()
+        if not K_full.is_contiguous(): K_full = K_full.contiguous()
+        if not V_full.is_contiguous(): V_full = V_full.contiguous()
 
         # 4. Get Topology Tables
         # Determine causality based on user input (mask presence implies causal)
@@ -2079,8 +2079,9 @@ def run_full_suite_update_X_from_Y():
 
     # Config: Large scale to saturate GPU
     #B, N, D, H = 32, 4096, 64, 8
-    B, N, D, H = 64, 2048, 64, 8
+    #B, N, D, H = 64, 2048, 64, 8
     #B, N, D, H = 2, 2048 * 64, 64, 8
+    B, N, D, H = 128, 512, 64, 8
     dim = D * H
 
     print(f"Config: B={B}, N={N}, D={dim} (HeadDim={D}), H={H}, dtype={check_dtype}")
