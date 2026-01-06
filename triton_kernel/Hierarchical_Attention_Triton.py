@@ -2002,8 +2002,8 @@ def run_full_suite_update_X_from_Y():
     
     # 3. Create Inputs
     # update_X_from_Y takes leaves (x) and parents (y).
-    x = torch.randn(B, N, dim, device='cuda', dtype=dtype).clamp(-1, 1)
-    y = torch.randn(B, N - 1, dim, device='cuda', dtype=dtype).clamp(-1, 1)
+    x = torch.randn(B, N, dim, device='cuda', dtype=check_dtype).clamp(-1, 1)
+    y = torch.randn(B, N - 1, dim, device='cuda', dtype=check_dtype).clamp(-1, 1)
     
     # Optional mask (can be None, but good to test with None first for basic sanity)
     #mask = True
