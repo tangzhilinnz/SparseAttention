@@ -669,8 +669,8 @@ def hierarchical_attention_backward_dK_dV_leaf_kernel(
             
             #dk_acc += ds_sib * q_sib
             #dv_acc += w_sib * do_sib
-            dk_acc += ds_sib * q.to(tl.float32)
-            dv_acc += w_sib * do.to(tl.float32)
+            dk_acc += ds_sib * q_sib.to(tl.float32)
+            dv_acc += w_sib * do_sib.to(tl.float32)
 
 
         # --- Store Chunk ---
