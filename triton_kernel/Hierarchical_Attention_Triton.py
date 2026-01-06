@@ -790,8 +790,10 @@ def hierarchical_attention_backward_low_level_kernel(
             q  = tl.load(ptr_q,  mask=mask_op, other=0.0)
             do = tl.load(ptr_do, mask=mask_op, other=0.0)
             
-            dk_acc += ds * q
-            dv_acc += w * do
+            #dk_acc += ds * q
+            #dv_acc += w * do
+            dk_acc += ds.to(tl.float32) * q.to(tl.float32)
+            dv_acc += w.to(tl.float32)  * do.to(tl.float32)
 
         # Store Result
         ptr_dk = DK_ptr + off_out_base + (offs_d[None, :] * sdk_d)
@@ -931,8 +933,10 @@ def hierarchical_attention_backward_high_level_kernel(
             do = tl.load(ptr_do, mask=mask_op, other=0.0)
             
             # FMA
-            dk_acc += ds * q
-            dv_acc += w * do
+            #dk_acc += ds * q
+            #dv_acc += w * do
+            dk_acc += ds.to(tl.float32) * q.to(tl.float32)
+            dv_acc += w.to(tl.float32)  * do.to(tl.float32)
 
         # [ATOMIC STORE] 
         # We only reach here if children exist, so we never atomic_add to empty nodes.
