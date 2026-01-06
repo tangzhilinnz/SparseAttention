@@ -1892,7 +1892,8 @@ def run_full_suite():
     print(f"{'='*60}")
 
     # Config: Massive scale
-    B, N, D, H = 128, 512, 512, 8 
+    B, N, D, H = 128, 1024, 512, 8 
+    #B, N, D, H = 128, 512, 512, 8 
     # B, N, D, H = 64, 2048, 512, 8 
     # B, N, D, H = 16, 4096, 1024, 16 # Alternative config
 
@@ -2082,7 +2083,8 @@ def run_full_suite_update_X_from_Y():
     #B, N, D, H = 32, 4096, 64, 8
     #B, N, D, H = 64, 2048, 64, 8
     #B, N, D, H = 2, 2048 * 64, 64, 8
-    B, N, D, H = 128, 512, 64, 8
+    #B, N, D, H = 128, 512, 64, 8
+    B, N, D, H = 128, 1024, 64, 8
     dim = D * H
 
     print(f"Config: B={B}, N={N}, D={dim} (HeadDim={D}), H={H}, dtype={check_dtype}")
