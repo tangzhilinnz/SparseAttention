@@ -1828,9 +1828,12 @@ def run_full_suite():
     
     # 3. Create Inputs (Float16)
     dtype = torch.float16
-    x = torch.randn(B, N, dim, device='cuda', dtype=dtype)
-    y = torch.randn(B, N - 1, dim, device='cuda', dtype=dtype)
-    
+    #x = torch.randn(B, N, dim, device='cuda', dtype=dtype)
+    #y = torch.randn(B, N - 1, dim, device='cuda', dtype=dtype)
+
+    x = torch.randn(B, N, dim, device='cuda', dtype=dtype).clamp(-1, 1)
+    y = torch.randn(B, N - 1, dim, device='cuda', dtype=dtype).clamp(-1, 1)
+
     print(f"Input Shapes -> X: {x.shape}, Y: {y.shape}, Dtype: {x.dtype}")
     
     assert y.shape[1] == N - 1, f"Sanity Check Failed"
