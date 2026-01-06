@@ -1206,7 +1206,7 @@ class PositionwiseFeedForward(nn.Module):
         return self.fc2(self.dropout(F.relu(self.fc1(x))))
 
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, dropout, max_len=160000):
+    def __init__(self, d_model, dropout, max_len=80000):
         super(PositionalEncoding, self).__init__()
         self.dropout = nn.Dropout(p=dropout)
         
@@ -1448,8 +1448,8 @@ def run_transformer_benchmark():
     DROPOUT = 0.0 # As requested
     
     # Batch config
-    B = 1   # Reduced slightly from 16 to ensure safety on standard VRAM with 12 layers
-    SEQ_LEN = 2048 * 64
+    B = 2   # Reduced slightly from 16 to ensure safety on standard VRAM with 12 layers
+    SEQ_LEN = 2048 * 32
     
     print(f"\n{'='*60}")
     print(f" TRANSFORMER LM BENCHMARK (B={B}, L={SEQ_LEN}, Layers={NUM_LAYERS})")
