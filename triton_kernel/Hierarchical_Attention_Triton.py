@@ -1148,7 +1148,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         )
     
         
-        CUTOFF_LEVEL = 5
+        CUTOFF_LEVEL = 6
         
         # --- KERNEL A: Low Levels (Split=1) ---
         if LEVELS >= 1:
@@ -1903,10 +1903,10 @@ def run_full_suite():
     #B, N, D, H = 128, 256, 512, 8
     #B, N, D, H = 1, 2048 * 256, 512, 8
     #B, N, D, H = 2, 2048 * 64, 512, 8
-    #B, N, D, H = 32, 4096, 512, 8
+    B, N, D, H = 32, 4096, 512, 8
     #B, N, D, H = 128, 1024, 512, 8 
     #B, N, D, H = 128, 512, 512, 8 
-    B, N, D, H = 64, 2048, 512, 8
+    #B, N, D, H = 64, 2048, 512, 8
     # B, N, D, H = 16, 4096, 1024, 16 # Alternative config
 
     print(f"Config: B={B}, N={N}, D={D}, H={H}, dtype={dtype}")
@@ -2092,8 +2092,8 @@ def run_full_suite_update_X_from_Y():
     print(f"{'='*60}")
 
     # Config: Large scale to saturate GPU
-    #B, N, D, H = 32, 4096, 64, 8
-    B, N, D, H = 64, 2048, 64, 8
+    B, N, D, H = 32, 4096, 64, 8
+    #B, N, D, H = 64, 2048, 64, 8
     #B, N, D, H = 2, 2048 * 64, 64, 8
     #B, N, D, H = 1, 2048 * 256, 64, 8
     #B, N, D, H = 128, 512, 64, 8
