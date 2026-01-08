@@ -1110,7 +1110,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         # 1. Retrieve Tensors
         Q, K, V, idx_table, gather_table, Weights, mask_table = ctx.saved_tensors
         sm_scale, H, BLOCK_H, D, BLOCK_D, LEVELS, BLOCK_LEVELS = ctx.constants
-    
+
         # View as 4D
         grad_output = grad_output.contiguous()
         B, N = Q.shape[0], Q.shape[1]
@@ -1129,12 +1129,12 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             sm_scale, H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=32, 
             LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS, HAS_MASK=HAS_MASK, num_warps=2
         )
-    
+
         # --- SETUP PARALLELISM ---
         dK = torch.zeros_like(K)
         dV = torch.zeros_like(V)
         dQ = torch.empty_like(Q)
-    
+
         # --- BRANCH 2: dK/dV (Dependent on dS) ---
         
         # Step A: Leaf Kernel (Level 0)
@@ -1146,9 +1146,18 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
             H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, num_warps=2
         )
-    
-        
-        CUTOFF_LEVEL = 10
+
+        # --- Dynamic CUTOFF_LEVEL Logic ---
+        # Default is 6, adjusted based on sequence length N
+        if N <= 1025:
+            CUTOFF_LEVEL = 5
+        elif N <= 2048:
+            CUTOFF_LEVEL = 6
+        elif N <= 4096:
+            CUTOFF_LEVEL = 8
+        else:
+            # Covers large scale N (e.g., 2048*64, 2048*256)
+            CUTOFF_LEVEL = 10
         
         # --- KERNEL A: Low Levels (Split=1) ---
         if LEVELS >= 1:
@@ -1189,10 +1198,10 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
                 *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
                 H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
                 N=N,
-                START_LEVEL=CUTOFF_LEVEL + 1, # Start at Level 9
+                START_LEVEL=CUTOFF_LEVEL + 1,
                 num_warps=2
             )
-    
+
         # --- BRANCH 1: dQ (Independent) ---
         grid_dq = (N, B)
         hierarchical_attention_backward_dQ_kernel[grid_dq](
