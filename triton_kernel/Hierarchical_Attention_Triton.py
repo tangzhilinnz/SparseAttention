@@ -1148,7 +1148,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         )
     
         
-        CUTOFF_LEVEL = 4
+        CUTOFF_LEVEL = 5
         
         # --- KERNEL A: Low Levels (Split=1) ---
         if LEVELS >= 1:
@@ -1899,7 +1899,8 @@ def run_full_suite():
     print(f"{'='*60}")
 
     # Config: Massive scale
-    B, N, D, H = 128, 256, 512, 8
+    B, N, D, H = 64, 1024, 512, 8
+    #B, N, D, H = 128, 256, 512, 8
     #B, N, D, H = 1, 2048 * 256, 512, 8
     #B, N, D, H = 2, 2048 * 64, 512, 8
     #B, N, D, H = 32, 4096, 512, 8
@@ -2096,7 +2097,8 @@ def run_full_suite_update_X_from_Y():
     #B, N, D, H = 2, 2048 * 64, 64, 8
     #B, N, D, H = 1, 2048 * 256, 64, 8
     #B, N, D, H = 128, 512, 64, 8
-    B, N, D, H = 128, 256, 64, 8
+    #B, N, D, H = 128, 256, 64, 8
+    B, N, D, H = 64, 1024, 64, 8
     #B, N, D, H = 128, 1024, 64, 8
     dim = D * H
 
