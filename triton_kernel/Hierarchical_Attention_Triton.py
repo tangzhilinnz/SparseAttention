@@ -1902,8 +1902,8 @@ def run_full_suite():
     #B, N, D, H = 64, 1024, 512, 8
     #B, N, D, H = 128, 256, 512, 8
     #B, N, D, H = 1, 2048 * 256, 512, 8
-    #B, N, D, H = 2, 2048 * 64, 512, 8
-    B, N, D, H = 32, 4096, 512, 8
+    B, N, D, H = 2, 2048 * 64, 512, 8
+    #B, N, D, H = 32, 4096, 512, 8
     #B, N, D, H = 128, 1024, 512, 8 
     #B, N, D, H = 128, 512, 512, 8 
     #B, N, D, H = 64, 2048, 512, 8
@@ -2092,14 +2092,13 @@ def run_full_suite_update_X_from_Y():
     print(f"{'='*60}")
 
     # Config: Large scale to saturate GPU
-    B, N, D, H = 32, 4096, 64, 8
+    #B, N, D, H = 32, 4096, 64, 8
     #B, N, D, H = 64, 2048, 64, 8
-    #B, N, D, H = 2, 2048 * 64, 64, 8
+    B, N, D, H = 2, 2048 * 64, 64, 8
     #B, N, D, H = 1, 2048 * 256, 64, 8
     #B, N, D, H = 128, 512, 64, 8
     #B, N, D, H = 128, 256, 64, 8
     #B, N, D, H = 64, 1024, 64, 8
-    #B, N, D, H = 128, 1024, 64, 8
     dim = D * H
 
     print(f"Config: B={B}, N={N}, D={dim} (HeadDim={D}), H={H}, dtype={check_dtype}")
