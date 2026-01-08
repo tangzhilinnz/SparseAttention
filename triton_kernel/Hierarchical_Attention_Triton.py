@@ -1148,7 +1148,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         )
     
         
-        CUTOFF_LEVEL = 9
+        CUTOFF_LEVEL = 8
         
         # --- KERNEL A: Low Levels (Split=1) ---
         if LEVELS >= 1:
