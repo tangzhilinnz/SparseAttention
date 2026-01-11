@@ -2207,7 +2207,7 @@ def run_transformer_benchmark():
     print(f">> Trace exported to '{trace_name}'. Open in chrome://tracing")
     
     # Print heavy hitters
-    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=100))
     torch.cuda.empty_cache()
 
     # --------------------------------------------------------------------------
