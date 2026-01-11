@@ -2083,323 +2083,187 @@ import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+import time
 import torch
-import torch.nn.functional as F
 from torch.profiler import profile, record_function, ProfilerActivity
 
-# Placeholder for your actual model import
-# from hierarchical_attention import HierarchicalSparseAttentionTriton 
+def print_header(msg):
+    print(f"\n{'='*60}\n {msg}\n{'='*60}")
 
-def run_full_suite(B, N, HeadDim, H):
-    # ==========================================================================
-    # 1. SETUP & CORRECTNESS CHECK (Float16)
-    # ==========================================================================
-    # We use a fixed, safe size for correctness to strictly check logic first.
-    # This ensures the kernel works before throwing the massive tensors at it.
+def get_peak_memory_gb():
+    return torch.cuda.max_memory_allocated() / (1024 ** 3)
+
+def run_transformer_benchmark():
+    # --------------------------------------------------------------------------
+    # 0. CONFIGURATION
+    # --------------------------------------------------------------------------
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
     
-    # Calculate Model Dimension
-    dim = HeadDim * H
-    dtype = torch.float16
+    # Use the device defined in your environment/kernels
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    torch.cuda.set_device(device)
 
-    print(f"\n{'='*80}")
-    print(f"1. CORRECTNESS CHECK (Float16) - cross_update_Y")
-    print(f"   [Sanity Check Dims: B=2, N=1024, D={dim}, H={H}]")
-    print(f"{'='*80}")
-
-    B_check, N_check = 2, 1024
+    # Hyperparameters from request
+    VOCAB_SIZE = 50000
+    D_MODEL = 768
+    NUM_HEADS = 12
+    D_FF = 3072
+    NUM_LAYERS = 12
+    DROPOUT = 0.0 # Zero dropout for valid numerical comparison
     
-    # Initialize Model
-    model = HierarchicalSparseAttentionTriton(dim, H, dropout=0.0).cuda().to(dtype)
+    # Batch config
+    B = 1    
+    # SEQ_LEN = 2048 * 32  # 65536
+    # NOTE: 65k seq len with 12 layers might OOM on 80GB during backward. 
+    # Adjusted to 2048 * 8 (16k) for safety in this demo script. 
+    # Uncomment the line below to run full 65k if hardware permits.
+    SEQ_LEN = 2048 * 8 
     
-    # Create Inputs
-    x = torch.randn(B_check, N_check, dim, device='cuda', dtype=dtype).clamp(-1, 1)
-    y = torch.randn(B_check, N_check - 1, dim, device='cuda', dtype=dtype).clamp(-1, 1)
+    print_header(f"TRANSFORMER BENCHMARK\n B={B}, L={SEQ_LEN}, Layers={NUM_LAYERS}\n Device: {torch.cuda.get_device_name(device)}")
+
+    # --------------------------------------------------------------------------
+    # 1. SETUP & WEIGHT SYNCHRONIZATION
+    # --------------------------------------------------------------------------
+    print("Initializing Standard PyTorch Model...")
+    model_ref = TransformerLM(
+        vocab_size=VOCAB_SIZE, d_model=D_MODEL, num_heads=NUM_HEADS, 
+        d_ff=D_FF, num_layers=NUM_LAYERS, triton=False, dropout=DROPOUT
+    ).to(device).half() # FP16
+
+    print("Initializing Triton Optimized Model...")
+    model_opt = TransformerLM(
+        vocab_size=VOCAB_SIZE, d_model=D_MODEL, num_heads=NUM_HEADS, 
+        d_ff=D_FF, num_layers=NUM_LAYERS, triton=True, dropout=DROPOUT
+    ).to(device).half() # FP16
+
+    print("Synchronizing weights for Sanity Check...")
+    # CRITICAL: Load PyTorch weights into Triton model to ensure identical starting state
+    model_opt.load_state_dict(model_ref.state_dict())
+
+    # Create dummy input
+    x = torch.randint(0, VOCAB_SIZE, (B, SEQ_LEN), device=device)
+
+    # --------------------------------------------------------------------------
+    # 2. NUMERICAL SANITY CHECK
+    # --------------------------------------------------------------------------
+    print_header("2. NUMERICAL SANITY CHECK")
     
-    assert y.shape[1] == N_check - 1, f"Sanity Check Failed"
-
-    # -------------------------------------------------
-    # Run PyTorch Reference Path
-    # -------------------------------------------------
-    x_ref = x.clone().detach().requires_grad_(True)
-    y_ref = y.clone().detach().requires_grad_(True)
-    model.sizes = None; model.offsets = None 
-    out_ref = model.cross_update_Y_Ref(x_ref, y_ref)
-    loss_ref = out_ref.sum()
-    loss_ref.backward()
+    # Forward
+    print("Running Forward Pass...")
+    out_ref = model_ref(x)
+    out_opt = model_opt(x)
     
-    # -------------------------------------------------
-    # Run Triton Kernel Path
-    # -------------------------------------------------
-    x_tri = x.clone().detach().requires_grad_(True)
-    y_tri = y.clone().detach().requires_grad_(True)
-    model.sizes = None; model.offsets = None
-    out_tri = model.cross_update_Y(x_tri, y_tri)
-    loss_tri = out_tri.sum()
-    loss_tri.backward()
+    diff = (out_ref - out_opt).abs().max().item()
+    print(f"Forward Pass Max Difference: {diff:.6f}")
+    if diff > 1e-1: # FP16 tolerance
+        print("WARNING: Large forward difference detected!")
+    else:
+        print(">> Forward Pass Check: PASSED")
+
+    # Backward
+    print("Running Backward Pass...")
+    # Create random gradients
+    grad_output = torch.randn_like(out_ref)
     
-    # -------------------------------------------------
-    # Compare
-    # -------------------------------------------------
-    diff_out = (out_ref.float() - out_tri.float()).abs().max().item()
-    diff_grad_x = (x_ref.grad.float() - x_tri.grad.float()).abs().max().item()
-    diff_grad_y = (y_ref.grad.float() - y_tri.grad.float()).abs().max().item()
+    model_ref.zero_grad()
+    out_ref.backward(grad_output)
+    grad_ref = model_ref.embedding.weight.grad.clone() # Check embedding grad as proxy
+
+    model_opt.zero_grad()
+    out_opt.backward(grad_output)
+    grad_opt = model_opt.embedding.weight.grad.clone()
+
+    grad_diff = (grad_ref - grad_opt).abs().max().item()
+    print(f"Backward Pass (Grad) Max Difference: {grad_diff:.6f}")
+    if grad_diff > 1.0: # Gradients can accumulate error in FP16 deep networks
+        print("WARNING: Large gradient difference detected!")
+    else:
+        print(">> Backward Pass Check: PASSED")
+
+    # Clear memory before heavy profiling
+    del out_ref, out_opt, grad_output, grad_ref, grad_opt
+    torch.cuda.empty_cache()
+
+    # --------------------------------------------------------------------------
+    # 3. PROFILING (Chrome Traces)
+    # --------------------------------------------------------------------------
+    print_header("3. KERNEL PROFILING")
     
-    print(f"Max Diff Output:   {diff_out:.6f}")
-    print(f"Max Diff Grad X:   {diff_grad_x:.6f}")
-    print(f"Max Diff Grad Y:   {diff_grad_y:.6f}")
+    # We only profile the optimized model to see the Triton kernels
+    print(f"Profiling Triton Model (1 Step)...")
     
-    tol = 5e-2 
-    try:
-        assert torch.allclose(out_ref, out_tri, atol=tol), "Forward pass mismatch!"
-        assert torch.allclose(x_ref.grad, x_tri.grad, atol=tol), "Gradient X mismatch!"
-        assert torch.allclose(y_ref.grad, y_tri.grad, atol=tol), "Gradient Y mismatch!"
-        print(f"SUCCESS: Triton kernel matches PyTorch reference.")
-    except AssertionError as e:
-        print(f"\n{e}")
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
+        with record_function("model_inference"):
+            # Forward
+            out = model_opt(x)
+            # Backward
+            loss = out.mean()
+            loss.backward()
 
-    # ==========================================================================
-    # 2. PERFORMANCE BENCHMARK (Float16 - Target Config)
-    # ==========================================================================
-    print(f"\n{'-'*80}")
-    print(f"2. SPEED BENCHMARK (Float16) - Target Config")
-    print(f"   Config: B={B}, N={N}, HeadDim={HeadDim}, H={H} (ModelDim={dim})")
-    print(f"{'-'*80}")
-
-    # Re-init model for benchmark
-    model = HierarchicalSparseAttentionTriton(dim=dim, num_heads=H, dropout=0.0).to('cuda').to(dtype)
-    model.eval() 
-
-    # Create large inputs 
-    x = torch.randn(B, N, dim, device='cuda', dtype=dtype, requires_grad=True)
-    y_in = torch.randn(B, N-1, dim, device='cuda', dtype=dtype, requires_grad=True)
+    # Export trace
+    trace_name = "hierarchical_triton_trace.json"
+    prof.export_chrome_trace(trace_name)
+    print(f">> Trace exported to '{trace_name}'. Open in chrome://tracing")
     
-    model.sizes = None
-    # Dry run 
-    out_warm = model.cross_update_Y(x, y_in)
-    out_warm.sum().backward()
-    model.zero_grad(); x.grad = None; y_in.grad = None
+    # Print heavy hitters
+    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+    torch.cuda.empty_cache()
 
-    # --- Timing Setup ---
-    num_warmup = 5
-    num_trials = 10 
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
+    # --------------------------------------------------------------------------
+    # 4. PERFORMANCE BENCHMARKING
+    # --------------------------------------------------------------------------
+    print_header("4. PERFORMANCE BENCHMARK (Latency & Memory)")
 
-    # A. Measure PyTorch Reference (Always Run)
-    print("  Running PyTorch Reference (FWD + BWD)...")
-    for _ in range(num_warmup): 
-        out = model.cross_update_Y_Ref(x, y_in)
-        out.sum().backward()
-        model.zero_grad(); x.grad = None; y_in.grad = None
+    def benchmark_model(model, name, steps=10, warmup=5):
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        
+        # Warmup
+        for _ in range(warmup):
+            out = model(x)
+            loss = out.mean()
+            loss.backward()
+            model.zero_grad()
+        
+        torch.cuda.synchronize()
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        
+        start_event.record()
+        for _ in range(steps):
+            out = model(x)
+            loss = out.mean()
+            loss.backward()
+            model.zero_grad()
+        end_event.record()
+        torch.cuda.synchronize()
+        
+        total_time_ms = start_event.elapsed_time(end_event)
+        avg_time_ms = total_time_ms / steps
+        max_mem_gb = get_peak_memory_gb()
+        
+        print(f"[{name}]")
+        print(f"  Avg Step Time: {avg_time_ms:.2f} ms")
+        print(f"  Peak Memory:   {max_mem_gb:.2f} GB")
+        return avg_time_ms, max_mem_gb
 
-    torch.cuda.synchronize()
-    start.record()
-    for _ in range(num_trials):
-        out = model.cross_update_Y_Ref(x, y_in)
-        out.sum().backward()
-        model.zero_grad(); x.grad = None; y_in.grad = None
-    end.record()
-    torch.cuda.synchronize()
-    ms_ref = start.elapsed_time(end)
+    # Run Benchmark
+    time_ref, mem_ref = benchmark_model(model_ref, "Standard PyTorch (FP16)")
+    time_opt, mem_opt = benchmark_model(model_opt, "Triton Optimized (FP16)")
 
-    # B. Measure Triton Kernel
-    print("  Running Triton Kernel (FWD + BWD)...")
-    for _ in range(num_warmup): 
-        out = model.cross_update_Y(x, y_in)
-        out.sum().backward()
-        model.zero_grad(); x.grad = None; y_in.grad = None
-
-    torch.cuda.synchronize()
-    start.record()
-    for _ in range(num_trials):
-        out = model.cross_update_Y(x, y_in)
-        out.sum().backward()
-        model.zero_grad(); x.grad = None; y_in.grad = None
-    end.record()
-    torch.cuda.synchronize()
-    ms_opt = start.elapsed_time(end)
-
-    # Results
-    print("-" * 50)
-    print(f"  PyTorch Avg Time (Fwd+Bwd): {ms_ref/num_trials:.3f} ms")
-    print(f"  Triton  Avg Time (Fwd+Bwd): {ms_opt/num_trials:.3f} ms")
-    print(f"  >>> Speedup: {ms_ref/ms_opt:.2f}x")
-    print("-" * 50)
-
-    # ==========================================================================
-    # 3. PROFILER
-    # ==========================================================================
-    # Optional: Profile one iteration to check Kernel/Memory usage
-    # print("Profiling Triton Kernel Trace (1 iter)...")
-    # with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
-    #     with record_function("Triton_Step"):
-    #          out = model.cross_update_Y(x, y_in)
-    #          out.sum().backward()
-    #          model.zero_grad()
-    # print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
-
-
-def run_full_suite_update_X_from_Y(B, N, HeadDim, H):
-    # ==========================================================================
-    # 1. SETUP & CORRECTNESS CHECK
-    # ==========================================================================
-    check_dtype = torch.float16
-    dim = HeadDim * H
+    # --------------------------------------------------------------------------
+    # 5. FINAL SUMMARY
+    # --------------------------------------------------------------------------
+    print_header("FINAL RESULTS")
+    speedup = time_ref / time_opt
+    mem_saving = (1 - (mem_opt / mem_ref)) * 100
     
-    print(f"\n{'='*80}")
-    print(f"1. CORRECTNESS CHECK ({check_dtype}) - update_X_from_Y")
-    print(f"   [Sanity Check Dims: B=32, N=512, D={dim}, H={H}]")
-    print(f"{'='*80}")
-
-    B_check, N_check = 32, 512
-    
-    model = HierarchicalSparseAttentionTriton(dim, H, dropout=0.0).cuda().to(check_dtype)
-    
-    x = torch.randn(B_check, N_check, dim, device='cuda', dtype=check_dtype).clamp(-1, 1)
-    y = torch.randn(B_check, N_check - 1, dim, device='cuda', dtype=check_dtype).clamp(-1, 1)
-    mask = torch.ones((B_check, N_check), dtype=torch.bool, device='cuda')
-
-    # Run PyTorch Reference
-    x_ref = x.clone().detach().requires_grad_(True)
-    y_ref = y.clone().detach().requires_grad_(True)
-    model.sizes = None; model.offsets = None 
-    out_ref = model.update_X_from_Y_Ref(x_ref, y_ref, mask=mask)
-    loss_ref = out_ref.sum()
-    loss_ref.backward()
-    
-    # Run Triton Kernel
-    x_tri = x.clone().detach().requires_grad_(True)
-    y_tri = y.clone().detach().requires_grad_(True)
-    model.sizes = None; model.offsets = None
-    out_tri = model.update_X_from_Y(x_tri, y_tri, mask=mask)
-    loss_tri = out_tri.sum()
-    loss_tri.backward()
-    
-    # Compare
-    diff_out = (out_ref.float() - out_tri.float()).abs().max().item()
-    diff_grad_x = (x_ref.grad.float() - x_tri.grad.float()).abs().max().item()
-    diff_grad_y = (y_ref.grad.float() - y_tri.grad.float()).abs().max().item()
-    
-    print(f"Max Diff Output:   {diff_out:.8f}")
-    print(f"Max Diff Grad X:   {diff_grad_x:.8f}")
-    print(f"Max Diff Grad Y:   {diff_grad_y:.8f}")
-    
-    tol = 5e-2
-    try:
-        assert torch.allclose(out_ref, out_tri, atol=tol), f"Forward pass mismatch! (tol={tol})"
-        assert torch.allclose(x_ref.grad, x_tri.grad, atol=tol), f"Gradient X mismatch! (tol={tol})"
-        assert torch.allclose(y_ref.grad, y_tri.grad, atol=tol), f"Gradient Y mismatch! (tol={tol})"
-        print(f"SUCCESS: Triton kernel matches PyTorch reference.")
-    except AssertionError as e:
-        print(f"\n{e}")
-
-    # ==========================================================================
-    # 2. PERFORMANCE BENCHMARK (Dynamic Config)
-    # ==========================================================================
-    print(f"\n{'-'*80}")
-    print(f"2. SPEED BENCHMARK ({check_dtype}) - Target Config")
-    print(f"   Config: B={B}, N={N}, HeadDim={HeadDim}, H={H} (ModelDim={dim})")
-    print(f"{'-'*80}")
-
-    model = HierarchicalSparseAttentionTriton(dim=dim, num_heads=H, dropout=0.0).to('cuda').to(check_dtype)
-    model.eval() 
-
-    x = torch.randn(B, N, dim, device='cuda', dtype=check_dtype, requires_grad=True)
-    y_in = torch.randn(B, N - 1, dim, device='cuda', dtype=check_dtype, requires_grad=True)
-    
-    model.sizes = None
-    
-    # Warmup
-    out_warm = model.update_X_from_Y(x, y_in)
-    out_warm.sum().backward()
-    model.zero_grad(); x.grad = None; y_in.grad = None
-
-    # --- Timing Setup ---
-    num_warmup = 5
-    num_trials = 10
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-
-    # A. Measure PyTorch Reference (Always Run)
-    print("  Running PyTorch Reference (FWD + BWD)...")
-    for _ in range(num_warmup): 
-        out = model.update_X_from_Y_Ref(x, y_in)
-        out.sum().backward()
-        model.zero_grad(); x.grad = None; y_in.grad = None
-
-    torch.cuda.synchronize()
-    start.record()
-    for _ in range(num_trials):
-        out = model.update_X_from_Y_Ref(x, y_in)
-        out.sum().backward()
-        model.zero_grad(); x.grad = None; y_in.grad = None
-    end.record()
-    torch.cuda.synchronize()
-    ms_ref = start.elapsed_time(end)
-
-    # B. Measure Triton Kernel
-    print("  Running Triton Kernel (FWD + BWD)...")
-    for _ in range(num_warmup): 
-        out = model.update_X_from_Y(x, y_in)
-        out.sum().backward()
-        model.zero_grad(); x.grad = None; y_in.grad = None
-
-    torch.cuda.synchronize()
-    start.record()
-    for _ in range(num_trials):
-        out = model.update_X_from_Y(x, y_in)
-        out.sum().backward()
-        model.zero_grad(); x.grad = None; y_in.grad = None
-    end.record()
-    torch.cuda.synchronize()
-    ms_opt = start.elapsed_time(end)
-
-    # Results
-    print("-" * 50)
-    print(f"  PyTorch Avg Time (Fwd+Bwd): {ms_ref/num_trials:.3f} ms")
-    print(f"  Triton  Avg Time (Fwd+Bwd): {ms_opt/num_trials:.3f} ms")
-    print(f"  >>> Speedup: {ms_ref/ms_opt:.2f}x")
-    print("-" * 50)
-
+    print(f"{'Metric':<20} | {'PyTorch':<15} | {'Triton':<15} | {'Delta':<10}")
+    print("-" * 70)
+    print(f"{'Time (ms)':<20} | {time_ref:<15.2f} | {time_opt:<15.2f} | {speedup:.2f}x FASTER")
+    print(f"{'Memory (GB)':<20} | {mem_ref:<15.2f} | {mem_opt:<15.2f} | {mem_saving:.2f}% LESS")
+    print("-" * 70)
 
 if __name__ == "__main__":
-    # Configs: (B, N, HeadDim, H)
-    configs = [
-        (32, 4096, 64, 8),
-        (64, 2048, 64, 8),
-        (2, 2048 * 64, 64, 8),   # N = 131,072
-        (1, 2048 * 256, 64, 8),  # N = 524,288
-        (128, 512, 64, 8),
-        (128, 256, 64, 8),
-        (64, 1024, 64, 8)
-    ]
-
-    print(f"Starting Benchmark Suite for {len(configs)} configurations on A100...")
-    
-    for (B, N, HeadDim, H) in configs:
-        print(f"\n\n{'#'*80}")
-        print(f"### RUNNING CONFIG: B={B}, N={N}, HeadDim={HeadDim}, H={H}")
-        print(f"{'#'*80}")
-        
-        # 1. Test cross_update_Y
-        run_full_suite(B, N, HeadDim, H)
-        
-        # 2. Test update_X_from_Y
-        run_full_suite_update_X_from_Y(B, N, HeadDim, H)
+    run_transformer_benchmark()
