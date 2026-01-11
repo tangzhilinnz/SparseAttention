@@ -2096,23 +2096,25 @@ def run_transformer_benchmark():
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     torch.cuda.set_device(device)
 
-    # Hyperparameters from request
+    # Hyperparameters
     VOCAB_SIZE = 50000
     D_MODEL = 768
     NUM_HEADS = 12
     D_FF = 3072
     NUM_LAYERS = 12
-    DROPOUT = 0.0 # Zero dropout for valid numerical comparison
+    DROPOUT = 0.0 
     
     # Batch config
     B = 8    
-    # SEQ_LEN = 2048 * 32  # 65536
-    # NOTE: 65k seq len with 12 layers might OOM on 80GB during backward. 
-    # Adjusted to 2048 * 8 (16k) for safety in this demo script. 
-    # Uncomment the line below to run full 65k if hardware permits.
     SEQ_LEN = 2048
     
-    print_header(f"TRANSFORMER BENCHMARK\n B={B}, L={SEQ_LEN}, Layers={NUM_LAYERS}\n Device: {torch.cuda.get_device_name(device)}")
+    # Variables for the randn snippet
+    B_check = B
+    N_check = SEQ_LEN
+    dim = D_MODEL
+    check_dtype = torch.float16  # Matches model.half()
+    
+    print_header(f"TRANSFORMER BENCHMARK (Random Float Input)\n B={B}, L={SEQ_LEN}, Layers={NUM_LAYERS}\n Device: {torch.cuda.get_device_name(device)}")
 
     # --------------------------------------------------------------------------
     # 1. SETUP & WEIGHT SYNCHRONIZATION
@@ -2121,20 +2123,45 @@ def run_transformer_benchmark():
     model_ref = TransformerLM(
         vocab_size=VOCAB_SIZE, d_model=D_MODEL, num_heads=NUM_HEADS, 
         d_ff=D_FF, num_layers=NUM_LAYERS, triton=False, dropout=DROPOUT
-    ).to(device).half() # FP16
+    ).to(device).half() 
 
     print("Initializing Triton Optimized Model...")
     model_opt = TransformerLM(
         vocab_size=VOCAB_SIZE, d_model=D_MODEL, num_heads=NUM_HEADS, 
         d_ff=D_FF, num_layers=NUM_LAYERS, triton=True, dropout=DROPOUT
-    ).to(device).half() # FP16
+    ).to(device).half() 
 
     print("Synchronizing weights for Sanity Check...")
-    # CRITICAL: Load PyTorch weights into Triton model to ensure identical starting state
     model_opt.load_state_dict(model_ref.state_dict())
 
-    # Create dummy input
-    x = torch.randint(0, VOCAB_SIZE, (B, SEQ_LEN), device=device)
+    # --- INPUT GENERATION (RANDN) ---
+    # Using the requested snippet with mapped variables
+    x = torch.randn(B_check, N_check, dim, device='cuda', dtype=check_dtype).clamp(-1, 1)
+
+    # --------------------------------------------------------------------------
+    # HELPER: Forward Wrapper (Handles Float Inputs by skipping Embedding)
+    # --------------------------------------------------------------------------
+    def run_forward(model, x_input):
+        if x_input.is_floating_point():
+            # Bypass Embedding Layer for raw float inputs
+            # Scale x just like the embedding layer would have
+            x_local = x_input * math.sqrt(model.d_model)
+            x_local = model.pos_encoding(x_local)
+            
+            # Generate Y hierarchy
+            y = HierarchicalSparseAttention.generate_span_input_Y(x_local)
+            
+            # Create mask (reuse the model's method, but pass dummy x for shape)
+            trg_mask = model.make_causal_mask(x_input)
+            
+            # Run Layers
+            for layer in model.layers:
+                x_local, y = layer(x_local, y, mask=trg_mask)
+            
+            return model.fc_out(x_local)
+        else:
+            # Standard Integer Path
+            return model(x_input)
 
     # --------------------------------------------------------------------------
     # 2. NUMERICAL SANITY CHECK
@@ -2143,37 +2170,38 @@ def run_transformer_benchmark():
     
     # Forward
     print("Running Forward Pass...")
-    out_ref = model_ref(x)
-    out_opt = model_opt(x)
+    out_ref = run_forward(model_ref, x)
+    out_opt = run_forward(model_opt, x)
     
     diff = (out_ref - out_opt).abs().max().item()
     print(f"Forward Pass Max Difference: {diff:.6f}")
-    if diff > 1e-1: # FP16 tolerance
+    if diff > 1e-1: 
         print("WARNING: Large forward difference detected!")
     else:
         print(">> Forward Pass Check: PASSED")
 
     # Backward
     print("Running Backward Pass...")
-    # Create random gradients
     grad_output = torch.randn_like(out_ref)
     
+    # Check Ref
     model_ref.zero_grad()
     out_ref.backward(grad_output)
-    grad_ref = model_ref.embedding.weight.grad.clone() # Check embedding grad as proxy
+    # We check the first Linear layer grad since we skipped embedding
+    grad_ref = model_ref.layers[0].feed_forward.fc1.weight.grad.clone()
 
+    # Check Opt
     model_opt.zero_grad()
     out_opt.backward(grad_output)
-    grad_opt = model_opt.embedding.weight.grad.clone()
+    grad_opt = model_opt.layers[0].feed_forward.fc1.weight.grad.clone()
 
     grad_diff = (grad_ref - grad_opt).abs().max().item()
     print(f"Backward Pass (Grad) Max Difference: {grad_diff:.6f}")
-    if grad_diff > 1.0: # Gradients can accumulate error in FP16 deep networks
+    if grad_diff > 1.0: 
         print("WARNING: Large gradient difference detected!")
     else:
         print(">> Backward Pass Check: PASSED")
 
-    # Clear memory before heavy profiling
     del out_ref, out_opt, grad_output, grad_ref, grad_opt
     torch.cuda.empty_cache()
 
@@ -2182,23 +2210,19 @@ def run_transformer_benchmark():
     # --------------------------------------------------------------------------
     print_header("3. KERNEL PROFILING")
     
-    # We only profile the optimized model to see the Triton kernels
     print(f"Profiling Triton Model (1 Step)...")
     
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
         with record_function("model_inference"):
-            # Forward
-            out = model_opt(x)
-            # Backward
+            out = run_forward(model_opt, x)
             loss = out.mean()
             loss.backward()
 
-    # Export trace
     trace_name = "hierarchical_triton_trace.json"
     prof.export_chrome_trace(trace_name)
     print(f">> Trace exported to '{trace_name}'. Open in chrome://tracing")
     
-    # Print heavy hitters
+    # Increase row limit to see small kernels
     print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=100))
     torch.cuda.empty_cache()
 
@@ -2213,7 +2237,7 @@ def run_transformer_benchmark():
         
         # Warmup
         for _ in range(warmup):
-            out = model(x)
+            out = run_forward(model, x)
             loss = out.mean()
             loss.backward()
             model.zero_grad()
@@ -2224,7 +2248,7 @@ def run_transformer_benchmark():
         
         start_event.record()
         for _ in range(steps):
-            out = model(x)
+            out = run_forward(model, x)
             loss = out.mean()
             loss.backward()
             model.zero_grad()
