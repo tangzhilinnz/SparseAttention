@@ -3,7 +3,7 @@ import os
 # CRITICAL FIX: GPU SELECTION MUST BE FIRST
 # ==========================================
 # Set this before importing torch or calling torch.cuda to avoid OOM
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 
 
 import torch
@@ -2105,7 +2105,7 @@ def run_transformer_benchmark():
     DROPOUT = 0.0 # Zero dropout for valid numerical comparison
     
     # Batch config
-    B = 32    
+    B = 8    
     # SEQ_LEN = 2048 * 32  # 65536
     # NOTE: 65k seq len with 12 layers might OOM on 80GB during backward. 
     # Adjusted to 2048 * 8 (16k) for safety in this demo script. 
