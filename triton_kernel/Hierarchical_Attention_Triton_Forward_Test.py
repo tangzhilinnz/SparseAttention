@@ -2075,14 +2075,6 @@ class TransformerLM(nn.Module):
 
 from torch.profiler import profile, record_function, ProfilerActivity
 
-
-import os
-# ==========================================
-# [CRITICAL] SET GPU BEFORE IMPORTING TORCH
-# ==========================================
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
-
-
 import time
 import torch
 from torch.profiler import profile, record_function, ProfilerActivity
@@ -2113,12 +2105,12 @@ def run_transformer_benchmark():
     DROPOUT = 0.0 # Zero dropout for valid numerical comparison
     
     # Batch config
-    B = 1    
+    B = 32    
     # SEQ_LEN = 2048 * 32  # 65536
     # NOTE: 65k seq len with 12 layers might OOM on 80GB during backward. 
     # Adjusted to 2048 * 8 (16k) for safety in this demo script. 
     # Uncomment the line below to run full 65k if hardware permits.
-    SEQ_LEN = 2048 * 8 
+    SEQ_LEN = 2048
     
     print_header(f"TRANSFORMER BENCHMARK\n B={B}, L={SEQ_LEN}, Layers={NUM_LAYERS}\n Device: {torch.cuda.get_device_name(device)}")
 
