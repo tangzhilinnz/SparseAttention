@@ -1,6 +1,6 @@
 __version__ = "0.1.0"
 
-from .modules import HierarchicalSparseAttention
+from .modules import HierarchicalAttention
 from .ops import (
     build_tree_topology, 
     generate_span_input_Y,
