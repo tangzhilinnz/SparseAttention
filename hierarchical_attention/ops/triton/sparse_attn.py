@@ -1,9 +1,6 @@
 import triton
 import triton.language as tl
 
-# ------------------------------------------------------------------
-#  Forward Kernel
-# ------------------------------------------------------------------
 @triton.jit
 def hierarchical_attention_forward_kernel(
     # Pointers
@@ -15,7 +12,7 @@ def hierarchical_attention_forward_kernel(
     sq_b, sq_n, sq_h, sq_d,
     # Strides (K)
     sk_b, sk_n, sk_h, sk_d,
-    # Strides (V)
+    # Strides (V) <--- [FIX]: Explicit V strides added
     sv_b, sv_n, sv_h, sv_d,
     # Strides (Topology)
     sl_n, sl_lvl,
@@ -44,15 +41,9 @@ def hierarchical_attention_forward_kernel(
     offs_lvl = tl.arange(0, BLOCK_LEVELS)
     mask_lvl = offs_lvl < LEVELS
 
-    # 2. Load Topology (Safe Loading)
+    # 2. Load Topology
     off_lookup = node_idx * sl_n + offs_lvl * sl_lvl
-    
-    # [FIX] Load with -1 default to detect invalid neighbors
-    neighbor_indices = tl.load(Lookup_ptr + off_lookup, mask=mask_lvl, other=-1)
-    
-    # [FIX] Create validity mask and safe indices for pointer math
-    valid_neighbor_mask = (neighbor_indices != -1)
-    safe_indices = tl.where(valid_neighbor_mask, neighbor_indices, 0)
+    neighbor_indices = tl.load(Lookup_ptr + off_lookup, mask=mask_lvl, other=0)
     
     neighbor_mask_val = tl.zeros([BLOCK_LEVELS], dtype=tl.int1)
     if HAS_MASK:
@@ -62,13 +53,12 @@ def hierarchical_attention_forward_kernel(
 
     # 3. Base Pointers
     k_batch_base = K_ptr + b_idx * sk_b
+    
+    # [FIX]: Use V specific stride for batch
     v_batch_base = V_ptr + b_idx * sv_b
     
     off_node_self = node_idx * sk_n
-    
-    # [FIX] Calculate cross offsets using safe indices (redirects -1 to 0)
-    off_node_cross_k = safe_indices * sk_n 
-    off_node_cross_v = safe_indices * sv_n
+    off_node_cross = neighbor_indices * sk_n 
 
     q_ptr = Q_ptr + (b_idx * sq_b) + (node_idx * sq_n) + \
             (h_idx[:, None] * sq_h) + (offs_d[None, :] * sq_d)
@@ -91,14 +81,12 @@ def hierarchical_attention_forward_kernel(
         acc_self += tl.sum(q * k_self, axis=1)
 
         # --- K CROSS ---
-        # [FIX] Use safe_indices offsets
         ptr_k_cross = k_batch_base + \
-                      off_node_cross_k[None, :, None] + \
+                      off_node_cross[None, :, None] + \
                       (h_idx[:, None, None] * sk_h) + \
                       (cur_offs_d[None, None, :] * sk_d)
         
-        # [FIX] Apply valid_neighbor_mask to the load
-        mask_k = mask_h[:, None, None] & mask_lvl[None, :, None] & d_mask[None, None, :] & valid_neighbor_mask[None, :, None]
+        mask_k = mask_h[:, None, None] & mask_lvl[None, :, None] & d_mask[None, None, :]
         k_cross = tl.load(ptr_k_cross, mask=mask_k, other=0.0)
         
         acc_cross += tl.sum(q[:, None, :] * k_cross, axis=2)
@@ -109,9 +97,7 @@ def hierarchical_attention_forward_kernel(
     acc_cross = acc_cross * sm_scale
     
     # Apply Masking (1 = Mask Out / -inf)
-    # [FIX] Mask out if Level is out of bounds OR Neighbor is -1
-    mask_broadcast = (offs_lvl >= LEVELS) | (~valid_neighbor_mask)
-    
+    mask_broadcast = (offs_lvl >= LEVELS)
     if HAS_MASK:
         mask_broadcast = mask_broadcast | neighbor_mask_val
         
@@ -144,19 +130,20 @@ def hierarchical_attention_forward_kernel(
         mask_op = mask_h[:, None] & d_mask[None, :]
 
         # --- V SELF ---
-        ptr_v_self = v_batch_base + (node_idx * sv_n) + \
+        # [FIX]: Use sv_h and sv_d
+        ptr_v_self = v_batch_base + off_node_self + \
                      (h_idx[:, None] * sv_h) + (cur_offs_d[None, :] * sv_d)
         v_self = tl.load(ptr_v_self, mask=mask_op, other=0.0)
         out_acc = w_self[:, None] * v_self
         
         # --- V CROSS ---
-        # [FIX] Use safe offsets and valid_mask for V
+        # [FIX]: Use sv_h and sv_d
         ptr_v_cross = v_batch_base + \
-                      off_node_cross_v[None, :, None] + \
+                      off_node_cross[None, :, None] + \
                       (h_idx[:, None, None] * sv_h) + \
                       (cur_offs_d[None, None, :] * sv_d)
                       
-        mask_v = mask_h[:, None, None] & mask_lvl[None, :, None] & d_mask[None, None, :] & valid_neighbor_mask[None, :, None]
+        mask_v = mask_h[:, None, None] & mask_lvl[None, :, None] & d_mask[None, None, :]
         v_cross = tl.load(ptr_v_cross, mask=mask_v, other=0.0)
         
         out_acc += tl.sum(w_cross[:, :, None] * v_cross, axis=1)
@@ -186,7 +173,7 @@ def hierarchical_attention_backward_dS_kernel(
     H: tl.constexpr, BLOCK_H: tl.constexpr,
     D: tl.constexpr, BLOCK_D: tl.constexpr,
     LEVELS: tl.constexpr, BLOCK_LEVELS: tl.constexpr,
-    HAS_MASK: tl.constexpr
+    HAS_MASK: tl.constexpr # <--- Added Flag
 ):
     node_idx = tl.program_id(0)
     b_idx = tl.program_id(1)
@@ -198,18 +185,15 @@ def hierarchical_attention_backward_dS_kernel(
     # -----------------------------------------------------------
     # 1. Mask Logic & Topology Load
     # -----------------------------------------------------------
+    # Boundary Check: Are we within the max levels?
     mask_lvl_bounds = offs_lvl < LEVELS
     off_lookup = node_idx * sl_n + offs_lvl * sl_lvl
     
-    # [FIX] Load with -1 default
-    neighbor_indices = tl.load(Lookup_ptr + off_lookup, mask=mask_lvl_bounds, other=-1)
+    neighbor_indices = tl.load(Lookup_ptr + off_lookup, mask=mask_lvl_bounds, other=0)
 
-    # [FIX] Create Safe Indices
-    valid_mask = (neighbor_indices != -1)
-    safe_indices = tl.where(valid_mask, neighbor_indices, 0)
-
-    # Combined Mask: (In Bounds) AND (Not -1)
-    mask_valid_cross = mask_lvl_bounds & valid_mask
+    # Combined Mask: (In Bounds) AND (Not Masked by User)
+    # Start with bounds
+    mask_valid_cross = mask_lvl_bounds
     
     if HAS_MASK:
         # Load User Mask (1 = Ignore/Masked, 0 = Keep)
@@ -225,6 +209,7 @@ def hierarchical_attention_backward_dS_kernel(
     w_self = tl.load(w_base + (0 * sw_lvl), mask=mask_h, other=0.0)
     
     # Cross Weight
+    # DEFENSIVE: Apply mask_valid_cross. If masked, w_cross becomes 0.0.
     w_cross = tl.load(w_base[:, None] + ((1 + offs_lvl[None, :]) * sw_lvl), 
                       mask=mask_h[:, None] & mask_valid_cross[None, :], other=0.0)
 
@@ -234,12 +219,12 @@ def hierarchical_attention_backward_dS_kernel(
     dp_self = tl.zeros([BLOCK_H], dtype=tl.float32)
     dp_cross = tl.zeros([BLOCK_H, BLOCK_LEVELS], dtype=tl.float32)
 
+    # Use explicit SV strides for V pointer calculation
     v_batch_base = V_ptr + b_idx * sv_b
     do_batch_base = DO_ptr + (b_idx * sdo_b) + (node_idx * sdo_n)
     
     off_node_self = node_idx * sv_n
-    # [FIX] Safe Cross Offset
-    off_node_cross = safe_indices * sv_n
+    off_node_cross = neighbor_indices * sv_n
 
     for off_d in range(0, D, BLOCK_D):
         offs_d = off_d + tl.arange(0, BLOCK_D)
@@ -250,15 +235,16 @@ def hierarchical_attention_backward_dS_kernel(
         do = tl.load(do_batch_base + (h_idx[:, None]*sdo_h) + (offs_d[None, :]*sdo_d), 
                      mask=mask_op, other=0.0)
         
-        # Load V Self
+        # Load V Self (using sv strides)
         ptr_v_self = v_batch_base + off_node_self + (h_idx[:, None]*sv_h) + (offs_d[None, :]*sv_d)
         v_self = tl.load(ptr_v_self, mask=mask_op, other=0.0)
         
-        # Load V Cross
-        # [FIX] Use Safe Indices and Mask
+        # Load V Cross (using sv strides)
         ptr_v_cross = v_batch_base + off_node_cross[None, :, None] + \
                       (h_idx[:, None, None]*sv_h) + (offs_d[None, None, :]*sv_d)
         
+        # DEFENSIVE: Apply mask_valid_cross to V load.
+        # This prevents loading 'NaNs' or garbage from padding tokens.
         mask_v_cross = mask_h[:, None, None] & mask_valid_cross[None, :, None] & mask_d[None, None, :]
         v_cross = tl.load(ptr_v_cross, mask=mask_v_cross, other=0.0)
 
@@ -282,14 +268,20 @@ def hierarchical_attention_backward_dS_kernel(
     
     ds_cross_ptr = ds_base[:, None] + ((1 + offs_lvl[None, :]) * sds_lvl)
     
-    # SAFE STORE: We store 0s to invalid slots to clean up memory
+    # SAFE STORE: We use mask_lvl_bounds (bounds only), NOT mask_valid_cross.
+    # Why? If a node is masked, ds_cross is 0.0 (because w_cross was 0.0).
+    # We WANT to write this 0.0 to memory to overwrite any garbage in uninitialized DS.
+    # If we masked the store, DS would retain random values from empty_like().
     tl.store(ds_cross_ptr, ds_cross, mask=mask_h[:, None] & mask_lvl_bounds[None, :])
 
 
-# ==================================================================
-#  BACKWARD KERNEL 2a: SPECIALIZED LEAF KERNEL (Level 0)
-#  (Unchanged logic, just context preserved)
-# ==================================================================
+# ------------------------------------------------------------------
+#  Backward Kernel 2a: SPECIALIZED LEAF KERNEL (Level 0)
+# ------------------------------------------------------------------
+# Hardcoded for Level 0: 
+# - Self Interaction
+# - Single Neighbor Gather (Width=1)
+# - No Loops, No Branching overhead
 @triton.jit
 def hierarchical_attention_backward_dK_dV_leaf_kernel(
     DS_ptr, Q_ptr, W_ptr, DO_ptr, Gather_Table_ptr,
@@ -308,6 +300,12 @@ def hierarchical_attention_backward_dK_dV_leaf_kernel(
 
     offs_h = tl.arange(0, BLOCK_H)
     mask_h = offs_h < H
+
+    # -----------------------------------------------------------
+    # 1. Pre-Load DS and W (Invariant across D)
+    # -----------------------------------------------------------
+    # These are scalars per head, so we can load them once and reuse them
+    # for every chunk of D. This saves significant memory bandwidth.
 
     # --- Self Pointers ---
     off_ds = (b_idx * sds_b) + (node_id * sds_n)
@@ -333,11 +331,13 @@ def hierarchical_attention_backward_dK_dV_leaf_kernel(
         w_sib = tl.load(W_ptr + off_w_sib + (offs_h[:, None] * sw_h), mask=mask_h[:, None], other=0.0)
 
     # -----------------------------------------------------------
-    # 2. Loop over Dimension D
+    # 2. Loop over Dimension D (The Fix)
     # -----------------------------------------------------------
+    # We process D in chunks of BLOCK_D.
     off_q = (b_idx * sq_b) + (node_id * sq_n)
     off_do = (b_idx * sdo_b) + (node_id * sdo_n)
     
+    # Sibling Q/dO Base Pointers
     off_q_sib = (b_idx * sq_b) + (sibling_leaf * sq_n)
     off_do_sib = (b_idx * sdo_b) + (sibling_leaf * sdo_n)
 
@@ -350,6 +350,7 @@ def hierarchical_attention_backward_dK_dV_leaf_kernel(
         q_self = tl.load(Q_ptr + off_q + (offs_h[:, None] * sq_h) + (offs_d[None, :] * sq_d), mask=mask_op, other=0.0)
         do_self = tl.load(DO_ptr + off_do + (offs_h[:, None] * sdo_h) + (offs_d[None, :] * sdo_d), mask=mask_op, other=0.0)
         
+        # dK = dS * Q | dV = W * dO
         dk_acc = ds_self * q_self
         dv_acc = w_self * do_self
 
@@ -358,6 +359,8 @@ def hierarchical_attention_backward_dK_dV_leaf_kernel(
             q_sib = tl.load(Q_ptr + off_q_sib + (offs_h[:, None] * sq_h) + (offs_d[None, :] * sq_d), mask=mask_op, other=0.0)
             do_sib = tl.load(DO_ptr + off_do_sib + (offs_h[:, None] * sdo_h) + (offs_d[None, :] * sdo_d), mask=mask_op, other=0.0)
             
+            #dk_acc += ds_sib * q_sib
+            #dv_acc += w_sib * do_sib
             dk_acc += ds_sib * q_sib
             dv_acc += w_sib * do_sib
 
@@ -366,16 +369,23 @@ def hierarchical_attention_backward_dK_dV_leaf_kernel(
         tl.store(DK_ptr + off_out + (offs_h[:, None] * sdk_h) + (offs_d[None, :] * sdk_d), dk_acc, mask=mask_op)
         tl.store(DV_ptr + off_out + (offs_h[:, None] * sdk_h) + (offs_d[None, :] * sdk_d), dv_acc, mask=mask_op)
 
+
+# ------------------------------------------------------------------
+#  Backward Kernel 2b: Low Level Parents
+# ------------------------------------------------------------------
 @triton.jit
 def hierarchical_attention_backward_low_level_kernel(
+    # Inputs
     DS_ptr, Q_ptr, W_ptr, DO_ptr, Gather_Table_ptr,
     DK_ptr, DV_ptr,
+    # Strides
     sds_b, sds_n, sds_h, sds_lvl,
     sq_b, sq_n, sq_h, sq_d,
     sw_b, sw_n, sw_h, sw_lvl,
     sdo_b, sdo_n, sdo_h, sdo_d,
     sdk_b, sdk_node, sdk_h, sdk_d,
     sg_node, sg_dim,
+    # Constants
     H: tl.constexpr, BLOCK_H: tl.constexpr,
     D: tl.constexpr, BLOCK_D: tl.constexpr,
     N: tl.constexpr,
@@ -384,25 +394,61 @@ def hierarchical_attention_backward_low_level_kernel(
     pid = tl.program_id(0)
     b_idx = tl.program_id(1)
 
+    # ------------------------------------------------------------------
+    # 1. OPTIMIZED GEOMETRIC LOOP (Fully Unrolled & Constant Folded)
+    # ------------------------------------------------------------------
+    # Pre-calculate the constant shift for Node ID.
+    # Mathematical Fact: (current_node_offset - current_block_offset) is ALWAYS == N.
+    # Therefore, node_id is ALWAYS (N + pid) regardless of the level.
+    # This removes 2 additions from inside the loop.
     node_id = N + pid
+    
+    # Use static_range to ensure the compiler unrolls this loop 100%.
+    # Each iteration becomes a standalone block of PTX code.
     target_level = 0
+    
+    # We maintain the 'if' structure because it allows for "Early Exit".
+    # (Threads that match Level 1 don't need to do work for Level 2).
+    # We use a 'found' flag to prevent overwriting if we continue checking.
     found = 0
     
     for lvl in tl.static_range(1, MAX_LEVEL + 1):
+        # 1. Calculate Bounds CONSTANTLY (No accumulation dependency)
+        # Level starts at: N - N/(2^(L-1))
+        # Level ends at:   N - N/(2^L)
+        # Since N and lvl are constants, Triton calculates these at compile time.
+        
+        # e.g. Level 1: Start=0, End=N/2
+        # e.g. Level 2: Start=N/2, End=3N/4
         lvl_start = N - (N >> (lvl - 1))
         lvl_end   = N - (N >> lvl)
         
+        # 2. Check (Pure Comparison, No Arithmetic)
+        # We check 'if not found' first to simulate an 'else-if' chain efficiently
         if found == 0:
+            # We only need to check the upper bound 'lvl_end' 
+            # because the lower bound is implicitly handled by the previous iteration's failure
+            # (or it's 0 for the first level).
             if pid < lvl_end:
                 target_level = lvl
+                # We already calculated node_id = N + pid outside!
                 found = 1
 
-    # Gather Logic
+    # ------------------------------------------------------------------
+    # 2. GATHER LOGIC (With Early Stop)
+    # ------------------------------------------------------------------  
+    # Gather Table Lookup
     tab_ptr = Gather_Table_ptr + (node_id * sg_node)
     child_start_base = tl.load(tab_ptr + 0)
 
+    # [OPTIMIZATION] EARLY STOP
+    # If this node has no children, we are done. 
+    # Since dK and dV are initialized to 0.0 by torch.zeros_like(), 
+    # we don't need to write anything.
     if child_start_base == -1:
         return
+
+    # --- Everything below is SKIPPED for leaf/invalid nodes ---
 
     num_children = 1 << target_level
     w_idx = target_level + 1
@@ -425,6 +471,7 @@ def hierarchical_attention_backward_low_level_kernel(
         dk_acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
         dv_acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
 
+        # We already checked has_children above, so we know it's True here
         off_hq_d  = (offs_h[:, None] * sq_h)  + (offs_d[None, :] * sq_d)
         off_hdo_d = (offs_h[:, None] * sdo_h) + (offs_d[None, :] * sdo_d)
 
@@ -441,24 +488,34 @@ def hierarchical_attention_backward_low_level_kernel(
             q  = tl.load(ptr_q,  mask=mask_op, other=0.0)
             do = tl.load(ptr_do, mask=mask_op, other=0.0)
             
+            #dk_acc += ds * q
+            #dv_acc += w * do
             dk_acc += ds * q.to(tl.float32)
             dv_acc += w * do.to(tl.float32)
 
+        # Store Result
         ptr_dk = DK_ptr + off_out_base + (offs_d[None, :] * sdk_d)
         ptr_dv = DV_ptr + off_out_base + (offs_d[None, :] * sdk_d)
         tl.store(ptr_dk, dk_acc, mask=mask_op)
         tl.store(ptr_dv, dv_acc, mask=mask_op)
 
+
+# ------------------------------------------------------------------
+#  Backward Kernel 2b: High Level Parents
+# ------------------------------------------------------------------
 @triton.jit
 def hierarchical_attention_backward_high_level_kernel(
+    # Inputs
     DS_ptr, Q_ptr, W_ptr, DO_ptr, Gather_Table_ptr,
     DK_ptr, DV_ptr,
+    # Strides
     sds_b, sds_n, sds_h, sds_lvl,
     sq_b, sq_n, sq_h, sq_d,
     sw_b, sw_n, sw_h, sw_lvl,
     sdo_b, sdo_n, sdo_h, sdo_d,
     sdk_b, sdk_node, sdk_h, sdk_d,
     sg_node, sg_dim,
+    # Constants
     H: tl.constexpr, BLOCK_H: tl.constexpr,
     D: tl.constexpr, BLOCK_D: tl.constexpr,
     N: tl.constexpr,
@@ -467,32 +524,71 @@ def hierarchical_attention_backward_high_level_kernel(
     pid = tl.program_id(0)
     b_idx = tl.program_id(1)
 
+    # ------------------------------------------------------------------
+    # 1. BITWISE PID DECODING (Extreme Optimization)
+    # ------------------------------------------------------------------
+    # Constants derived from N and START_LEVEL
+    # SHIFT_GRID = log2(BLOCKS_PER_LVL) = log2(N) - (START_LEVEL - 1)
+    # Note: We rely on the compiler to fold these constants.
+    
+    # Blocks Per Level = N / 2^(START_LEVEL - 1)
     BLOCKS_PER_LVL: tl.constexpr = N >> (START_LEVEL - 1)
     BLOCK_MASK: tl.constexpr = BLOCKS_PER_LVL - 1
+    
+    # 1. Which Level? (Integer Div -> Right Shift?)
+    # Since BLOCKS_PER_LVL is power of 2, 'pid // BLOCKS' is a Shift.
+    # However, 'pid' is dynamic, so we can just use integer div, 
+    # Triton/LLVM optimizes 'div by power-of-2' into a shift automatically.
+    # But for 'rem', using AND is explicitly cleaner.
     
     lvl_offset = pid // BLOCKS_PER_LVL
     target_level = START_LEVEL + lvl_offset
     
+    # 2. Relative Index (Modulo -> Bitwise AND)
     rem = pid & BLOCK_MASK
+    
+    # 3. Calculate Split-K Parameters
+    # shift_val = L - (START_LEVEL - 1)
     shift_val = target_level - (START_LEVEL - 1)
+    
+    # split_k = 1 << shift_val. 
+    # split_k_mask = split_k - 1 = (1 << shift_val) - 1.
     split_k_mask = (1 << shift_val) - 1
     
-    node_local = rem >> shift_val
-    split_id   = rem & split_k_mask
+    # 4. Decode Node vs Split (Bitwise)
+    node_local = rem >> shift_val           # Division by split_k
+    split_id   = rem & split_k_mask         # Modulo split_k
     
+    # 5. Global Node ID
     start_node_global = (2 * N) - (N >> (target_level - 1))
     node_id = start_node_global + node_local
 
+    # ------------------------------------------------------------------
+    # 2. EARLY EXIT (The Optimization)
+    # ------------------------------------------------------------------
+    # Load Table Entry FIRST.
     tab_ptr = Gather_Table_ptr + (node_id * sg_node)
     child_start_base = tl.load(tab_ptr + 0)
     
+    # If -1, this node is empty. Exit immediately.
+    # This prevents all subsequent math, pointer arithmetic, and atomic locking.
     if child_start_base == -1:
         return
 
+    # ------------------------------------------------------------------
+    # 3. CONSTANT LOOP SETUP
+    # ------------------------------------------------------------------
+    # Only reached if node has children.
+    
+    # Ratio = 2^L / 2^(L - (START-1)) = 2^(START-1)
     CHILDREN_PER_SPLIT: tl.constexpr = 1 << (START_LEVEL - 1)
+    
     w_idx = target_level + 1
+    
+    # Start K
     start_k = split_id * CHILDREN_PER_SPLIT
 
+    # Base Pointers (Hoisted)
     offs_h = tl.arange(0, BLOCK_H)
     mask_h = offs_h < H
     off_out_base = (b_idx * sdk_b) + (node_id * sdk_node) + (offs_h[:, None] * sdk_h)
@@ -502,6 +598,9 @@ def hierarchical_attention_backward_high_level_kernel(
     ptr_q_base  = Q_ptr  + (b_idx * sq_b)
     ptr_do_base = DO_ptr + (b_idx * sdo_b)
 
+    # ------------------------------------------------------------------
+    # 4. MAIN LOOP
+    # ------------------------------------------------------------------
     for off_d_start in range(0, D, BLOCK_D):
         offs_d = off_d_start + tl.arange(0, BLOCK_D)
         mask_d = offs_d < D
@@ -510,16 +609,22 @@ def hierarchical_attention_backward_high_level_kernel(
         dk_acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
         dv_acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
 
+        # Note: We don't need 'if has_children' check here because 
+        # we would have returned above if it was False.
         off_hq_d  = (offs_h[:, None] * sq_h)  + (offs_d[None, :] * sq_d)
         off_hdo_d = (offs_h[:, None] * sdo_h) + (offs_d[None, :] * sdo_d)
 
+        # Constant Unrolled Loop
         for k_offset in range(CHILDREN_PER_SPLIT):
+            # Calculate offsets (Pure ALU, no branches)
             k = start_k + k_offset
             child_idx = child_start_base + k
             
+            # Pointers
             ptr_ds = ptr_ds_base + (child_idx * sds_n) + (offs_h * sds_h)
             ptr_w  = ptr_w_base  + (child_idx * sw_n)  + (offs_h * sw_h)
             
+            # Load
             ds = tl.load(ptr_ds, mask=mask_h, other=0.0)[:, None]
             w  = tl.load(ptr_w,  mask=mask_h, other=0.0)[:, None]
             
@@ -529,13 +634,19 @@ def hierarchical_attention_backward_high_level_kernel(
             q  = tl.load(ptr_q,  mask=mask_op, other=0.0)
             do = tl.load(ptr_do, mask=mask_op, other=0.0)
             
+            # FMA
+            #dk_acc += ds * q
+            #dv_acc += w * do
             dk_acc += ds * q.to(tl.float32)
             dv_acc += w * do.to(tl.float32)
 
+        # [ATOMIC STORE] 
+        # We only reach here if children exist, so we never atomic_add to empty nodes.
         ptr_dk = DK_ptr + off_out_base + (offs_d[None, :] * sdk_d)
         ptr_dv = DV_ptr + off_out_base + (offs_d[None, :] * sdk_d)
         tl.atomic_add(ptr_dk, dk_acc, mask=mask_op)
         tl.atomic_add(ptr_dv, dv_acc, mask=mask_op)
+
 
 # ------------------------------------------------------------------
 #  Backward Kernel 3: Compute dQ (Small Kernel)
@@ -562,15 +673,21 @@ def hierarchical_attention_backward_dQ_kernel(
     # -----------------------------------------------------------
     # 1. Pre-calculate Base Pointers
     # -----------------------------------------------------------
+    # DS Base: [Node, Head]
     ds_base = DS_ptr + (b_idx * sds_b) + (node_idx * sds_n) + (h_idx * sds_h)
+    
+    # DQ Base: [Node, Head]
     dq_base = DQ_ptr + (b_idx * sdq_b) + (node_idx * sdq_n) + (h_idx[:, None] * sdq_h)
+
+    # K Batch Base: [Batch]
     k_batch_base = K_ptr + b_idx * sk_b
 
-    # Pre-load Self DS
+    # Pre-load Self DS (reused across D loop)
+    # Shape: [BLOCK_H]
     ds_self = tl.load(ds_base + (0 * sds_lvl), mask=mask_h, other=0.0)
 
     # -----------------------------------------------------------
-    # 2. Outer Loop over D
+    # 2. Outer Loop over D (Chunked for Registers)
     # -----------------------------------------------------------
     for off_d_start in range(0, D, BLOCK_D):
         offs_d = off_d_start + tl.arange(0, BLOCK_D)
@@ -580,50 +697,63 @@ def hierarchical_attention_backward_dQ_kernel(
         # -------------------------------------------------------
         # A. Process Self (Level 0)
         # -------------------------------------------------------
+        # K Self Pointer: [Node, Head, D_Chunk]
         off_k_self = (node_idx * sk_n) + \
                      (h_idx[:, None] * sk_h) + \
                      (offs_d[None, :] * sk_d)
                      
         k_self = tl.load(k_batch_base + off_k_self, mask=mask_op, other=0.0)
 
+        # Init Accumulator (FP32 for Precision)
+        # dQ = dS_self * K_self
         dq_acc = ds_self[:, None].to(tl.float32) * k_self.to(tl.float32)
 
         # -------------------------------------------------------
-        # B. Inner Loop over Levels
+        # B. Inner Loop over Levels (The Optimization)
         # -------------------------------------------------------
         for lvl_idx in range(LEVELS):
             # 1. Load Topology for this level
             off_lookup = node_idx * sl_n + lvl_idx * sl_lvl
             
+            # Since 'node_idx' and 'lvl_idx' are valid, no mask needed for lookup
             p_idx = tl.load(Lookup_ptr + off_lookup)
 
-            # 2. Check Validity [FIX] Check for -1
+            # 2. Check Validity (Mask + Topology)
             is_valid = (p_idx != -1)
             if HAS_MASK:
                 mask_val = tl.load(Mask_ptr + off_lookup).to(tl.int8)
                 is_valid = is_valid & (mask_val == 0)
 
             # 3. Load dS for this level [BLOCK_H]
+            # Offset: (lvl + 1) because level 0 is Self
             ds_ptr_lvl = ds_base + ((lvl_idx + 1) * sds_lvl)
+            
+            # Mask logic: Head must be valid AND Edge must be valid
             mask_load = mask_h & is_valid
+            
             ds_cross = tl.load(ds_ptr_lvl, mask=mask_load, other=0.0)
 
             # 4. Load K for this Parent [BLOCK_H, BLOCK_D]
-            # [FIX] Safe Parent Index (redirect invalid to 0)
+            # Safe Parent Index (redirect invalid to 0)
             safe_p_idx = tl.where(is_valid, p_idx, 0)
             
+            # Pointer: [Parent_Node, Head, D_Chunk]
             off_k_cross = (safe_p_idx * sk_n) + \
                           (h_idx[:, None] * sk_h) + \
                           (offs_d[None, :] * sk_d)
             
+            # Mask logic for K: (Head & Valid_Edge & Dim)
             mask_k = mask_load[:, None] & mask_d[None, :]
+            
             k_cross = tl.load(k_batch_base + off_k_cross, mask=mask_k, other=0.0)
 
-            # 5. Accumulate
+            # 5. Accumulate (FP32)
+            # dq += dS_cross * K_cross
             dq_acc += ds_cross[:, None].to(tl.float32) * k_cross.to(tl.float32)
 
         # -------------------------------------------------------
         # C. Write Result
         # -------------------------------------------------------
+        # Cast back to original dtype
         off_dq_out = offs_d[None, :] * sdq_d
         tl.store(dq_base + off_dq_out, dq_acc.to(DQ_ptr.dtype.element_ty), mask=mask_op)
