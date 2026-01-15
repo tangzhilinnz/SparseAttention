@@ -10,7 +10,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 # ==========================================
 # NEW LIBRARY IMPORT
 # ==========================================
-from hierarchical_attn import HierarchicalAttention
+from hierarchical_attention import HierarchicalAttention
 
 import datasets
 # Essential PyTorch imports
