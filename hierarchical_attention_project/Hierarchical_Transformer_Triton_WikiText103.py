@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 
+import sys
 import os
 # ==========================================
 # CRITICAL FIX: GPU SELECTION MUST BE FIRST
