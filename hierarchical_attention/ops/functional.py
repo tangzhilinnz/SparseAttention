@@ -28,8 +28,12 @@ def get_cutoff_level(N: int) -> int:
 class BuildParentNodesFunc(torch.autograd.Function):
     @staticmethod
     def forward(ctx, Q_p, K_p, V_p, K_c, V_c):
-         Q_p = Q_p.contiguous(); K_p = K_p.contiguous(); V_p = V_p.contiguous()
-        K_c = K_c.contiguous(); V_c = V_c.contiguous()
+        # Enforce contiguity
+        Q_p = Q_p.contiguous()
+        K_p = K_p.contiguous()
+        V_p = V_p.contiguous()
+        K_c = K_c.contiguous()
+        V_c = V_c.contiguous()
         
         B, P, H, D = Q_p.shape
         assert K_c.shape[1] == 2 * P, "Child count mismatch"
