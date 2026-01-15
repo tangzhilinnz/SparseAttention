@@ -1131,9 +1131,13 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         )
     
         # --- SETUP PARALLELISM ---
-        dK = torch.zeros_like(K)
-        dV = torch.zeros_like(V)
-        dQ = torch.zeros_like(Q)
+        #dK = torch.zeros_like(K)
+        #dV = torch.zeros_like(V)
+        #dQ = torch.zeros_like(Q)
+
+        dK = torch.zeros_like(K, dtype=torch.float32)
+        dV = torch.zeros_like(V, dtype=torch.float32)
+        dQ = torch.empty_like(Q, dtype=torch.float32)
     
         # --- BRANCH 2: dK/dV (Dependent on dS) ---
         
