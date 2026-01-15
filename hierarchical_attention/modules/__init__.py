@@ -1,3 +1,3 @@
-from .attention import HierarchicalSparseAttention
+from .attention import HierarchicalAttention
 
 __all__ = ["HierarchicalAttention"]
