@@ -165,7 +165,7 @@ test_dataset = WikiTextDataset(test_texts, vocab_builder, max_len=MAX_LEN)
 
 # Create dataloaders
 # HYPERPARAMETER: batch_size
-batch_size = 64
+batch_size = 16
 # CHANGED: shuffle=False (Point 3: Maintain continuity)
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, drop_last=True)
 valid_loader = DataLoader(valid_dataset, batch_size=batch_size, drop_last=True)
