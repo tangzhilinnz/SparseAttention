@@ -1069,7 +1069,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         B, N, H, D = Q.shape
         LEVELS = idx_table.shape[1]
         
-        Out = torch.empty_like(Q)
+        Out = torch.zeros_like(Q)
         
         # Save weights for backward: [B, N, H, 1 + LEVELS]
         Weights = torch.zeros((B, N, H, 1 + LEVELS), device=Q.device, dtype=torch.float32)
