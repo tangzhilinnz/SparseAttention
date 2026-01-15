@@ -231,7 +231,7 @@ class BuildParentNodesFunc(torch.autograd.Function):
         assert K_c.shape[1] == 2 * P, "Child count mismatch"
         
         Out = torch.empty_like(Q_p)
-        Weights = torch.empty((B, P, H, 3), device=Q_p.device, dtype=Q_p.dtype)
+        Weights = torch.zeros((B, P, H, 3), device=Q_p.device, dtype=Q_p.dtype)
         
         grid = (P, B)
         BLOCK_H = triton.next_power_of_2(H)
@@ -1072,7 +1072,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         Out = torch.empty_like(Q)
         
         # Save weights for backward: [B, N, H, 1 + LEVELS]
-        Weights = torch.empty((B, N, H, 1 + LEVELS), device=Q.device, dtype=torch.float32)
+        Weights = torch.zeros((B, N, H, 1 + LEVELS), device=Q.device, dtype=torch.float32)
         
         HAS_MASK = (mask_table is not None)
         mask_ptr_safe = mask_table if HAS_MASK else Q # Dummy ptr
