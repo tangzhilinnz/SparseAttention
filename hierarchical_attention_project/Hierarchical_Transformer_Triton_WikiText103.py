@@ -32,7 +32,7 @@ print(f"Checking for library: {os.path.join(parent_dir, 'hierarchical_attention'
 # 4. Now import using the class name you requested
 # Folder: hierarchical_attention
 # Class:  HierarchicalAttention
-from hierarchical_attention import HierarchicalAttention
+from hierarchical_attention import HierarchicalAttention, generate_span_input_Y
 
 
 import datasets
@@ -327,9 +327,7 @@ class TransformerLM(nn.Module):
         x = self.embedding(trg) * math.sqrt(self.d_model)
         x = self.pos_encoding(x)
 
-        # Initialize Y from the embeddings using the static method
-        # [MODIFIED] Use HierarchicalAttention static method
-        y = HierarchicalAttention.generate_span_input_Y(x)
+        y = generate_span_input_Y(x)
         
         trg_mask = self.make_causal_mask(trg)
 
