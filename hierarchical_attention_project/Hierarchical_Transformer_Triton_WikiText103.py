@@ -10,7 +10,29 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 # ==========================================
 # NEW LIBRARY IMPORT
 # ==========================================
+# 1. Get the folder where this script lives
+# (.../hierarchical_attention_project)
+script_dir = os.path.dirname(os.path.abspath(__file__))
+
+# 2. Get the PARENT folder
+# (.../workspace/SparseAttention)
+parent_dir = os.path.dirname(script_dir)
+
+# 3. Add the PARENT folder to Python's search path
+# This allows Python to "see" the neighbor folder 'hierarchical_attention'
+if parent_dir not in sys.path:
+    sys.path.append(parent_dir)
+
+# Debug: Prove we can see it
+print(f"Script location: {script_dir}")
+print(f"Parent location: {parent_dir}")
+print(f"Checking for library: {os.path.join(parent_dir, 'hierarchical_attention')}")
+
+# 4. Now import using the class name you requested
+# Folder: hierarchical_attention
+# Class:  HierarchicalAttention
 from hierarchical_attention import HierarchicalAttention
+
 
 import datasets
 # Essential PyTorch imports
