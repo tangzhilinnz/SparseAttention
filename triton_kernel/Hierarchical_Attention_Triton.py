@@ -576,10 +576,10 @@ def hierarchical_attention_backward_dS_kernel(
         mask_v_cross = mask_h[:, None, None] & mask_valid_cross[None, :, None] & mask_d[None, None, :]
         v_cross = tl.load(ptr_v_cross, mask=mask_v_cross, other=0.0)
 
-        dp_self += tl.sum(do * v_self, axis=1)
-        dp_cross += tl.sum(do[:, None, :] * v_cross, axis=2)
+        # [FIX] Cast to FP32 before multiplication to avoid FP16 precision loss
+        dp_self += tl.sum(do.to(tl.float32) * v_self.to(tl.float32), axis=1)
+        dp_cross += tl.sum(do[:, None, :].to(tl.float32) * v_cross.to(tl.float32), axis=2)
 
-    # -----------------------------------------------------------
     # 4. Compute dS (Softmax Gradient)
     # -----------------------------------------------------------
     sum_wdp = (w_self * dp_self) + tl.sum(w_cross * dp_cross, axis=1)
@@ -679,18 +679,18 @@ def hierarchical_attention_backward_dK_dV_leaf_kernel(
         do_self = tl.load(DO_ptr + off_do + (offs_h[:, None] * sdo_h) + (offs_d[None, :] * sdo_d), mask=mask_op, other=0.0)
         
         # dK = dS * Q | dV = W * dO
-        dk_acc = ds_self * q_self
-        dv_acc = w_self * do_self
+        # [FIX] Cast to FP32
+        dk_acc = ds_self.to(tl.float32) * q_self.to(tl.float32)
+        dv_acc = w_self.to(tl.float32) * do_self.to(tl.float32)
 
         # --- Sibling Computation ---
         if has_sibling:
             q_sib = tl.load(Q_ptr + off_q_sib + (offs_h[:, None] * sq_h) + (offs_d[None, :] * sq_d), mask=mask_op, other=0.0)
             do_sib = tl.load(DO_ptr + off_do_sib + (offs_h[:, None] * sdo_h) + (offs_d[None, :] * sdo_d), mask=mask_op, other=0.0)
             
-            #dk_acc += ds_sib * q_sib
-            #dv_acc += w_sib * do_sib
-            dk_acc += ds_sib * q_sib
-            dv_acc += w_sib * do_sib
+            # [FIX] Cast to FP32
+            dk_acc += ds_sib.to(tl.float32) * q_sib.to(tl.float32)
+            dv_acc += w_sib.to(tl.float32) * do_sib.to(tl.float32)
 
 
         # --- Store Chunk ---
