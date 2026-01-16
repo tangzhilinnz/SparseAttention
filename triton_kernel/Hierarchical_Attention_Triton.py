@@ -692,6 +692,7 @@ def hierarchical_attention_backward_low_level_kernel(
     sdo_b, sdo_n, sdo_h, sdo_d,
     sdk_b, sdk_node, sdk_h, sdk_d,
     sg_node, sg_dim,
+    sm_scale, # [FIX] Add Scaling Factor
     # Constants
     H: tl.constexpr, BLOCK_H: tl.constexpr,
     D: tl.constexpr, BLOCK_D: tl.constexpr,
@@ -803,6 +804,10 @@ def hierarchical_attention_backward_low_level_kernel(
         # Store Result
         ptr_dk = DK_ptr + off_out_base + (offs_d[None, :] * sdk_d)
         ptr_dv = DV_ptr + off_out_base + (offs_d[None, :] * sdk_d)
+        
+        # [FIX] Apply Scaling Factor
+        dk_acc = dk_acc * sm_scale
+        
         tl.store(ptr_dk, dk_acc, mask=mask_op)
         tl.store(ptr_dv, dv_acc, mask=mask_op)
 
@@ -822,6 +827,7 @@ def hierarchical_attention_backward_high_level_kernel(
     sdo_b, sdo_n, sdo_h, sdo_d,
     sdk_b, sdk_node, sdk_h, sdk_d,
     sg_node, sg_dim,
+    sm_scale, # [FIX] Add Scaling Factor
     # Constants
     H: tl.constexpr, BLOCK_H: tl.constexpr,
     D: tl.constexpr, BLOCK_D: tl.constexpr,
@@ -951,6 +957,10 @@ def hierarchical_attention_backward_high_level_kernel(
         # We only reach here if children exist, so we never atomic_add to empty nodes.
         ptr_dk = DK_ptr + off_out_base + (offs_d[None, :] * sdk_d)
         ptr_dv = DV_ptr + off_out_base + (offs_d[None, :] * sdk_d)
+        
+        # [FIX] Apply Scaling Factor
+        dk_acc = dk_acc * sm_scale
+        
         tl.atomic_add(ptr_dk, dk_acc, mask=mask_op)
         tl.atomic_add(ptr_dv, dv_acc, mask=mask_op)
 
@@ -1197,7 +1207,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         sm_scale = 1.0 / math.sqrt(D)
         
         # FIXED: Added 'tri_attn.' prefix
-        tri_attn.hierarchical_attention_forward_kernel[grid](
+        hierarchical_attention_forward_kernel[grid](
             Q, K, V,
             idx_table, mask_ptr_safe,
             Out, Weights,
@@ -1237,8 +1247,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         HAS_MASK = (mask_table is not None)
         mask_ptr_safe = mask_table if HAS_MASK else Weights
         
-        # FIXED: Added 'tri_attn.' prefix
-        tri_attn.hierarchical_attention_backward_dS_kernel[grid_ds](
+        hierarchical_attention_backward_dS_kernel[grid_ds](
             grad_output_4d, Weights, V, idx_table, DS, mask_ptr_safe,
             *grad_output_4d.stride(), *Weights.stride(), *V.stride(), 
             *idx_table.stride(), *DS.stride(),            
@@ -1255,8 +1264,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         
         # Step A: Leaf Kernel (Level 0)
         grid_leaf = (N, B)
-        # FIXED: Added 'tri_attn.' prefix
-        tri_attn.hierarchical_attention_backward_dK_dV_leaf_kernel[grid_leaf](
+        hierarchical_attention_backward_dK_dV_leaf_kernel[grid_leaf](
             DS, Q, Weights, grad_output_4d, gather_table,
             dK, dV,
             *DS.stride(), *Q.stride(), *Weights.stride(), 
@@ -1275,12 +1283,12 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             
             grid_low = (total_blocks_low, B)
             
-            # FIXED: Added 'tri_attn.' prefix
-            tri_attn.hierarchical_attention_backward_low_level_kernel[grid_low](
+            hierarchical_attention_backward_low_level_kernel[grid_low](
                 DS, Q, Weights, grad_output_4d, gather_table,
                 dK, dV,
                 *DS.stride(), *Q.stride(), *Weights.stride(),
                 *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
+                sm_scale, # [FIX] Pass Scaling Factor
                 H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
                 N=N, 
                 MAX_LEVEL=limit, 
@@ -1300,12 +1308,12 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             
             grid_high = (total_blocks_high, B)
             
-            # FIXED: Added 'tri_attn.' prefix
-            tri_attn.hierarchical_attention_backward_high_level_kernel[grid_high](
+            hierarchical_attention_backward_high_level_kernel[grid_high](
                 DS, Q, Weights, grad_output_4d, gather_table,
                 dK, dV,
                 *DS.stride(), *Q.stride(), *Weights.stride(),
                 *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
+                sm_scale, # [FIX] Pass Scaling Factor
                 H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
                 N=N,
                 START_LEVEL=CUTOFF_LEVEL + 1,
@@ -1314,8 +1322,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
 
         # --- BRANCH 1: dQ (Independent) ---
         grid_dq = (N, B)
-        # FIXED: Added 'tri_attn.' prefix
-        tri_attn.hierarchical_attention_backward_dQ_kernel[grid_dq](
+        hierarchical_attention_backward_dQ_kernel[grid_dq](
             DS, K, idx_table, dQ, mask_ptr_safe,
             *DS.stride(), *K.stride(), *idx_table.stride(), *dQ.stride(),
             H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=32, LEVELS=LEVELS,
