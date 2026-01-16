@@ -990,8 +990,13 @@ def hierarchical_attention_backward_high_level_kernel(
         # atomic_add is unnecessary and potentially problematic (e.g. accumulation precision).
         ptr_dk = DK_ptr + off_out_base + (offs_d[None, :] * sdk_d)
         ptr_dv = DV_ptr + off_out_base + (offs_d[None, :] * sdk_d)
-        tl.atomic_add(ptr_dk, dk_acc, mask=mask_op)
-        tl.atomic_add(ptr_dv, dv_acc, mask=mask_op)
+        
+        # [FIX] Apply Scaling Factor
+        dk_acc = dk_acc * sm_scale
+        
+        # [FIX] use store (exclusive ownership)
+        tl.store(ptr_dk, dk_acc, mask=mask_op)
+        tl.store(ptr_dv, dv_acc, mask=mask_op)
 
 # ------------------------------------------------------------------
 #  Backward Kernel 3: Compute dQ (Small Kernel)
