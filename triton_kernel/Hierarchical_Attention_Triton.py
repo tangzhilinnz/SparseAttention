@@ -1371,7 +1371,7 @@ def build_tree_topology(seq_len, is_causal=True, device="cuda", dtype=torch.int3
 
     gather_info[valid_nodes, 0] = subtree_ranges[valid_siblings, 0].to(torch.int64)
     gather_info[valid_nodes, 1] = subtree_ranges[valid_siblings, 1].to(torch.int64)
-    gather_info[valid_nodes, 2] = node_levels[valid_nodes] # Now uses the corrected levels
+    gather_info[valid_nodes, 2] = node_levels[valid_nodes].to(torch.int64) # Now uses the corrected levels
 
 
     ## ===============================================================
