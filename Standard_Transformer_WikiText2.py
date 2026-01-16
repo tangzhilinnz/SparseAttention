@@ -134,7 +134,7 @@ vocab_builder = VocabBuilder(train_texts, max_vocab_size=35000)
 print("\n<> Creating Datasets...")
 # HYPERPARAMETER: max_len
 # INCREASED TO 512 (Point 7: Increase context length)
-MAX_LEN = 4096
+MAX_LEN = 512
 train_dataset = WikiTextDataset(train_texts, vocab_builder, max_len=MAX_LEN)
 valid_dataset = WikiTextDataset(valid_texts, vocab_builder, max_len=MAX_LEN)
 test_dataset = WikiTextDataset(test_texts, vocab_builder, max_len=MAX_LEN)
@@ -142,7 +142,7 @@ test_dataset = WikiTextDataset(test_texts, vocab_builder, max_len=MAX_LEN)
 # Create dataloaders
 # HYPERPARAMETER: batch_size
 # INCREASED TO 64 (32 per GPU)
-batch_size = 4
+batch_size = 16
 # CHANGED: shuffle=False (Point 3: Maintain continuity)
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, drop_last=True)
 valid_loader = DataLoader(valid_dataset, batch_size=batch_size, drop_last=True)
