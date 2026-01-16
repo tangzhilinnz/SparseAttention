@@ -616,7 +616,7 @@ model = model.to(device)
 print(f"Using device: {device}")
 
 # Training parameters
-num_epochs = 150     # SET HIGH as requested (auto-exit will stop it)
+num_epochs = 100     # SET HIGH as requested (auto-exit will stop it)
 learning_rate = 1e-4 # LOWERED for stability with larger model
 
 print("\n<> Starting Training...")
