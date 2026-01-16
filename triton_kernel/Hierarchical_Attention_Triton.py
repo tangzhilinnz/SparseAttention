@@ -1196,6 +1196,11 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             
             grid_low = (total_blocks_low, B)
             
+            # [DEBUG] Check Intermediate Tensor Stats
+            print(f"   [DEBUG] DS Stats: Mean {DS.float().abs().mean():.4f} | Max {DS.float().abs().max():.4f}")
+            print(f"   [DEBUG] Q Stats:  Mean {Q.float().abs().mean():.4f} | Max {Q.float().abs().max():.4f}")
+            print(f"   [DEBUG] Gather Table: Max {gather_table.max()} | Min {gather_table.min()}")
+            
             hierarchical_attention_backward_low_level_kernel[grid_low](
                 DS, Q, Weights, grad_output_4d, gather_table,
                 dK, dV,
