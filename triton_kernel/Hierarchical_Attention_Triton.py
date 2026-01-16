@@ -787,15 +787,7 @@ def hierarchical_attention_backward_low_level_kernel(
 
     # Determine Work for this PID
     # We iterate over Children (Leaves) that assume 'node_idx' is their Ancestor at 'target_level'
-    
-    # [FIX] User Logic: Level 1 Parents correspond to Level 0 Interactions.
-    # w_idx should be 'target_level' (Index 1 for Level 0 Weights).
-    w_idx = target_level # 1-based index in weights? No, matches Level.
-    
-    # Mathematical derivation:
-    # We want Weights for Level (target_level - 1). 
-    # Forward Index for Level L is (L + 1).
-    # So we want Index (target_level - 1 + 1) = target_level.
+    w_idx = target_level + 1 # 1-based index in weights (0 is self)
 
     num_children = 1 << target_level
     # w_idx = target_level + 1
