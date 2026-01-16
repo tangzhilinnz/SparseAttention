@@ -709,7 +709,7 @@ def hierarchical_attention_backward_low_level_kernel(
     sw_b, sw_n, sw_h, sw_lvl,
     sdo_b, sdo_n, sdo_h, sdo_d,
     sdk_b, sdk_node, sdk_h, sdk_d,
-    sdk_b, sdk_node, sdk_h, sdk_d,
+
     sg_node, sg_dim,
     sm_scale, # [FIX] Add Scaling Factor
     # Constants
