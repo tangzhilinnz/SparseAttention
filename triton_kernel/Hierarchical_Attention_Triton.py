@@ -837,6 +837,10 @@ def hierarchical_attention_backward_low_level_kernel(
         # Store Result
         ptr_dk = DK_ptr + off_out_base + (offs_d[None, :] * sdk_d)
         ptr_dv = DV_ptr + off_out_base + (offs_d[None, :] * sdk_d)
+        
+        # [FIX] Apply Scaling Factor
+        dk_acc = dk_acc * sm_scale
+        
         tl.store(ptr_dk, dk_acc, mask=mask_op)
         tl.store(ptr_dv, dv_acc, mask=mask_op)
 
@@ -851,7 +855,9 @@ def hierarchical_attention_backward_high_level_kernel(
     sw_b, sw_n, sw_h, sw_lvl,
     sdo_b, sdo_n, sdo_h, sdo_d,
     sdk_b, sdk_node, sdk_h, sdk_d,
+    sdk_b, sdk_node, sdk_h, sdk_d,
     sg_node, sg_dim,
+    sm_scale, # [FIX] Add Scaling Factor
     # Constants
     H: tl.constexpr, BLOCK_H: tl.constexpr,
     D: tl.constexpr, BLOCK_D: tl.constexpr,
@@ -1243,6 +1249,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
                 dK, dV,
                 *DS.stride(), *Q.stride(), *Weights.stride(),
                 *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
+                sm_scale, # [FIX] Pass Scaling Factor
                 H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
                 N=N,
                 START_LEVEL=CUTOFF_LEVEL + 1, # Start at Level 9
