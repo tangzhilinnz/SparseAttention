@@ -767,8 +767,13 @@ def hierarchical_attention_backward_low_level_kernel(
     # ------------------------------------------------------------------
     # 2. GATHER LOGIC (With Early Stop)
     # ------------------------------------------------------------------  
+    # ------------------------------------------------------------------  
     # Gather Table Lookup
-    tab_ptr = Gather_Table_ptr + (node_id * sg_node)
+    # [FIX] Explicitly treat as int64 pointer to match new table dtype
+    tab_ptr_base = Gather_Table_ptr.to(tl.pointer_type(tl.int64))
+    tab_ptr = tab_ptr_base + (node_id * sg_node)
+    
+    # [FIX] Load as int64. child_start_base is index
     child_start_base = tl.load(tab_ptr + 0)
 
     # [OPTIMIZATION] EARLY STOP
@@ -1350,7 +1355,8 @@ def build_tree_topology(seq_len, is_causal=True, device="cuda", dtype=torch.int3
     siblings = all_nodes ^ 1
     siblings = torch.clamp(siblings, max=total_nodes-1)
 
-    gather_info = torch.full((total_nodes, 3), -1, dtype=dtype, device=device)
+    # [FIX] Use int64 for valid 8-byte loads in Triton
+    gather_info = torch.full((total_nodes, 3), -1, dtype=torch.int64, device=device)
 
     if is_causal:
         should_gather = siblings > all_nodes
