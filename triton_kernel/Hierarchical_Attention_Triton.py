@@ -795,8 +795,10 @@ def hierarchical_attention_backward_low_level_kernel(
             
             #dk_acc += ds * q
             #dv_acc += w * do
-            dk_acc += ds * q.to(tl.float32)
-            dv_acc += w * do.to(tl.float32)
+            #dk_acc += ds * q.to(tl.float32)
+            #dv_acc += w * do.to(tl.float32)
+            dk_acc += ds.to(tl.float32) * q.to(tl.float32)
+            dv_acc += w.to(tl.float32) * do.to(tl.float32)
 
         # Store Result
         ptr_dk = DK_ptr + off_out_base + (offs_d[None, :] * sdk_d)
