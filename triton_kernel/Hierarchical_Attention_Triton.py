@@ -2074,12 +2074,12 @@ def run_full_suite_update_X_from_Y():
     
     print(f"Max Diff Output:   {diff_out:.8f}")
     print(f"Max Diff Grad X:   {diff_grad_x:.8f}")
-        print(f"Max Diff Grad Y:   {diff_grad_y:.8f}")
+    print(f"Max Diff Grad Y:   {diff_grad_y:.8f}")
         
-        print(f"   -> Ref Grad Y Mean: {y_ref.grad.float().abs().mean():.4f} | Max: {y_ref.grad.float().abs().max():.4f}")
-        print(f"   -> Tri Grad Y Mean: {y_tri.grad.float().abs().mean():.4f} | Max: {y_tri.grad.float().abs().max():.4f}")
+    print(f"   -> Ref Grad Y Mean: {y_ref.grad.float().abs().mean():.4f} | Max: {y_ref.grad.float().abs().max():.4f}")
+    print(f"   -> Tri Grad Y Mean: {y_tri.grad.float().abs().mean():.4f} | Max: {y_tri.grad.float().abs().max():.4f}")
         
-        # Dynamic tolerance based on dtype
+    # Dynamic tolerance based on dtype
     # FP32: stricter (e.g., 1e-4), FP16: looser (e.g., 1e-2)
     tol = 1e-3 if check_dtype == torch.float32 else 5e-2
     
