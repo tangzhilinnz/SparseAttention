@@ -1149,7 +1149,8 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         )
     
         
-        CUTOFF_LEVEL = 10
+        # [DEBUG] Increase Cutoff to force low_level_kernel (Sequential Accumulation)
+        CUTOFF_LEVEL = 30 # Was 10
         
         # --- KERNEL A: Low Levels (Split=1) ---
         if LEVELS >= 1:
