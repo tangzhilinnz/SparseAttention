@@ -158,7 +158,7 @@ vocab_builder = VocabBuilder(train_texts, max_vocab_size=35000)
 # Create datasets
 print("\n<> Creating Datasets...")
 # HYPERPARAMETER: max_len
-MAX_LEN = 256
+MAX_LEN = 512
 train_dataset = WikiTextDataset(train_texts, vocab_builder, max_len=MAX_LEN)
 valid_dataset = WikiTextDataset(valid_texts, vocab_builder, max_len=MAX_LEN)
 test_dataset = WikiTextDataset(test_texts, vocab_builder, max_len=MAX_LEN)
@@ -616,7 +616,7 @@ model = model.to(device)
 print(f"Using device: {device}")
 
 # Training parameters
-num_epochs = 100     # SET HIGH as requested (auto-exit will stop it)
+num_epochs = 150     # SET HIGH as requested (auto-exit will stop it)
 learning_rate = 1e-4 # LOWERED for stability with larger model
 
 print("\n<> Starting Training...")
