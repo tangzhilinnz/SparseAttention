@@ -946,8 +946,8 @@ def hierarchical_attention_backward_high_level_kernel(
         # atomic_add is unnecessary and potentially problematic (e.g. accumulation precision).
         ptr_dk = DK_ptr + off_out_base + (offs_d[None, :] * sdk_d)
         ptr_dv = DV_ptr + off_out_base + (offs_d[None, :] * sdk_d)
-        tl.store(ptr_dk, dk_acc, mask=mask_op)
-        tl.store(ptr_dv, dv_acc, mask=mask_op)
+        tl.atomic_add(ptr_dk, dk_acc, mask=mask_op)
+        tl.atomic_add(ptr_dv, dv_acc, mask=mask_op)
 
 # ------------------------------------------------------------------
 #  Backward Kernel 3: Compute dQ (Small Kernel)
@@ -1065,7 +1065,6 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         # Alignment checks
         Q = Q.contiguous(); K = K.contiguous(); V = V.contiguous()
         idx_table = idx_table.contiguous()
-        gather_table = gather_table.contiguous()
         if mask_table is not None: mask_table = mask_table.contiguous()
 
         B, N, H, D = Q.shape
@@ -2003,7 +2002,7 @@ def run_full_suite_update_X_from_Y():
     # 1. SETUP & CORRECTNESS CHECK
     # ==========================================================================
     # [CONFIG] Choose your dtype here: torch.float32 or torch.float16
-    check_dtype = torch.float16
+    check_dtype = torch.float32
     
     print(f"{'='*60}")
     print(f"1. CORRECTNESS CHECK ({check_dtype}) - update_X_from_Y")
@@ -2012,7 +2011,7 @@ def run_full_suite_update_X_from_Y():
     # 1. Setup Dimensions for Correctness
     # N needs to be a power of 2 usually for easier tree construction logic.
     #B, N, D, H = 1, 2048 * 128, 64, 16
-    B, N, D, H = 1, 2048, 64, 16
+    B, N, D, H = 1, 2048 * 64, 64, 16
     dim = H * D
     
     # 2. Initialize Model (Dropout=0.0 for deterministic check)
