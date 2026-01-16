@@ -714,7 +714,8 @@ def hierarchical_attention_backward_low_level_kernel(
     H: tl.constexpr, BLOCK_H: tl.constexpr,
     D: tl.constexpr, BLOCK_D: tl.constexpr,
     N: tl.constexpr,
-    MAX_LEVEL: tl.constexpr
+    MAX_LEVEL: tl.constexpr,
+    TOTAL_LEVELS: tl.constexpr # [FIX] Guard Root OOB
 ):
     pid = tl.program_id(0)
     b_idx = tl.program_id(1)
@@ -758,6 +759,10 @@ def hierarchical_attention_backward_low_level_kernel(
                 target_level = lvl
                 # We already calculated node_id = N + pid outside!
                 found = 1
+                
+                # [FIX] Guard against Root/OOB
+                if target_level >= TOTAL_LEVELS:
+                    return
 
     # ------------------------------------------------------------------
     # 2. GATHER LOGIC (With Early Stop)
@@ -1193,7 +1198,8 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
                 *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
                 H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
                 N=N, 
-                MAX_LEVEL=limit, 
+                MAX_LEVEL=limit,
+                TOTAL_LEVELS=LEVELS, # [FIX] Pass true LEVELS
                 num_warps=4
             )
         
