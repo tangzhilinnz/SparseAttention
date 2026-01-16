@@ -763,6 +763,10 @@ def hierarchical_attention_backward_low_level_kernel(
                 # [FIX] Guard against Root/OOB
                 if target_level >= TOTAL_LEVELS:
                     return
+                
+                # [DEBUG] Clamp to Level 5 to inspect High Level Explosion
+                if target_level > 5:
+                    return
 
     # ------------------------------------------------------------------
     # 2. GATHER LOGIC (With Early Stop)
