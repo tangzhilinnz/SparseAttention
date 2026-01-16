@@ -351,7 +351,7 @@ def hierarchical_attention_forward_kernel(
 
     # 2. Load Topology
     off_lookup = node_idx * sl_n + offs_lvl * sl_lvl
-    neighbor_indices = tl.load(Lookup_ptr + off_lookup, mask=mask_lvl, other=0)
+    neighbor_indices = tl.load(Lookup_ptr + off_lookup, mask=mask_lvl, other=-1)
     
     neighbor_mask_val = tl.zeros([BLOCK_LEVELS], dtype=tl.int1)
     if HAS_MASK:
@@ -405,10 +405,28 @@ def hierarchical_attention_forward_kernel(
     acc_cross = acc_cross * sm_scale
     
     # Apply Masking (1 = Mask Out / -inf)
+    # [FIX] Also mask if neighbor_indices == -1 (invalid topology)
+    # neighbor_indices was loaded with other=0, but we can verify against original table?
+    # Actually, we loaded it into register `neighbor_indices`. But we used `other=0`.
+    # So we lost the -1 information if we don't handle it carefully.
+    
+    # Correction: We must ensure we don't lose the -1 state.
+    # In `Load Topology` block above (Line 354):
+    # neighbor_indices = tl.load(Lookup_ptr + off_lookup, mask=mask_lvl, other=-1)
+    
     mask_broadcast = (offs_lvl >= LEVELS)
     if HAS_MASK:
         mask_broadcast = mask_broadcast | neighbor_mask_val
         
+    # [FIX] Mask out invalid neighbors (which were -1 in table)
+    # We implicitly rely on neighbor_indices being -1 if invalid. 
+    # But wait, we used other=0 in line 354?
+    # We need to change line 354 first.
+    
+    # Assuming line 354 is fixed to other=-1...
+    is_invalid_neighbor = (neighbor_indices == -1)
+    mask_broadcast = mask_broadcast | is_invalid_neighbor[None, :]
+
     acc_cross = tl.where(mask_broadcast[None, :], -float('inf'), acc_cross)
     
     max_cross = tl.max(acc_cross, axis=1)
@@ -494,14 +512,16 @@ def hierarchical_attention_backward_dS_kernel(
     # 1. Mask Logic & Topology Load
     # -----------------------------------------------------------
     # Boundary Check: Are we within the max levels?
+    # Boundary Check: Are we within the max levels?
     mask_lvl_bounds = offs_lvl < LEVELS
     off_lookup = node_idx * sl_n + offs_lvl * sl_lvl
     
-    neighbor_indices = tl.load(Lookup_ptr + off_lookup, mask=mask_lvl_bounds, other=0)
+    # [FIX] Load with other=-1 to detect invalid entries
+    neighbor_indices = tl.load(Lookup_ptr + off_lookup, mask=mask_lvl_bounds, other=-1)
 
-    # Combined Mask: (In Bounds) AND (Not Masked by User)
+    # Combined Mask: (In Bounds) AND (Not Masked by User) AND (Valid Neighbor)
     # Start with bounds
-    mask_valid_cross = mask_lvl_bounds
+    mask_valid_cross = mask_lvl_bounds & (neighbor_indices != -1)
     
     if HAS_MASK:
         # Load User Mask (1 = Ignore/Masked, 0 = Keep)
@@ -1019,9 +1039,11 @@ def hierarchical_attention_backward_dQ_kernel(
             off_lookup = node_idx * sl_n + lvl_idx * sl_lvl
             
             # Since 'node_idx' and 'lvl_idx' are valid, no mask needed for lookup
+            # [FIX] Load with other=-1 (though mask is effectively true here)
             p_idx = tl.load(Lookup_ptr + off_lookup)
 
             # 2. Check Validity (Mask + Topology)
+            # [FIX] Explicitly check for -1
             is_valid = (p_idx != -1)
             if HAS_MASK:
                 mask_val = tl.load(Mask_ptr + off_lookup).to(tl.int8)
@@ -2075,7 +2097,7 @@ def run_full_suite_update_X_from_Y():
     print(f"Max Diff Output:   {diff_out:.8f}")
     print(f"Max Diff Grad X:   {diff_grad_x:.8f}")
     print(f"Max Diff Grad Y:   {diff_grad_y:.8f}")
-        
+    
     print(f"   -> Ref Grad Y Mean: {y_ref.grad.float().abs().mean():.4f} | Max: {y_ref.grad.float().abs().max():.4f}")
     print(f"   -> Tri Grad Y Mean: {y_tri.grad.float().abs().mean():.4f} | Max: {y_tri.grad.float().abs().max():.4f}")
         
