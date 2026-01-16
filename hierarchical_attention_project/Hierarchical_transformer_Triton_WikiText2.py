@@ -373,7 +373,7 @@ def train_transformer_model(model, train_loader, valid_loader, criterion=None, n
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
     
     # CHANGED: Use Cosine Annealing (Point 7: Better scheduler)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, verbose=False)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs+20, verbose=False)
     
     # --- AMP CHANGE 1: Initialize GradScaler ---
     # This manages the dynamic loss scaling (critical for FP16 stability)
