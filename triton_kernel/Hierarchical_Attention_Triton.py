@@ -1190,7 +1190,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         # [FIX] High-level kernel (Split-K) introduces race conditions/precision errors.
         # Since high-level nodes are < 1% of total nodes, single-block reduction (low_level) 
         # is sufficient and numerically stable.
-        CUTOFF_LEVEL = 8
+        CUTOFF_LEVEL = 5
         
         # --- KERNEL A: Low Levels (Split=1) ---
         if LEVELS >= 1:
