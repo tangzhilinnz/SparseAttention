@@ -763,10 +763,6 @@ def hierarchical_attention_backward_low_level_kernel(
                 # [FIX] Guard against Root/OOB
                 if target_level >= TOTAL_LEVELS:
                     return
-                
-                # [DEBUG] Clamp to Level 5 to inspect High Level Explosion
-                if target_level > 5:
-                    return
 
     # ------------------------------------------------------------------
     # 2. GATHER LOGIC (With Early Stop)
@@ -1156,7 +1152,9 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         grad_output_4d = grad_output.view(B, N, H, D)
         
         # 2. Compute dS (Main Stream)
-        DS = torch.zeros_like(Weights)
+        # [FIX] Use FP32 for intermediate gradients to prevent precision loss during large reductions
+        DS = torch.zeros(Q.shape[0], Q.shape[1], Q.shape[2], LEVELS + 1, dtype=torch.float32, device=Q.device)
+        
         grid_ds = (N, B)
         HAS_MASK = (mask_table is not None)
         mask_ptr_safe = mask_table if HAS_MASK else Weights
@@ -1170,9 +1168,9 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         )
     
         # --- SETUP PARALLELISM ---
-        dK = torch.zeros_like(K)
-        dV = torch.zeros_like(V)
-        dQ = torch.zeros_like(Q)
+        dK = torch.zeros(K.shape, dtype=torch.float32, device=K.device)
+        dV = torch.zeros(V.shape, dtype=torch.float32, device=V.device)
+        dQ = torch.zeros(Q.shape, dtype=torch.float32, device=Q.device)
     
         # --- BRANCH 2: dK/dV (Dependent on dS) ---
         
@@ -1250,7 +1248,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             HAS_MASK=HAS_MASK, num_warps=2
         )
             
-        return dQ, dK, dV, None, None, None
+        return dQ.to(Q.dtype), dK.to(K.dtype), dV.to(V.dtype), None, None, None
 
 def hierarchical_fused_attention(Q, K, V, idx_table, gather_table, mask_table=None):
     """
