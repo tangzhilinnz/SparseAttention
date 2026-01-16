@@ -425,7 +425,7 @@ def hierarchical_attention_forward_kernel(
     
     # Assuming line 354 is fixed to other=-1...
     is_invalid_neighbor = (neighbor_indices == -1)
-    mask_broadcast = mask_broadcast | is_invalid_neighbor[None, :]
+    mask_broadcast = mask_broadcast | is_invalid_neighbor
 
     acc_cross = tl.where(mask_broadcast[None, :], -float('inf'), acc_cross)
     
