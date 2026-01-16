@@ -724,21 +724,20 @@ def hierarchical_attention_backward_low_level_kernel(
                 val_int8 = tl.load(Mask_ptr + off_mask).to(tl.int8)
                 is_masked = (val_int8 != 0)
             
-            if is_masked:
-                continue
-
-            ptr_ds = ptr_ds_base + (child_idx * sds_n) + (offs_h * sds_h)
-            ptr_w  = ptr_w_base  + (child_idx * sw_n)  + (offs_h * sw_h)
-            ds = tl.load(ptr_ds, mask=mask_h, other=0.0)[:, None]
-            w  = tl.load(ptr_w,  mask=mask_h, other=0.0)[:, None]
-            
-            ptr_q  = ptr_q_base  + (child_idx * sq_n)  + off_hq_d
-            ptr_do = ptr_do_base + (child_idx * sdo_n) + off_hdo_d
-            q  = tl.load(ptr_q,  mask=mask_op, other=0.0)
-            do = tl.load(ptr_do, mask=mask_op, other=0.0)
-            
-            dk_acc += ds * q.to(tl.float32)
-            dv_acc += w * do.to(tl.float32)
+            # [FIX] Use IF logic, not continue
+            if is_masked == 0:
+                ptr_ds = ptr_ds_base + (child_idx * sds_n) + (offs_h * sds_h)
+                ptr_w  = ptr_w_base  + (child_idx * sw_n)  + (offs_h * sw_h)
+                ds = tl.load(ptr_ds, mask=mask_h, other=0.0)[:, None]
+                w  = tl.load(ptr_w,  mask=mask_h, other=0.0)[:, None]
+                
+                ptr_q  = ptr_q_base  + (child_idx * sq_n)  + off_hq_d
+                ptr_do = ptr_do_base + (child_idx * sdo_n) + off_hdo_d
+                q  = tl.load(ptr_q,  mask=mask_op, other=0.0)
+                do = tl.load(ptr_do, mask=mask_op, other=0.0)
+                
+                dk_acc += ds * q.to(tl.float32)
+                dv_acc += w * do.to(tl.float32)
 
         # [FIX] Use atomic_add for safety
         ptr_dk = DK_ptr + off_out_base + (offs_d[None, :] * sdk_d)
@@ -830,21 +829,20 @@ def hierarchical_attention_backward_high_level_kernel(
                 val_int8 = tl.load(Mask_ptr + off_mask).to(tl.int8)
                 is_masked = (val_int8 != 0)
             
-            if is_masked:
-                continue
-
-            ptr_ds = ptr_ds_base + (child_idx * sds_n) + (offs_h * sds_h)
-            ptr_w  = ptr_w_base  + (child_idx * sw_n)  + (offs_h * sw_h)
-            ds = tl.load(ptr_ds, mask=mask_h, other=0.0)[:, None]
-            w  = tl.load(ptr_w,  mask=mask_h, other=0.0)[:, None]
-            
-            ptr_q  = ptr_q_base  + (child_idx * sq_n)  + off_hq_d
-            ptr_do = ptr_do_base + (child_idx * sdo_n) + off_hdo_d
-            q  = tl.load(ptr_q,  mask=mask_op, other=0.0)
-            do = tl.load(ptr_do, mask=mask_op, other=0.0)
-            
-            dk_acc += ds * q.to(tl.float32)
-            dv_acc += w * do.to(tl.float32)
+            # [FIX] Use IF logic, not continue
+            if is_masked == 0:
+                ptr_ds = ptr_ds_base + (child_idx * sds_n) + (offs_h * sds_h)
+                ptr_w  = ptr_w_base  + (child_idx * sw_n)  + (offs_h * sw_h)
+                ds = tl.load(ptr_ds, mask=mask_h, other=0.0)[:, None]
+                w  = tl.load(ptr_w,  mask=mask_h, other=0.0)[:, None]
+                
+                ptr_q  = ptr_q_base  + (child_idx * sq_n)  + off_hq_d
+                ptr_do = ptr_do_base + (child_idx * sdo_n) + off_hdo_d
+                q  = tl.load(ptr_q,  mask=mask_op, other=0.0)
+                do = tl.load(ptr_do, mask=mask_op, other=0.0)
+                
+                dk_acc += ds * q.to(tl.float32)
+                dv_acc += w * do.to(tl.float32)
 
         # [FIX] Atomic Add
         ptr_dk = DK_ptr + off_out_base + (offs_d[None, :] * sdk_d)
@@ -980,7 +978,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         # [FIX] Initialize as FP32 for accumulation precision
         dK = torch.zeros_like(K, dtype=torch.float32)
         dV = torch.zeros_like(V, dtype=torch.float32)
-        dQ = torch.zeros_like(Q, dtype=torch.float32) # Usually independent, but safe to match
+        dQ = torch.zeros_like(Q, dtype=torch.float32) 
         
         # Leaf Kernel
         grid_leaf = (N, B)
@@ -1041,13 +1039,6 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         return dQ.to(Q.dtype), dK.to(K.dtype), dV.to(V.dtype), None, None, None
 
 def hierarchical_fused_attention(Q, K, V, idx_table, gather_table, mask_table=None):
-    return HierarchicalAttentionFunc.apply(Q, K, V, idx_table, gather_table, mask_table)
-
-
-def hierarchical_fused_attention(Q, K, V, idx_table, gather_table, mask_table=None):
-    """
-    Wrapper for the custom autograd function.
-    """
     return HierarchicalAttentionFunc.apply(Q, K, V, idx_table, gather_table, mask_table)
 
 
