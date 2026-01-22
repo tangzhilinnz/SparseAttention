@@ -1399,7 +1399,7 @@ def build_tree_topology(seq_len, is_causal=True, device="cuda", dtype=torch.int3
     forward_mask = torch.zeros((seq_len, level_num), dtype=torch.bool, device=device)
     
     # Vectorized "Climb Up" Logic
-    n_cur = torch.arange(seq_len, device=device, dtype=torch.int64)
+    n_cur = torch.arange(seq_len, device=device, dtype=dtype)
     
     for lvl in range(level_num):
         if lvl == 0:
@@ -1428,7 +1428,7 @@ def build_tree_topology(seq_len, is_causal=True, device="cuda", dtype=torch.int3
     # ===============================================================
     # 2. Backward Table Construction (Node -> Leaf Range)
     # ===============================================================
-    subtree_ranges = torch.zeros((total_nodes, 2), dtype=torch.int64, device=device)
+    subtree_ranges = torch.zeros((total_nodes, 2), dtype=dtype, device=device)
     node_levels = torch.zeros(total_nodes, dtype=dtype, device=device)
     
     # Initialize Leaves (Level 0)
@@ -1466,11 +1466,11 @@ def build_tree_topology(seq_len, is_causal=True, device="cuda", dtype=torch.int3
         curr_count = next_count
 
     # Gather Logic
-    all_nodes = torch.arange(total_nodes, device=device)
+    all_nodes = torch.arange(total_nodes, device=device, dtype=dtype)
     siblings = all_nodes ^ 1
     siblings = torch.clamp(siblings, max=total_nodes-1)
 
-    gather_info = torch.full((total_nodes, 3), -1, dtype=torch.int32, device=device)
+    gather_info = torch.full((total_nodes, 3), -1, dtype=dtype, device=device)
 
     if is_causal:
         should_gather = siblings > all_nodes
