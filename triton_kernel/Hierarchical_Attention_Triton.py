@@ -762,22 +762,22 @@ def hierarchical_attention_backward_low_level_kernel(
             is_leaf = (child_idx < N) & (child_idx >= 0)
             
             # 2. Combine with geometric mask
-            mask_load = mask_op & is_leaf
-            mask_h = mask_h & is_leaf
+            mask_2d = mask_op & is_leaf
+            mask_1d = mask_h & is_leaf
             
             # --- Load DS/W (Always valid, they exist for all nodes) ---
             ptr_ds = ptr_ds_base + (child_idx * sds_n) + (offs_h * sds_h)
             ptr_w  = ptr_w_base  + (child_idx * sw_n)  + (offs_h * sw_h)
             
-            ds = tl.load(ptr_ds, mask=mask_h, other=0.0)[:, None]
-            w  = tl.load(ptr_w,  mask=mask_h, other=0.0)[:, None]
+            ds = tl.load(ptr_ds, mask=mask_1d, other=0.0)[:, None]
+            w  = tl.load(ptr_w,  mask=mask_1d, other=0.0)[:, None]
             
             # --- Load Q/dO (Only if Leaf) ---
             ptr_q  = ptr_q_base  + (child_idx * sq_n)  + off_hq_d
             ptr_do = ptr_do_base + (child_idx * sdo_n) + off_hdo_d
             
-            q  = tl.load(ptr_q,  mask=mask_load, other=0.0)
-            do = tl.load(ptr_do, mask=mask_load, other=0.0)
+            q  = tl.load(ptr_q,  mask=mask_2d, other=0.0)
+            do = tl.load(ptr_do, mask=mask_2d, other=0.0)
             
             dk_acc += ds * q.to(tl.float32)
             dv_acc += w * do.to(tl.float32)
@@ -888,20 +888,20 @@ def hierarchical_attention_backward_high_level_kernel(
             is_leaf = (child_idx < N) & (child_idx >= 0)
             
             # 2. Combine with geometric mask
-            mask_load = mask_op & is_leaf
-            mask_h = mask_h & is_leaf
+            mask_2d = mask_op & is_leaf
+            mask_1d = mask_h & is_leaf
             
             ptr_ds = ptr_ds_base + (child_idx * sds_n) + (offs_h * sds_h)
             ptr_w  = ptr_w_base  + (child_idx * sw_n)  + (offs_h * sw_h)
             
-            ds = tl.load(ptr_ds, mask=mask_h, other=0.0)[:, None]
-            w  = tl.load(ptr_w,  mask=mask_h, other=0.0)[:, None]
+            ds = tl.load(ptr_ds, mask=mask_1d, other=0.0)[:, None]
+            w  = tl.load(ptr_w,  mask=mask_1d, other=0.0)[:, None]
             
             ptr_q  = ptr_q_base  + (child_idx * sq_n)  + off_hq_d
             ptr_do = ptr_do_base + (child_idx * sdo_n) + off_hdo_d
             
-            q  = tl.load(ptr_q,  mask=mask_load, other=0.0)
-            do = tl.load(ptr_do, mask=mask_load, other=0.0)
+            q  = tl.load(ptr_q,  mask=mask_2d, other=0.0)
+            do = tl.load(ptr_do, mask=mask_2d, other=0.0)
             
             dk_acc += ds * q.to(tl.float32)
             dv_acc += w * do.to(tl.float32)
