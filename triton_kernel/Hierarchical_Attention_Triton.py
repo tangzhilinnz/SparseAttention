@@ -1209,17 +1209,9 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         B, N = Q.shape[0], Q.shape[1]
         grad_output_4d = grad_output.view(B, N, H, D)
         
-        # --- SETUP OUTPUTS (Must allocate BEFORE checks) ---
-        # Note: If your tree has internal nodes (indices > N), dK/dV should technically
-        # be size (B, 2*N, H, D) or similar. If K is only (B, N, H, D), writing
-        # to node_id >= N is dangerous unless handled by a separate buffer.
-        # Assuming standard attention where we only want gradients for leaves:
-        #dK = torch.zeros_like(K)
-        #dV = torch.zeros_like(V)
-
+        # --- SETUP OUTPUTS ---
         dK = torch.zeros_like(K, dtype=torch.float32)
         dV = torch.zeros_like(V, dtype=torch.float32)
-
         dQ = torch.empty_like(Q)
         DS = torch.empty_like(Weights)
         
@@ -1236,7 +1228,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS, HAS_MASK=HAS_MASK, num_warps=2
         )
 
-        # --- BRANCH 2: dK/dV (Dependent on dS) ---
+        # --- BRANCH 2: dK/dV ---
         
         # Step A: Leaf Kernel (Level 0)
         grid_leaf = (N, B)
@@ -1248,52 +1240,58 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, num_warps=2
         )
 
-        # --- Dynamic CUTOFF_LEVEL Logic (Heuristic from helper) ---
+        # --- Dynamic CUTOFF_LEVEL Logic ---
         CUTOFF_LEVEL = get_cutoff_level(N)
         
-        # --- KERNEL A: Low Levels (Split=1) ---
-        if LEVELS >= 1:
-            limit = min(LEVELS, CUTOFF_LEVEL)
-            # Total blocks = N - (N >> limit)
+        # [SAFETY]: Reduce max levels by 1 to avoid Root/OOB crash
+        VALID_LEVELS = LEVELS - 1
+
+        # --- KERNEL A: Low Levels ---
+        if VALID_LEVELS >= 1:
+            limit = min(VALID_LEVELS, CUTOFF_LEVEL)
             total_blocks_low = N - (N >> limit)
-            
             grid_low = (total_blocks_low, B)
             
             hierarchical_attention_backward_low_level_kernel[grid_low](
+                # Pointers
                 DS, Q, Weights, grad_output_4d, gather_table,
                 dK, dV,
+                idx_table,  # <--- [NEW] Passed Lookup Table
+                # Strides
                 *DS.stride(), *Q.stride(), *Weights.stride(),
                 *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
-                sm_scale, # [FIX] Pass Scaling Factor
+                *idx_table.stride(), # <--- [NEW] Passed Lookup Strides (sl_n, sl_lvl)
+                sm_scale,            # <--- [NEW] Passed Scale
+                # Constants
                 H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
                 N=N, 
-                MAX_LEVEL=limit, 
+                MAX_LEVEL=limit,
+                LEVELS=LEVELS,       # <--- [NEW] Passed Levels
                 num_warps=4
             )
         
-        # --- KERNEL B: High Levels (Split>1) ---
-        if LEVELS > CUTOFF_LEVEL:
-            num_high_levels = LEVELS - CUTOFF_LEVEL
-            
-            # Constant blocks per level = N >> (CUTOFF)
-            # Actually, logic dictates: N >> (START_LEVEL - 1)
-            # If START_LEVEL=9, we need N >> 8.
+        # --- KERNEL B: High Levels ---
+        if VALID_LEVELS > CUTOFF_LEVEL:
+            num_high_levels = VALID_LEVELS - CUTOFF_LEVEL
             blocks_per_lvl = N >> CUTOFF_LEVEL
-            
             total_blocks_high = blocks_per_lvl * num_high_levels
-            
             grid_high = (total_blocks_high, B)
             
             hierarchical_attention_backward_high_level_kernel[grid_high](
+                # Pointers
                 DS, Q, Weights, grad_output_4d, gather_table,
                 dK, dV,
+                idx_table,  # <--- [NEW] Passed Lookup Table
+                # Strides
                 *DS.stride(), *Q.stride(), *Weights.stride(),
                 *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
-                sm_scale, # [FIX] Pass Scaling Factor
+                *idx_table.stride(), # <--- [NEW] Passed Lookup Strides (sl_n, sl_lvl)
+                sm_scale,            # <--- [NEW] Passed Scale
+                # Constants
                 H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
                 N=N,
                 START_LEVEL=CUTOFF_LEVEL + 1,
-                LEVELS=LEVELS,
+                LEVELS=LEVELS,       # <--- [NEW] Passed Levels
                 num_warps=2
             )
 
@@ -1306,21 +1304,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             HAS_MASK=HAS_MASK, num_warps=2
         )
 
-
-        # --- DEBUG: CHECK FOR EXPLODING GRADIENTS ---
-        # 1. Sync GPU to ensure kernels are done writing to dQ, dK, dV
-        torch.cuda.synchronize()
-
-        # 2. Print Stats
-        # Using .float() to prevent overflow if they are fp16 during the sum/mean calculation
-        print(f" -> Grad dQ Mean: {dQ.float().abs().mean().item():.6f} | Max: {dQ.float().abs().max().item():.6f}")
-        print(f" -> Grad dK Mean: {dK.float().abs().mean().item():.6f} | Max: {dK.float().abs().max().item():.6f}")
-        print(f" -> Grad dV Mean: {dV.float().abs().mean().item():.6f} | Max: {dV.float().abs().max().item():.6f}")
-        print(f" -> Grad DS Mean: {DS.float().abs().mean().item():.6f} | Max: {DS.float().abs().max().item():.6f}")
-        print(f" -> Weights Mean: {Weights.float().abs().mean().item():.6f} | Max: {Weights.float().abs().max().item():.6f}")
-        print(f" -> Grad output Mean: {grad_output.float().abs().mean().item():.6f} | Max: {grad_output.float().abs().max().item():.6f}")
-            
-        return dQ, dK, dV, None, None, None
+        return dQ, dK, dV, None, None, None, None
 
 def hierarchical_fused_attention(Q, K, V, idx_table, gather_table, mask_table=None):
     """
