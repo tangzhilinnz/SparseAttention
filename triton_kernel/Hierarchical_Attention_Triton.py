@@ -1314,7 +1314,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         print(f" -> Grad DS Mean: {DS.float().abs().mean().item():.6f} | Max: {DS.float().abs().max().item():.6f}")
 
             
-        return dQ, dK, dV, None, None, None
+        return dQ, dK, dV, None, None, None, None
 
 def hierarchical_fused_attention(Q, K, V, idx_table, gather_table, mask_table=None):
     """
