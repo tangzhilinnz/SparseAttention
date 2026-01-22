@@ -807,6 +807,18 @@ def hierarchical_attention_backward_low_level_kernel(
         
         # [FIX] Apply Scaling Factor
         dk_acc = dk_acc * sm_scale
+
+        # --- Guard Logic ---
+        # Define a maximum threshold (e.g., 65504 is the max for float16)
+        MAX_GRAD_VAL = 1000.0 
+
+        # Check if any value in the accumulator is NaN or exceeding the threshold
+        is_abnormal_dk = (tl.abs(dk_acc) > MAX_GRAD_VAL) | (dk_acc != dk_acc)
+        is_abnormal_dv = (tl.abs(dv_acc) > MAX_GRAD_VAL) | (dv_acc != dv_acc)
+
+        # Replace abnormal values with 0.0 before writing back
+        dk_acc = tl.where(is_abnormal_dk, 0.0, dk_acc)
+        dv_acc = tl.where(is_abnormal_dv, 0.0, dv_acc)
         
         tl.store(ptr_dk, dk_acc, mask=mask_op)
         tl.store(ptr_dv, dv_acc, mask=mask_op)
@@ -960,6 +972,18 @@ def hierarchical_attention_backward_high_level_kernel(
         
         # [FIX] Apply Scaling Factor
         dk_acc = dk_acc * sm_scale
+
+        # --- Guard Logic ---
+        # Define a maximum threshold (e.g., 65504 is the max for float16)
+        MAX_GRAD_VAL = 1000.0 
+
+        # Check if any value in the accumulator is NaN or exceeding the threshold
+        is_abnormal_dk = (tl.abs(dk_acc) > MAX_GRAD_VAL) | (dk_acc != dk_acc)
+        is_abnormal_dv = (tl.abs(dv_acc) > MAX_GRAD_VAL) | (dv_acc != dv_acc)
+
+        # Replace abnormal values with 0.0 before writing back
+        dk_acc = tl.where(is_abnormal_dk, 0.0, dk_acc)
+        dv_acc = tl.where(is_abnormal_dv, 0.0, dv_acc)
         
         tl.atomic_add(ptr_dk, dk_acc, mask=mask_op)
         tl.atomic_add(ptr_dv, dv_acc, mask=mask_op)
