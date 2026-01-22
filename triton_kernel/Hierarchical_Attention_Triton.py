@@ -1241,33 +1241,28 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         B, N = Q.shape[0], Q.shape[1]
         grad_output_4d = grad_output.view(B, N, H, D)
         
-        # --- SETUP OUTPUTS (Must allocate BEFORE checks) ---
-        # Note: If your tree has internal nodes (indices > N), dK/dV should technically
-        # be size (B, 2*N, H, D) or similar. If K is only (B, N, H, D), writing
-        # to node_id >= N is dangerous unless handled by a separate buffer.
-        # Assuming standard attention where we only want gradients for leaves:
-        dK = torch.zeros_like(K)
-        dV = torch.zeros_like(V)
+        # =========================================================================
+        # [SOLUTION 2] Allocate Memory for Parents (The Fix)
+        # =========================================================================
+        # Your kernels calculate gradients for geometric parents (indices N to 2N).
+        # Standard torch.zeros_like(K) only size N, causing buffer overflow.
+        # We allocate 2*N to safely capture all writes.
+        total_nodes = 2 * N
+        
+        dK_full = torch.zeros((B, total_nodes, H, D), dtype=K.dtype, device=K.device)
+        dV_full = torch.zeros((B, total_nodes, H, D), dtype=V.dtype, device=V.device)
+        
+        # dQ and DS are calculated for leaves/weights, so they match input shapes
         dQ = torch.empty_like(Q)
         DS = torch.empty_like(Weights)
 
         # --- SAFETY CHECKS ---
-        # 1. Memory Address Check
-        # Ensure dK and dV are distinct memory blocks to prevent overwrite race conditions
-        assert dK.data_ptr() != dV.data_ptr(), "Critical Error: dK and dV share the same memory address!"
+        assert dK_full.data_ptr() != dV_full.data_ptr(), "dK and dV share memory!"
+        assert dK_full.stride() == dV_full.stride(), "Strides must match"
 
-        # 2. Stride Alignment Check
-        # Ensure dK and dV have the same layout. The kernel uses *dK.stride() for both.
-        assert dK.stride() == dV.stride(), "Error: dK and dV must have identical strides for the current kernel signature"
-        
-        # 3. Tree Size Check (Crucial for Hierarchical Attention)
-        # If the kernel writes to internal nodes (indices >= N), dK must be large enough.
-        # If K.shape[1] == N, writing to node_id=N will segfault or corrupt memory.
-        # For standard backprop, we usually only care about leaves (0..N-1).
-        # IF your kernel writes to N+pid, ensure you aren't overflowing.
-        # (Assuming here that internal node writes are either suppressed or K is padded)
-        
+        # -------------------------------------------------------------------------
         # 2. Compute dS (Main Stream)
+        # -------------------------------------------------------------------------
         grid_ds = (N, B)
         HAS_MASK = (mask_table is not None)
         mask_ptr_safe = mask_table if HAS_MASK else Weights
@@ -1280,35 +1275,38 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS, HAS_MASK=HAS_MASK, num_warps=2
         )
 
-        # --- BRANCH 2: dK/dV (Dependent on dS) ---
+        # -------------------------------------------------------------------------
+        # 3. Compute dK / dV (Accumulate into Full Buffers)
+        # -------------------------------------------------------------------------
         
-        # Step A: Leaf Kernel (Level 0)
+        # --- Step A: Leaf Kernel (Level 0) ---
+        # Writes to indices [0, N-1] of dK_full/dV_full
         grid_leaf = (N, B)
         hierarchical_attention_backward_dK_dV_leaf_kernel[grid_leaf](
             DS, Q, Weights, grad_output_4d, gather_table,
-            dK, dV,
+            dK_full, dV_full,  # <--- Passing Full Buffer
             *DS.stride(), *Q.stride(), *Weights.stride(), 
-            *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
+            *grad_output_4d.stride(), *dK_full.stride(), *gather_table.stride(),
             H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, num_warps=2
         )
 
-        # --- Dynamic CUTOFF_LEVEL Logic (Heuristic from helper) ---
-        CUTOFF_LEVEL = get_cutoff_level(N)
+        # --- Dynamic CUTOFF_LEVEL Logic ---
+        # Ensure 'get_cutoff_level' is defined in your scope
+        CUTOFF_LEVEL = get_cutoff_level(N) 
         
         # --- KERNEL A: Low Levels (Split=1) ---
+        # Writes to indices [N, 2N] (Parents)
         if LEVELS >= 1:
             limit = min(LEVELS, CUTOFF_LEVEL)
-            # Total blocks = N - (N >> limit)
             total_blocks_low = N - (N >> limit)
-            
             grid_low = (total_blocks_low, B)
             
             hierarchical_attention_backward_low_level_kernel[grid_low](
                 DS, Q, Weights, grad_output_4d, gather_table,
-                dK, dV,
+                dK_full, dV_full, # <--- Passing Full Buffer
                 *DS.stride(), *Q.stride(), *Weights.stride(),
-                *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
-                sm_scale, # [FIX] Pass Scaling Factor
+                *grad_output_4d.stride(), *dK_full.stride(), *gather_table.stride(),
+                sm_scale, 
                 H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
                 N=N, 
                 MAX_LEVEL=limit, 
@@ -1316,31 +1314,28 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             )
         
         # --- KERNEL B: High Levels (Split>1) ---
+        # Writes to indices [N, 2N] (Parents)
         if LEVELS > CUTOFF_LEVEL:
             num_high_levels = LEVELS - CUTOFF_LEVEL
-            
-            # Constant blocks per level = N >> (CUTOFF)
-            # Actually, logic dictates: N >> (START_LEVEL - 1)
-            # If START_LEVEL=9, we need N >> 8.
             blocks_per_lvl = N >> CUTOFF_LEVEL
-            
             total_blocks_high = blocks_per_lvl * num_high_levels
-            
             grid_high = (total_blocks_high, B)
             
             hierarchical_attention_backward_high_level_kernel[grid_high](
                 DS, Q, Weights, grad_output_4d, gather_table,
-                dK, dV,
+                dK_full, dV_full, # <--- Passing Full Buffer
                 *DS.stride(), *Q.stride(), *Weights.stride(),
-                *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
-                sm_scale, # [FIX] Pass Scaling Factor
+                *grad_output_4d.stride(), *dK_full.stride(), *gather_table.stride(),
+                sm_scale, 
                 H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
                 N=N,
                 START_LEVEL=CUTOFF_LEVEL + 1,
                 num_warps=2
             )
 
-        # --- BRANCH 1: dQ (Independent) ---
+        # -------------------------------------------------------------------------
+        # 4. Compute dQ (Independent)
+        # -------------------------------------------------------------------------
         grid_dq = (N, B)
         hierarchical_attention_backward_dQ_kernel[grid_dq](
             DS, K, idx_table, dQ, mask_ptr_safe,
@@ -1349,7 +1344,17 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             HAS_MASK=HAS_MASK, num_warps=2
         )
             
-        return dQ, dK, dV, None, None, None
+        # -------------------------------------------------------------------------
+        # 5. Return Results
+        # -------------------------------------------------------------------------
+        # [SOLUTION 2 KEY]: We slice dK_full and dV_full to only return the 
+        # gradients for the leaves (indices 0 to N-1).
+        # The gradients for parents (N to 2N) are safely discarded here.
+        
+        dK_leaves = dK_full[:, :N, :, :]
+        dV_leaves = dV_full[:, :N, :, :]
+
+        return dQ, dK_leaves, dV_leaves, None, None, None
 
 def hierarchical_fused_attention(Q, K, V, idx_table, gather_table, mask_table=None):
     """
