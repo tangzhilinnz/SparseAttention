@@ -805,9 +805,6 @@ def hierarchical_attention_backward_low_level_kernel(
         ptr_dk = DK_ptr + off_out_base + (offs_d[None, :] * sdk_d)
         ptr_dv = DV_ptr + off_out_base + (offs_d[None, :] * sdk_d)
         
-        # [FIX] Apply Scaling Factor
-        dk_acc = dk_acc * sm_scale
-        
         tl.store(ptr_dk, dk_acc, mask=mask_op)
         tl.store(ptr_dv, dv_acc, mask=mask_op)
 
@@ -957,9 +954,6 @@ def hierarchical_attention_backward_high_level_kernel(
         # We only reach here if children exist, so we never atomic_add to empty nodes.
         ptr_dk = DK_ptr + off_out_base + (offs_d[None, :] * sdk_d)
         ptr_dv = DV_ptr + off_out_base + (offs_d[None, :] * sdk_d)
-        
-        # [FIX] Apply Scaling Factor
-        dk_acc = dk_acc * sm_scale
         
         tl.atomic_add(ptr_dk, dk_acc, mask=mask_op)
         tl.atomic_add(ptr_dv, dv_acc, mask=mask_op)
