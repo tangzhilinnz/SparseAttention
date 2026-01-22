@@ -1293,7 +1293,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
                 H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
                 N=N,
                 START_LEVEL=CUTOFF_LEVEL + 1,
-                LEVELS,
+                LEVELS=LEVELS,
                 num_warps=2
             )
 
