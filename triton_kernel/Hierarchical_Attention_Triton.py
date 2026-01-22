@@ -1302,7 +1302,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         print(f" -> Grad dV Mean: {dV.float().abs().mean().item():.6f} | Max: {dV.float().abs().max().item():.6f}")
         print(f" -> Grad DS Mean: {DS.float().abs().mean().item():.6f} | Max: {DS.float().abs().max().item():.6f}")
         print(f" -> Weights Mean: {Weights.float().abs().mean().item():.6f} | Max: {Weights.float().abs().max().item():.6f}")
-
+        print(f" -> Grad output Mean: {grad_output.float().abs().mean().item():.6f} | Max: {grad_output.float().abs().max().item():.6f}")
             
         return dQ, dK, dV, None, None, None, None
 
