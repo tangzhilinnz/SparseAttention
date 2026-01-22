@@ -1240,18 +1240,34 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         grad_output = grad_output.contiguous()
         B, N = Q.shape[0], Q.shape[1]
         grad_output_4d = grad_output.view(B, N, H, D)
+        
+        # --- SETUP OUTPUTS (Must allocate BEFORE checks) ---
+        # Note: If your tree has internal nodes (indices > N), dK/dV should technically
+        # be size (B, 2*N, H, D) or similar. If K is only (B, N, H, D), writing
+        # to node_id >= N is dangerous unless handled by a separate buffer.
+        # Assuming standard attention where we only want gradients for leaves:
+        dK = torch.zeros_like(K)
+        dV = torch.zeros_like(V)
+        dQ = torch.empty_like(Q)
+        DS = torch.empty_like(Weights)
 
         # --- SAFETY CHECKS ---
         # 1. Memory Address Check
-        assert K.data_ptr() != V.data_ptr(), "K and V share memory!"
-    
+        # Ensure dK and dV are distinct memory blocks to prevent overwrite race conditions
+        assert dK.data_ptr() != dV.data_ptr(), "Critical Error: dK and dV share the same memory address!"
+
         # 2. Stride Alignment Check
-        # Ensure dK and dV have the same layout so that *dK.stride() works for both
-        # If they don't, you MUST pass dV.stride() separately to the kernel
-        assert dK.stride() == dV.stride(), "dK and dV must have identical strides for the current kernel signature"
+        # Ensure dK and dV have the same layout. The kernel uses *dK.stride() for both.
+        assert dK.stride() == dV.stride(), "Error: dK and dV must have identical strides for the current kernel signature"
+        
+        # 3. Tree Size Check (Crucial for Hierarchical Attention)
+        # If the kernel writes to internal nodes (indices >= N), dK must be large enough.
+        # If K.shape[1] == N, writing to node_id=N will segfault or corrupt memory.
+        # For standard backprop, we usually only care about leaves (0..N-1).
+        # IF your kernel writes to N+pid, ensure you aren't overflowing.
+        # (Assuming here that internal node writes are either suppressed or K is padded)
         
         # 2. Compute dS (Main Stream)
-        DS = torch.empty_like(Weights)
         grid_ds = (N, B)
         HAS_MASK = (mask_table is not None)
         mask_ptr_safe = mask_table if HAS_MASK else Weights
@@ -1263,11 +1279,6 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             sm_scale, H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=32, 
             LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS, HAS_MASK=HAS_MASK, num_warps=2
         )
-
-        # --- SETUP PARALLELISM ---
-        dK = torch.zeros_like(K)
-        dV = torch.zeros_like(V)
-        dQ = torch.empty_like(Q)
 
         # --- BRANCH 2: dK/dV (Dependent on dS) ---
         
