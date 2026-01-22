@@ -807,9 +807,6 @@ def hierarchical_attention_backward_low_level_kernel(
         
         # [FIX] Apply Scaling Factor
         dk_acc = dk_acc * sm_scale
-
-        dk_acc = dk_acc * 0.0
-        dv_acc = dv_acc * 0.0
         
         tl.store(ptr_dk, dk_acc, mask=mask_op)
         tl.store(ptr_dv, dv_acc, mask=mask_op)
@@ -963,9 +960,6 @@ def hierarchical_attention_backward_high_level_kernel(
         
         # [FIX] Apply Scaling Factor
         dk_acc = dk_acc * sm_scale
-
-        dk_acc = dk_acc * 0.0
-        dv_acc = dv_acc * 0.0
         
         tl.atomic_add(ptr_dk, dk_acc, mask=mask_op)
         tl.atomic_add(ptr_dv, dv_acc, mask=mask_op)
@@ -1246,6 +1240,15 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         grad_output = grad_output.contiguous()
         B, N = Q.shape[0], Q.shape[1]
         grad_output_4d = grad_output.view(B, N, H, D)
+
+        # --- SAFETY CHECKS ---
+        # 1. Memory Address Check
+        assert K.data_ptr() != V.data_ptr(), "K and V share memory!"
+    
+        # 2. Stride Alignment Check
+        # Ensure dK and dV have the same layout so that *dK.stride() works for both
+        # If they don't, you MUST pass dV.stride() separately to the kernel
+        assert dK.stride() == dV.stride(), "dK and dV must have identical strides for the current kernel signature"
         
         # 2. Compute dS (Main Stream)
         DS = torch.empty_like(Weights)
