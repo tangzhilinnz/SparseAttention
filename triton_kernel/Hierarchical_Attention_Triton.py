@@ -788,6 +788,7 @@ def hierarchical_attention_backward_low_level_kernel(
         
         # [CRITICAL FIX] REMOVED DOUBLE SCALING
         # dk_acc = dk_acc * sm_scale  <-- DELETED
+        dv_acc = dv_acc * 0.0001
         
         tl.store(ptr_dk, dk_acc, mask=mask_op)
         tl.store(ptr_dv, dv_acc, mask=mask_op)
@@ -909,6 +910,7 @@ def hierarchical_attention_backward_high_level_kernel(
         
         # [CRITICAL FIX] REMOVED DOUBLE SCALING
         # dk_acc = dk_acc * sm_scale <-- DELETED
+        dv_acc = dv_acc * 0.0001
         
         tl.atomic_add(ptr_dk, dk_acc, mask=mask_op)
         tl.atomic_add(ptr_dv, dv_acc, mask=mask_op)
