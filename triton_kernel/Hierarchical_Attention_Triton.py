@@ -1273,7 +1273,8 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         )
 
         # --- Dynamic CUTOFF_LEVEL Logic (Heuristic from helper) ---
-        CUTOFF_LEVEL = get_cutoff_level(N)
+        #CUTOFF_LEVEL = get_cutoff_level(N)
+        CUTOFF_LEVEL = 4
         
         # --- KERNEL A: Low Levels (Split=1) ---
         if LEVELS >= 1:
