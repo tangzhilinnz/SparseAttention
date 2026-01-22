@@ -732,7 +732,7 @@ def hierarchical_attention_backward_low_level_kernel(
         return
 
     num_children = 1 << target_level
-    w_idx = target_level + 1
+    w_idx = target_level
 
     offs_h = tl.arange(0, BLOCK_H)
     mask_h = offs_h < H
@@ -853,7 +853,7 @@ def hierarchical_attention_backward_high_level_kernel(
     # ------------------------------------------------------------------
     CHILDREN_PER_SPLIT: tl.constexpr = 1 << (START_LEVEL - 1)
     
-    w_idx = target_level + 1
+    w_idx = target_level
     start_k = split_id * CHILDREN_PER_SPLIT
 
     offs_h = tl.arange(0, BLOCK_H)
