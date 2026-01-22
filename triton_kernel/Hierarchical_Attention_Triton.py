@@ -774,7 +774,7 @@ def hierarchical_attention_backward_low_level_kernel(
             ptr_do = ptr_do_base + (child_idx * sdo_n) + off_hdo_d
             
             # Apply `is_leaf` mask here to prevent OOB/Garbage reads
-            mask_load_q = mask_op & is_leaf
+            mask_load_q = mask_op
             
             q  = tl.load(ptr_q,  mask=mask_load_q, other=0.0)
             do = tl.load(ptr_do, mask=mask_load_q, other=0.0)
@@ -897,7 +897,7 @@ def hierarchical_attention_backward_high_level_kernel(
             ptr_do = ptr_do_base + (child_idx * sdo_n) + off_hdo_d
             
             # Apply `is_leaf` mask here
-            mask_load_q = mask_op & is_leaf
+            mask_load_q = mask_op
             
             q  = tl.load(ptr_q,  mask=mask_load_q, other=0.0)
             do = tl.load(ptr_do, mask=mask_load_q, other=0.0)
