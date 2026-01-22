@@ -803,6 +803,7 @@ def hierarchical_attention_backward_high_level_kernel(
     # Inputs
     DS_ptr, Q_ptr, W_ptr, DO_ptr, Gather_Table_ptr,
     DK_ptr, DV_ptr,
+    Lookup_ptr, # [NEW] Forward Topology Table
     # Strides
     sds_b, sds_n, sds_h, sds_lvl,
     sq_b, sq_n, sq_h, sq_d,
@@ -810,12 +811,14 @@ def hierarchical_attention_backward_high_level_kernel(
     sdo_b, sdo_n, sdo_h, sdo_d,
     sdk_b, sdk_node, sdk_h, sdk_d,
     sg_node, sg_dim,
+    sl_n, sl_lvl, # [NEW] Strides for Lookup
     sm_scale, 
     # Constants
     H: tl.constexpr, BLOCK_H: tl.constexpr,
     D: tl.constexpr, BLOCK_D: tl.constexpr,
     N: tl.constexpr,
-    START_LEVEL: tl.constexpr
+    START_LEVEL: tl.constexpr,
+    LEVELS: tl.constexpr # [NEW] Required for bounds check
 ):
     pid = tl.program_id(0)
     b_idx = tl.program_id(1)
@@ -833,8 +836,8 @@ def hierarchical_attention_backward_high_level_kernel(
     shift_val = target_level - (START_LEVEL - 1)
     split_k_mask = (1 << shift_val) - 1
     
-    node_local = rem >> shift_val           
-    split_id   = rem & split_k_mask         
+    node_local = rem >> shift_val            
+    split_id   = rem & split_k_mask          
     
     start_node_global = (2 * N) - (N >> (target_level - 1))
     node_id = start_node_global + node_local
@@ -852,9 +855,15 @@ def hierarchical_attention_backward_high_level_kernel(
     # 3. CONSTANT LOOP SETUP
     # ------------------------------------------------------------------
     CHILDREN_PER_SPLIT: tl.constexpr = 1 << (START_LEVEL - 1)
+
+    # [FIX 1] Safe Index calculation matching Forward Pass
+    calc_idx = target_level + 1
+    w_idx = tl.where(calc_idx < (LEVELS + 1), calc_idx, 0)
     
-    w_idx = target_level + 1
     start_k = split_id * CHILDREN_PER_SPLIT
+
+    # Determine Lookup Column (same as target level)
+    lookup_col = target_level
 
     offs_h = tl.arange(0, BLOCK_H)
     mask_h = offs_h < H
@@ -884,35 +893,41 @@ def hierarchical_attention_backward_high_level_kernel(
             k = start_k + k_offset
             child_idx = child_start_base + k
             
-            # 1. Safety Check
+            # 1. Safety Check (Boundary)
             is_leaf = (child_idx < N) & (child_idx >= 0)
             
-            # 2. Combine with geometric mask
-            mask_2d = mask_op & is_leaf
-            mask_1d = mask_h & is_leaf
+            # 2. [FIX 2] Topology Verification (Causal Mask Fix)
+            # Check if this child ACTUALLY attended to us.
+            off_lookup = (child_idx * sl_n) + (lookup_col * sl_lvl)
+            actual_parent = tl.load(Lookup_ptr + off_lookup, mask=is_leaf, other=-1)
+            is_connected = (actual_parent == node_id)
+
+            # 3. Combine Masks
+            mask_1d = mask_h & is_leaf & is_connected
+            mask_2d = mask_op & is_leaf & is_connected
             
+            # 4. Load DS/W (Protected)
             ptr_ds = ptr_ds_base + (child_idx * sds_n) + (offs_h * sds_h)
             ptr_w  = ptr_w_base  + (child_idx * sw_n)  + (offs_h * sw_h)
             
+            # If masked (Ghost Child), we load 0.0
             ds = tl.load(ptr_ds, mask=mask_1d, other=0.0)[:, None]
             w  = tl.load(ptr_w,  mask=mask_1d, other=0.0)[:, None]
             
+            # 5. Load Q/dO
             ptr_q  = ptr_q_base  + (child_idx * sq_n)  + off_hq_d
             ptr_do = ptr_do_base + (child_idx * sdo_n) + off_hdo_d
             
             q  = tl.load(ptr_q,  mask=mask_2d, other=0.0)
             do = tl.load(ptr_do, mask=mask_2d, other=0.0)
             
-            dk_acc += ds * q.to(tl.float32)
+            # 6. [FIX 3] Accumulate with Scaling
+            dk_acc += (ds * q.to(tl.float32)) * sm_scale
             dv_acc += w * do.to(tl.float32)
 
         # [ATOMIC STORE] 
         ptr_dk = DK_ptr + off_out_base + (offs_d[None, :] * sdk_d)
         ptr_dv = DV_ptr + off_out_base + (offs_d[None, :] * sdk_d)
-        
-        # [CRITICAL FIX] REMOVED DOUBLE SCALING
-        #dk_acc = dk_acc * sm_scale
-        #dv_acc = dv_acc * sm_scale
         
         tl.atomic_add(ptr_dk, dk_acc, mask=mask_op)
         tl.atomic_add(ptr_dv, dv_acc, mask=mask_op)
@@ -1278,6 +1293,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
                 H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
                 N=N,
                 START_LEVEL=CUTOFF_LEVEL + 1,
+                LEVELS,
                 num_warps=2
             )
 
