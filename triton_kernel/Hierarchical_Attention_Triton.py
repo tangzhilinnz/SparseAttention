@@ -2144,6 +2144,7 @@ def run_full_suite_update_X_from_Y():
     
     # 2. Initialize Model (Dropout=0.0 for deterministic check)
     model = HierarchicalSparseAttentionTriton(dim, H, dropout=0.0).cuda().to(check_dtype)
+    model.eval()
     
     # 3. Create Inputs
     # update_X_from_Y takes leaves (x) and parents (y).
