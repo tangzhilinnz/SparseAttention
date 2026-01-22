@@ -789,7 +789,7 @@ def hierarchical_attention_backward_low_level_kernel(
         # [CRITICAL FIX] REMOVED DOUBLE SCALING
         # dk_acc = dk_acc * sm_scale  <-- DELETED
         #dk_acc = dk_acc * sm_scale
-        dv_acc = dv_acc / sm_scale
+        #dv_acc = dv_acc * sm_scale
         
         tl.store(ptr_dk, dk_acc, mask=mask_op)
         tl.store(ptr_dv, dv_acc, mask=mask_op)
@@ -912,7 +912,7 @@ def hierarchical_attention_backward_high_level_kernel(
         
         # [CRITICAL FIX] REMOVED DOUBLE SCALING
         #dk_acc = dk_acc * sm_scale
-        dv_acc = dv_acc / sm_scale
+        #dv_acc = dv_acc * sm_scale
         
         tl.atomic_add(ptr_dk, dk_acc, mask=mask_op)
         tl.atomic_add(ptr_dv, dv_acc, mask=mask_op)
@@ -1199,8 +1199,12 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         # be size (B, 2*N, H, D) or similar. If K is only (B, N, H, D), writing
         # to node_id >= N is dangerous unless handled by a separate buffer.
         # Assuming standard attention where we only want gradients for leaves:
-        dK = torch.zeros_like(K)
-        dV = torch.zeros_like(V)
+        #dK = torch.zeros_like(K)
+        #dV = torch.zeros_like(V)
+
+        dK = torch.zeros_like(K, dtype=torch.float32)
+        dV = torch.zeros_like(V, dtype=torch.float32)
+
         dQ = torch.empty_like(Q)
         DS = torch.empty_like(Weights)
 
