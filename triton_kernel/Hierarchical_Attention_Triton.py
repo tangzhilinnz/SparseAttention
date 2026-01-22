@@ -757,10 +757,13 @@ def hierarchical_attention_backward_low_level_kernel(
 
         for k in range(num_children):
             child_idx = child_start_base + k
-            
-            # [CRITICAL FIX] Safety: Only read Q/dO if child is a LEAF (< N).
-            # Internal nodes (>= N) do not have Q or dO.
+
+            # 1. Safety Check
             is_leaf = (child_idx < N) & (child_idx >= 0)
+            
+            # 2. Combine with geometric mask
+            mask_load = mask_op & is_leaf
+            mask_h = mask_h & is_leaf
             
             # --- Load DS/W (Always valid, they exist for all nodes) ---
             ptr_ds = ptr_ds_base + (child_idx * sds_n) + (offs_h * sds_h)
@@ -773,11 +776,8 @@ def hierarchical_attention_backward_low_level_kernel(
             ptr_q  = ptr_q_base  + (child_idx * sq_n)  + off_hq_d
             ptr_do = ptr_do_base + (child_idx * sdo_n) + off_hdo_d
             
-            # Apply `is_leaf` mask here to prevent OOB/Garbage reads
-            mask_load_q = mask_op
-            
-            q  = tl.load(ptr_q,  mask=mask_load_q, other=0.0)
-            do = tl.load(ptr_do, mask=mask_load_q, other=0.0)
+            q  = tl.load(ptr_q,  mask=mask_load, other=0.0)
+            do = tl.load(ptr_do, mask=mask_load, other=0.0)
             
             dk_acc += ds * q.to(tl.float32)
             dv_acc += w * do.to(tl.float32)
@@ -884,8 +884,12 @@ def hierarchical_attention_backward_high_level_kernel(
             k = start_k + k_offset
             child_idx = child_start_base + k
             
-            # [CRITICAL FIX] Safety: Only read Q/dO if child is a LEAF (< N).
+            # 1. Safety Check
             is_leaf = (child_idx < N) & (child_idx >= 0)
+            
+            # 2. Combine with geometric mask
+            mask_load = mask_op & is_leaf
+            mask_h = mask_h & is_leaf
             
             ptr_ds = ptr_ds_base + (child_idx * sds_n) + (offs_h * sds_h)
             ptr_w  = ptr_w_base  + (child_idx * sw_n)  + (offs_h * sw_h)
@@ -896,11 +900,8 @@ def hierarchical_attention_backward_high_level_kernel(
             ptr_q  = ptr_q_base  + (child_idx * sq_n)  + off_hq_d
             ptr_do = ptr_do_base + (child_idx * sdo_n) + off_hdo_d
             
-            # Apply `is_leaf` mask here
-            mask_load_q = mask_op
-            
-            q  = tl.load(ptr_q,  mask=mask_load_q, other=0.0)
-            do = tl.load(ptr_do, mask=mask_load_q, other=0.0)
+            q  = tl.load(ptr_q,  mask=mask_load, other=0.0)
+            do = tl.load(ptr_do, mask=mask_load, other=0.0)
             
             dk_acc += ds * q.to(tl.float32)
             dv_acc += w * do.to(tl.float32)
