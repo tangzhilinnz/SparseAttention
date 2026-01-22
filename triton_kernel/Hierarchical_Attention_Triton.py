@@ -760,7 +760,7 @@ def hierarchical_attention_backward_low_level_kernel(
             
             # [CRITICAL FIX] Safety: Only read Q/dO if child is a LEAF (< N).
             # Internal nodes (>= N) do not have Q or dO.
-            is_leaf = (child_idx < N)
+            is_leaf = (child_idx < N + N + N)
             
             # --- Load DS/W (Always valid, they exist for all nodes) ---
             ptr_ds = ptr_ds_base + (child_idx * sds_n) + (offs_h * sds_h)
@@ -884,7 +884,7 @@ def hierarchical_attention_backward_high_level_kernel(
             child_idx = child_start_base + k
             
             # [CRITICAL FIX] Safety: Only read Q/dO if child is a LEAF (< N).
-            is_leaf = (child_idx < N)
+            is_leaf = (child_idx < N + N + N)
             
             ptr_ds = ptr_ds_base + (child_idx * sds_n) + (offs_h * sds_h)
             ptr_w  = ptr_w_base  + (child_idx * sw_n)  + (offs_h * sw_h)
