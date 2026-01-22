@@ -2122,9 +2122,9 @@ def run_full_suite_update_X_from_Y():
 
     # 1. Setup Dimensions for Correctness
     # N needs to be a power of 2 usually for easier tree construction logic.
-    B, N, D, H = 1, 2048 * 128, 64, 16
+    #B, N, D, H = 1, 2048 * 128, 64, 16
     #B, N, D, H = 16, 2048, 64, 16
-    #B, N, D, H = 2, 2048 * 32, 64, 16
+    B, N, D, H = 2, 2048 * 32, 64, 16
     dim = H * D
     
     # 2. Initialize Model (Dropout=0.0 for deterministic check)
