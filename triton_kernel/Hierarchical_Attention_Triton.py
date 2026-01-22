@@ -1470,8 +1470,7 @@ def build_tree_topology(seq_len, is_causal=True, device="cuda", dtype=torch.int3
     siblings = all_nodes ^ 1
     siblings = torch.clamp(siblings, max=total_nodes-1)
 
-    # [FIX] Use int64 for valid 8-byte loads in Triton
-    gather_info = torch.full((total_nodes, 3), -1, dtype=torch.int64, device=device)
+    gather_info = torch.full((total_nodes, 3), -1, dtype=torch.int32, device=device)
 
     if is_causal:
         should_gather = siblings > all_nodes
