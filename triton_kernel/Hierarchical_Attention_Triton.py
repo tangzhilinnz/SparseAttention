@@ -1205,8 +1205,8 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         dK = torch.zeros_like(K, dtype=torch.float32)
         dV = torch.zeros_like(V, dtype=torch.float32)
 
-        dQ = torch.empty_like(Q, dtype=torch.float32)
-        DS = torch.empty_like(Weights, dtype=torch.float32)
+        dQ = torch.empty_like(Q)
+        DS = torch.empty_like(Weights)
         
         # 2. Compute dS (Main Stream)
         grid_ds = (N, B)
