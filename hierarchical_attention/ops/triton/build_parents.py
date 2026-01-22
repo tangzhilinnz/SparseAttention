@@ -202,3 +202,15 @@ def build_parent_nodes_backward_kernel(
         tl.store(dkp_ptr_base + (offs_h[:, None]*sdkp_h) + (offs_d[None, :]*sdkp_d), ds_self[:, None] * q, mask=mask)
         tl.store(dkc0_ptr_base + (offs_h[:, None]*sdkc_h) + (offs_d[None, :]*sdkc_d), ds_c0[:, None] * q, mask=mask)
         tl.store(dkc1_ptr_base + (offs_h[:, None]*sdkc_h) + (offs_d[None, :]*sdkc_d), ds_c1[:, None] * q, mask=mask)
+
+
+# Persistent Kernels
+# The Concept: Instead of launching a kernel 1,000 times, you launch one kernel
+#  that stays alive on the GPU and "polls" a memory location for new data.
+  
+# The Interview Pitch: > "To bypass the driver's launch latency entirely, I can
+# use a Persistent Kernel pattern. I launch a grid that occupies the SMs once,
+# and the threads run in a while loop, consuming data from a producer-consumer
+# queue in shared or global memory. This turns a series of discrete, high-overhead
+# launches into a single stream of execution, which is critical for sub-microsecond
+# response times."
