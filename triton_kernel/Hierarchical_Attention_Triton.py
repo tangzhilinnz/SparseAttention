@@ -692,7 +692,7 @@ def hierarchical_attention_backward_low_level_kernel(
     sdo_b, sdo_n, sdo_h, sdo_d,
     sdk_b, sdk_node, sdk_h, sdk_d,
     sg_node, sg_dim,
-    sm_scale, # [FIX] Add Scaling Factor
+    sm_scale, # Scaling Factor (Used implicitly in dS, but NOT applied to dK output again)
     # Constants
     H: tl.constexpr, BLOCK_H: tl.constexpr,
     D: tl.constexpr, BLOCK_D: tl.constexpr,
@@ -703,60 +703,33 @@ def hierarchical_attention_backward_low_level_kernel(
     b_idx = tl.program_id(1)
 
     # ------------------------------------------------------------------
-    # 1. OPTIMIZED GEOMETRIC LOOP (Fully Unrolled & Constant Folded)
+    # 1. OPTIMIZED GEOMETRIC LOOP
     # ------------------------------------------------------------------
-    # Pre-calculate the constant shift for Node ID.
-    # Mathematical Fact: (current_node_offset - current_block_offset) is ALWAYS == N.
-    # Therefore, node_id is ALWAYS (N + pid) regardless of the level.
-    # This removes 2 additions from inside the loop.
     node_id = N + pid
     
-    # Use static_range to ensure the compiler unrolls this loop 100%.
-    # Each iteration becomes a standalone block of PTX code.
     target_level = 0
-    
-    # We maintain the 'if' structure because it allows for "Early Exit".
-    # (Threads that match Level 1 don't need to do work for Level 2).
-    # We use a 'found' flag to prevent overwriting if we continue checking.
     found = 0
     
     for lvl in tl.static_range(1, MAX_LEVEL + 1):
-        # 1. Calculate Bounds CONSTANTLY (No accumulation dependency)
         # Level starts at: N - N/(2^(L-1))
         # Level ends at:   N - N/(2^L)
-        # Since N and lvl are constants, Triton calculates these at compile time.
-        
-        # e.g. Level 1: Start=0, End=N/2
-        # e.g. Level 2: Start=N/2, End=3N/4
         lvl_start = N - (N >> (lvl - 1))
         lvl_end   = N - (N >> lvl)
         
-        # 2. Check (Pure Comparison, No Arithmetic)
-        # We check 'if not found' first to simulate an 'else-if' chain efficiently
         if found == 0:
-            # We only need to check the upper bound 'lvl_end' 
-            # because the lower bound is implicitly handled by the previous iteration's failure
-            # (or it's 0 for the first level).
             if pid < lvl_end:
                 target_level = lvl
-                # We already calculated node_id = N + pid outside!
                 found = 1
 
     # ------------------------------------------------------------------
-    # 2. GATHER LOGIC (With Early Stop)
+    # 2. GATHER LOGIC
     # ------------------------------------------------------------------  
-    # Gather Table Lookup
     tab_ptr = Gather_Table_ptr + (node_id * sg_node)
     child_start_base = tl.load(tab_ptr + 0)
 
-    # [OPTIMIZATION] EARLY STOP
-    # If this node has no children, we are done. 
-    # Since dK and dV are initialized to 0.0 by torch.zeros_like(), 
-    # we don't need to write anything.
+    # EARLY STOP if no children
     if child_start_base == -1:
         return
-
-    # --- Everything below is SKIPPED for leaf/invalid nodes ---
 
     num_children = 1 << target_level
     w_idx = target_level + 1
@@ -779,31 +752,42 @@ def hierarchical_attention_backward_low_level_kernel(
         dk_acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
         dv_acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
 
-        # We already checked has_children above, so we know it's True here
         off_hq_d  = (offs_h[:, None] * sq_h)  + (offs_d[None, :] * sq_d)
         off_hdo_d = (offs_h[:, None] * sdo_h) + (offs_d[None, :] * sdo_d)
 
         for k in range(num_children):
             child_idx = child_start_base + k
             
+            # [CRITICAL FIX] Safety: Only read Q/dO if child is a LEAF (< N).
+            # Internal nodes (>= N) do not have Q or dO.
+            is_leaf = (child_idx < N)
+            
+            # --- Load DS/W (Always valid, they exist for all nodes) ---
             ptr_ds = ptr_ds_base + (child_idx * sds_n) + (offs_h * sds_h)
             ptr_w  = ptr_w_base  + (child_idx * sw_n)  + (offs_h * sw_h)
+            
             ds = tl.load(ptr_ds, mask=mask_h, other=0.0)[:, None]
             w  = tl.load(ptr_w,  mask=mask_h, other=0.0)[:, None]
             
+            # --- Load Q/dO (Only if Leaf) ---
             ptr_q  = ptr_q_base  + (child_idx * sq_n)  + off_hq_d
             ptr_do = ptr_do_base + (child_idx * sdo_n) + off_hdo_d
-            q  = tl.load(ptr_q,  mask=mask_op, other=0.0)
-            do = tl.load(ptr_do, mask=mask_op, other=0.0)
             
-            #dk_acc += ds * q
-            #dv_acc += w * do
+            # Apply `is_leaf` mask here to prevent OOB/Garbage reads
+            mask_load_q = mask_op & is_leaf
+            
+            q  = tl.load(ptr_q,  mask=mask_load_q, other=0.0)
+            do = tl.load(ptr_do, mask=mask_load_q, other=0.0)
+            
             dk_acc += ds * q.to(tl.float32)
             dv_acc += w * do.to(tl.float32)
 
         # Store Result
         ptr_dk = DK_ptr + off_out_base + (offs_d[None, :] * sdk_d)
         ptr_dv = DV_ptr + off_out_base + (offs_d[None, :] * sdk_d)
+        
+        # [CRITICAL FIX] REMOVED DOUBLE SCALING
+        # dk_acc = dk_acc * sm_scale  <-- DELETED
         
         tl.store(ptr_dk, dk_acc, mask=mask_op)
         tl.store(ptr_dv, dv_acc, mask=mask_op)
@@ -824,7 +808,7 @@ def hierarchical_attention_backward_high_level_kernel(
     sdo_b, sdo_n, sdo_h, sdo_d,
     sdk_b, sdk_node, sdk_h, sdk_d,
     sg_node, sg_dim,
-    sm_scale, # [FIX] Add Scaling Factor
+    sm_scale, 
     # Constants
     H: tl.constexpr, BLOCK_H: tl.constexpr,
     D: tl.constexpr, BLOCK_D: tl.constexpr,
@@ -835,70 +819,41 @@ def hierarchical_attention_backward_high_level_kernel(
     b_idx = tl.program_id(1)
 
     # ------------------------------------------------------------------
-    # 1. BITWISE PID DECODING (Extreme Optimization)
+    # 1. BITWISE PID DECODING
     # ------------------------------------------------------------------
-    # Constants derived from N and START_LEVEL
-    # SHIFT_GRID = log2(BLOCKS_PER_LVL) = log2(N) - (START_LEVEL - 1)
-    # Note: We rely on the compiler to fold these constants.
-    
-    # Blocks Per Level = N / 2^(START_LEVEL - 1)
     BLOCKS_PER_LVL: tl.constexpr = N >> (START_LEVEL - 1)
     BLOCK_MASK: tl.constexpr = BLOCKS_PER_LVL - 1
-    
-    # 1. Which Level? (Integer Div -> Right Shift?)
-    # Since BLOCKS_PER_LVL is power of 2, 'pid // BLOCKS' is a Shift.
-    # However, 'pid' is dynamic, so we can just use integer div, 
-    # Triton/LLVM optimizes 'div by power-of-2' into a shift automatically.
-    # But for 'rem', using AND is explicitly cleaner.
     
     lvl_offset = pid // BLOCKS_PER_LVL
     target_level = START_LEVEL + lvl_offset
     
-    # 2. Relative Index (Modulo -> Bitwise AND)
     rem = pid & BLOCK_MASK
-    
-    # 3. Calculate Split-K Parameters
-    # shift_val = L - (START_LEVEL - 1)
     shift_val = target_level - (START_LEVEL - 1)
-    
-    # split_k = 1 << shift_val. 
-    # split_k_mask = split_k - 1 = (1 << shift_val) - 1.
     split_k_mask = (1 << shift_val) - 1
     
-    # 4. Decode Node vs Split (Bitwise)
-    node_local = rem >> shift_val           # Division by split_k
-    split_id   = rem & split_k_mask         # Modulo split_k
+    node_local = rem >> shift_val           
+    split_id   = rem & split_k_mask         
     
-    # 5. Global Node ID
     start_node_global = (2 * N) - (N >> (target_level - 1))
     node_id = start_node_global + node_local
 
     # ------------------------------------------------------------------
-    # 2. EARLY EXIT (The Optimization)
+    # 2. EARLY EXIT
     # ------------------------------------------------------------------
-    # Load Table Entry FIRST.
     tab_ptr = Gather_Table_ptr + (node_id * sg_node)
     child_start_base = tl.load(tab_ptr + 0)
     
-    # If -1, this node is empty. Exit immediately.
-    # This prevents all subsequent math, pointer arithmetic, and atomic locking.
     if child_start_base == -1:
         return
 
     # ------------------------------------------------------------------
     # 3. CONSTANT LOOP SETUP
     # ------------------------------------------------------------------
-    # Only reached if node has children.
-    
-    # Ratio = 2^L / 2^(L - (START-1)) = 2^(START-1)
     CHILDREN_PER_SPLIT: tl.constexpr = 1 << (START_LEVEL - 1)
     
     w_idx = target_level + 1
-    
-    # Start K
     start_k = split_id * CHILDREN_PER_SPLIT
 
-    # Base Pointers (Hoisted)
     offs_h = tl.arange(0, BLOCK_H)
     mask_h = offs_h < H
     off_out_base = (b_idx * sdk_b) + (node_id * sdk_node) + (offs_h[:, None] * sdk_h)
@@ -919,41 +874,41 @@ def hierarchical_attention_backward_high_level_kernel(
         dk_acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
         dv_acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
 
-        # Note: We don't need 'if has_children' check here because 
-        # we would have returned above if it was False.
         off_hq_d  = (offs_h[:, None] * sq_h)  + (offs_d[None, :] * sq_d)
         off_hdo_d = (offs_h[:, None] * sdo_h) + (offs_d[None, :] * sdo_d)
 
         # Constant Unrolled Loop
         for k_offset in range(CHILDREN_PER_SPLIT):
-            # Calculate offsets (Pure ALU, no branches)
             k = start_k + k_offset
             child_idx = child_start_base + k
             
-            # Pointers
+            # [CRITICAL FIX] Safety: Only read Q/dO if child is a LEAF (< N).
+            is_leaf = (child_idx < N)
+            
             ptr_ds = ptr_ds_base + (child_idx * sds_n) + (offs_h * sds_h)
             ptr_w  = ptr_w_base  + (child_idx * sw_n)  + (offs_h * sw_h)
             
-            # Load
             ds = tl.load(ptr_ds, mask=mask_h, other=0.0)[:, None]
             w  = tl.load(ptr_w,  mask=mask_h, other=0.0)[:, None]
             
             ptr_q  = ptr_q_base  + (child_idx * sq_n)  + off_hq_d
             ptr_do = ptr_do_base + (child_idx * sdo_n) + off_hdo_d
             
-            q  = tl.load(ptr_q,  mask=mask_op, other=0.0)
-            do = tl.load(ptr_do, mask=mask_op, other=0.0)
+            # Apply `is_leaf` mask here
+            mask_load_q = mask_op & is_leaf
             
-            # FMA
-            #dk_acc += ds * q
-            #dv_acc += w * do
+            q  = tl.load(ptr_q,  mask=mask_load_q, other=0.0)
+            do = tl.load(ptr_do, mask=mask_load_q, other=0.0)
+            
             dk_acc += ds * q.to(tl.float32)
             dv_acc += w * do.to(tl.float32)
 
         # [ATOMIC STORE] 
-        # We only reach here if children exist, so we never atomic_add to empty nodes.
         ptr_dk = DK_ptr + off_out_base + (offs_d[None, :] * sdk_d)
         ptr_dv = DV_ptr + off_out_base + (offs_d[None, :] * sdk_d)
+        
+        # [CRITICAL FIX] REMOVED DOUBLE SCALING
+        # dk_acc = dk_acc * sm_scale <-- DELETED
         
         tl.atomic_add(ptr_dk, dk_acc, mask=mask_op)
         tl.atomic_add(ptr_dv, dv_acc, mask=mask_op)
