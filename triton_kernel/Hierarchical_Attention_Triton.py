@@ -2113,8 +2113,8 @@ def run_full_suite_update_X_from_Y():
     # N needs to be a power of 2 usually for easier tree construction logic.
     #B, N, D, H = 1, 2048 * 128, 64, 16
     #B, N, D, H = 16, 2048, 64, 16
-    #B, N, D, H = 2, 2048 * 32, 64, 16
-    B, N, D, H = 2, 64, 64, 16
+    B, N, D, H = 2, 2048 * 32, 64, 16
+    #B, N, D, H = 2, 64, 64, 16
     dim = H * D
     
     # 2. Initialize Model (Dropout=0.0 for deterministic check)
@@ -2182,48 +2182,48 @@ def run_full_suite_update_X_from_Y():
     # FP32: stricter (e.g., 1e-4), FP16: looser (e.g., 1e-2)
     tol = 1e-3 if check_dtype == torch.float32 else 5e-2
     
-    try:
-        assert torch.allclose(out_ref, out_tri, atol=tol), f"Forward pass mismatch! (tol={tol})"
-        assert torch.allclose(x_ref.grad, x_tri.grad, atol=tol), f"Gradient X mismatch! (tol={tol})"
-        assert torch.allclose(y_ref.grad, y_tri.grad, atol=tol), f"Gradient Y mismatch! (tol={tol})"
-        print(f"SUCCESS: Triton kernel matches PyTorch reference (within {check_dtype} tolerance).")
+    #try:
+    assert torch.allclose(out_ref, out_tri, atol=tol), f"Forward pass mismatch! (tol={tol})"
+    assert torch.allclose(x_ref.grad, x_tri.grad, atol=tol), f"Gradient X mismatch! (tol={tol})"
+    assert torch.allclose(y_ref.grad, y_tri.grad, atol=tol), f"Gradient Y mismatch! (tol={tol})"
+    print(f"SUCCESS: Triton kernel matches PyTorch reference (within {check_dtype} tolerance).")
         
-        # --- ANALYSIS: Breakdown Error by Level ---
-        print(f"\n{'='*30}")
-        print("ANALYSIS: Grad Y Error by Level")
-        print(f"{'='*30}")
+    # --- ANALYSIS: Breakdown Error by Level ---
+    print(f"\n{'='*30}")
+    print("ANALYSIS: Grad Y Error by Level")
+    print(f"{'='*30}")
         
-        # We need the topology to mapping nodes to levels
-        tables = model._get_lookup_table(N, is_causal=(mask is not None), device='cuda')
-        gather_info = tables['backward_gather'] # [Total_Nodes, 3] -> [Start, End, Level]
+    # We need the topology to mapping nodes to levels
+    tables = model._get_lookup_table(N, is_causal=(mask is not None), device='cuda')
+    gather_info = tables['backward_gather'] # [Total_Nodes, 3] -> [Start, End, Level]
         
-        # All nodes: 0..Total-1. But Y corresponds to Parents (Nodes N..Total-1)
-        # Note: Y has shape [B, N-1, D] corresponding to nodes N to 2N-2.
+    # All nodes: 0..Total-1. But Y corresponds to Parents (Nodes N..Total-1)
+    # Note: Y has shape [B, N-1, D] corresponding to nodes N to 2N-2.
         
-        # Get Levels for all Y nodes
-        # gather_info Index N corresponds to Y index 0
-        total_nodes = 2*N - 1
-        y_node_indices = torch.arange(N, total_nodes, device='cuda')
-        y_levels = gather_info[y_node_indices, 2] # Level of each Y node
+    # Get Levels for all Y nodes
+    # gather_info Index N corresponds to Y index 0
+    total_nodes = 2*N - 1
+    y_node_indices = torch.arange(N, total_nodes, device='cuda')
+    y_levels = gather_info[y_node_indices, 2] # Level of each Y node
         
-        diff_y = (y_ref.grad.float() - y_tri.grad.float()).abs().sum(dim=-1) # [B, N-1]
+    diff_y = (y_ref.grad.float() - y_tri.grad.float()).abs().sum(dim=-1) # [B, N-1]
         
-        # Bucket by level
-        max_lvl = int(math.log2(N))
-        print(f"{'Level':<6} | {'Count':<8} | {'Max Diff':<12} | {'Mean Diff':<12}")
-        print("-" * 50)
+    # Bucket by level
+    max_lvl = int(math.log2(N))
+    print(f"{'Level':<6} | {'Count':<8} | {'Max Diff':<12} | {'Mean Diff':<12}")
+    print("-" * 50)
         
-        for lvl in range(1, max_lvl + 1):
-             mask_lvl = (y_levels == lvl)
-             if mask_lvl.any():
-                 errs = diff_y[:, mask_lvl]
-                 print(f"{lvl:<6} | {errs.numel():<8} | {errs.max().item():<12.8f} | {errs.mean().item():<12.8f}")
-        print("-" * 50)
-        print("Explanation: Higher levels sum more gradients (2^L terms), causing higher FP accumulation error.")
+    for lvl in range(1, max_lvl + 1):
+            mask_lvl = (y_levels == lvl)
+            if mask_lvl.any():
+                errs = diff_y[:, mask_lvl]
+                print(f"{lvl:<6} | {errs.numel():<8} | {errs.max().item():<12.8f} | {errs.mean().item():<12.8f}")
+    print("-" * 50)
+    print("Explanation: Higher levels sum more gradients (2^L terms), causing higher FP accumulation error.")
 
-    except AssertionError as e:
-        print(f"\n{e}")
-        # Proceed regardless
+    #except AssertionError as e:
+    #    print(f"\n{e}")
+    #    # Proceed regardless
 
     # ==========================================================================
     # 2. PERFORMANCE BENCHMARK (Float16 - Large Scale)
