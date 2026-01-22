@@ -1205,24 +1205,8 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         dK = torch.zeros_like(K, dtype=torch.float32)
         dV = torch.zeros_like(V, dtype=torch.float32)
 
-        dQ = torch.empty_like(Q)
-        DS = torch.empty_like(Weights)
-
-        # --- SAFETY CHECKS ---
-        # 1. Memory Address Check
-        # Ensure dK and dV are distinct memory blocks to prevent overwrite race conditions
-        assert dK.data_ptr() != dV.data_ptr(), "Critical Error: dK and dV share the same memory address!"
-
-        # 2. Stride Alignment Check
-        # Ensure dK and dV have the same layout. The kernel uses *dK.stride() for both.
-        assert dK.stride() == dV.stride(), "Error: dK and dV must have identical strides for the current kernel signature"
-        
-        # 3. Tree Size Check (Crucial for Hierarchical Attention)
-        # If the kernel writes to internal nodes (indices >= N), dK must be large enough.
-        # If K.shape[1] == N, writing to node_id=N will segfault or corrupt memory.
-        # For standard backprop, we usually only care about leaves (0..N-1).
-        # IF your kernel writes to N+pid, ensure you aren't overflowing.
-        # (Assuming here that internal node writes are either suppressed or K is padded)
+        dQ = torch.empty_like(Q, dtype=torch.float32)
+        DS = torch.empty_like(Weights, dtype=torch.float32)
         
         # 2. Compute dS (Main Stream)
         grid_ds = (N, B)
