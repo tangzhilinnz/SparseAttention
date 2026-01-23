@@ -1228,6 +1228,19 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=32, LEVELS=LEVELS,
             HAS_MASK=HAS_MASK, num_warps=2
         )
+
+        # --- DEBUG: CHECK FOR EXPLODING GRADIENTS ---
+        # 1. Sync GPU to ensure kernels are done writing to dQ, dK, dV
+        torch.cuda.synchronize()
+
+        # 2. Print Stats
+        # Using .float() to prevent overflow if they are fp16 during the sum/mean calculation
+        print(f" -> Grad dQ Mean: {dQ.float().abs().mean().item():.6f} | Max: {dQ.float().abs().max().item():.6f}")
+        print(f" -> Grad dK Mean: {dK.float().abs().mean().item():.6f} | Max: {dK.float().abs().max().item():.6f}")
+        print(f" -> Grad dV Mean: {dV.float().abs().mean().item():.6f} | Max: {dV.float().abs().max().item():.6f}")
+        print(f" -> Grad DS Mean: {DS.float().abs().mean().item():.6f} | Max: {DS.float().abs().max().item():.6f}")
+        print(f" -> Weights Mean: {Weights.float().abs().mean().item():.6f} | Max: {Weights.float().abs().max().item():.6f}")
+        print(f" -> Grad output Mean: {grad_output.float().abs().mean().item():.6f} | Max: {grad_output.float().abs().max().item():.6f}")
             
         return dQ, dK, dV, None, None, None
 
