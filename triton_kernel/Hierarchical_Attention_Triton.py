@@ -1139,7 +1139,8 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         grad_output_4d = grad_output.view(B, N, H, D)
         
         # 2. Compute dS (Main Stream)
-        DS = torch.empty_like(Weights)
+        #DS = torch.empty_like(Weights)
+        DS = torch.zeros_like(Weights)
         grid_ds = (N, B)
         HAS_MASK = (mask_table is not None)
         mask_ptr_safe = mask_table if HAS_MASK else Weights
@@ -1156,7 +1157,8 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         # --- SETUP PARALLELISM ---
         dK = torch.zeros_like(K)
         dV = torch.zeros_like(V)
-        dQ = torch.empty_like(Q)
+        #dQ = torch.empty_like(Q)
+        dQ = torch.zeros_like(Q)
 
         # --- BRANCH 2: dK/dV (Dependent on dS) ---
         
