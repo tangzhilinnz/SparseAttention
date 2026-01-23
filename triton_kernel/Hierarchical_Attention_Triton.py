@@ -1225,7 +1225,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         hierarchical_attention_backward_dQ_kernel[grid_dq](
             DS, K, idx_table, dQ, mask_ptr_safe,
             *DS.stride(), *K.stride(), *idx_table.stride(), *dQ.stride(),
-            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=32, LEVELS=LEVELS,
+            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, LEVELS=LEVELS,
             HAS_MASK=HAS_MASK, num_warps=2
         )
 
