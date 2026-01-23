@@ -2187,8 +2187,8 @@ def run_full_suite_update_X_from_Y():
     dout = torch.randn_like(x, device='cuda', dtype=check_dtype)
 
     # Optional mask 
-    #mask = None
-    mask = torch.ones((B, N), dtype=torch.bool, device='cuda')
+    mask = None
+    #mask = torch.ones((B, N), dtype=torch.bool, device='cuda')
 
     print(f"Input Shapes -> X: {x.shape}, Y: {y.shape}, Dtype: {x.dtype}")
 
