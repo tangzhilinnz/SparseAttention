@@ -31,7 +31,8 @@ def build_tree_topology(seq_len: int, is_causal: bool = True, device: str = "cud
     forward_mask = torch.zeros((seq_len, level_num), dtype=torch.bool, device=device)
     
     # Vectorized "Climb Up" Logic
-    n_cur = torch.arange(seq_len, device=device, dtype=torch.int64)
+    #n_cur = torch.arange(seq_len, device=device, dtype=torch.int64)
+    n_cur = torch.arange(seq_len, device=device, dtype=dtype)
     
     for lvl in range(level_num):
         if lvl == 0:
@@ -60,7 +61,8 @@ def build_tree_topology(seq_len: int, is_causal: bool = True, device: str = "cud
     # ===============================================================
     # 2. Backward Table Construction (Node -> Leaf Range)
     # ===============================================================
-    subtree_ranges = torch.zeros((total_nodes, 2), dtype=torch.int64, device=device)
+    #subtree_ranges = torch.zeros((total_nodes, 2), dtype=torch.int64, device=device)
+    subtree_ranges = torch.zeros((total_nodes, 2), dtype=dtype, device=device)
     node_levels = torch.zeros(total_nodes, dtype=dtype, device=device)
     
     # Initialize Leaves (Level 0)
