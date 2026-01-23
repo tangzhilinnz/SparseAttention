@@ -1154,8 +1154,10 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         )
 
         # --- SETUP PARALLELISM ---
-        dK = torch.zeros_like(K)
-        dV = torch.zeros_like(V)
+        dK = torch.zeros_like(K, dtype=torch.float32)
+        dV = torch.zeros_like(V, dtype=torch.float32)
+        #dK = torch.zeros_like(K)
+        #dV = torch.zeros_like(V)
         dQ = torch.empty_like(Q)
 
         # --- BRANCH 2: dK/dV (Dependent on dS) ---
@@ -1242,7 +1244,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         print(f" -> Weights Mean: {Weights.float().abs().mean().item():.6f} | Max: {Weights.float().abs().max().item():.6f}")
         print(f" -> Grad output Mean: {grad_output.float().abs().mean().item():.6f} | Max: {grad_output.float().abs().max().item():.6f}")
             
-        return dQ, dK, dV, None, None, None
+        return dQ, dK.to(K.dtype), dV.to(V.dtype), None, None, None
 
 def hierarchical_fused_attention(Q, K, V, idx_table, gather_table, mask_table=None):
     """
