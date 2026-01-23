@@ -1210,18 +1210,10 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         grad_output_4d = grad_output.view(B, N, H, D)
         
         # --- SETUP OUTPUTS (Must allocate BEFORE checks) ---
-        # Note: If your tree has internal nodes (indices > N), dK/dV should technically
-        # be size (B, 2*N, H, D) or similar. If K is only (B, N, H, D), writing
-        # to node_id >= N is dangerous unless handled by a separate buffer.
-        # Assuming standard attention where we only want gradients for leaves:
-        #dK = torch.zeros_like(K)
-        #dV = torch.zeros_like(V)
-
         dK = torch.zeros_like(K, dtype=torch.float32)
         dV = torch.zeros_like(V, dtype=torch.float32)
 
-        # [FIX] Use zeros_like for dQ to ensure clean memory for atomic accumulations
-        dQ = torch.zeros_like(Q, dtype=torch.float32)
+        dQ = torch.empty_like(Q)
         DS = torch.empty_like(Weights)
         
         # 2. Compute dS (Main Stream)
@@ -1249,7 +1241,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, num_warps=2
         )
 
-        # --- Dynamic CUTOFF_LEVEL Logic (Heuristic from helper) ---
+        # --- Dynamic CUTOFF_LEVEL Logic ---
         CUTOFF_LEVEL = get_cutoff_level(N)
         
         # --- KERNEL A: Low Levels (Split=1) ---
@@ -1265,7 +1257,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
                 dK, dV,
                 *DS.stride(), *Q.stride(), *Weights.stride(),
                 *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
-                sm_scale, # [FIX] Pass Scaling Factor
+                sm_scale, # Correctly passed here in original
                 H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
                 N=N, 
                 MAX_LEVEL=limit, 
@@ -1277,26 +1269,39 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             num_high_levels = LEVELS - CUTOFF_LEVEL
             
             # Constant blocks per level = N >> (CUTOFF)
-            # Actually, logic dictates: N >> (START_LEVEL - 1)
-            # If START_LEVEL=9, we need N >> 8.
             blocks_per_lvl = N >> CUTOFF_LEVEL
             
             total_blocks_high = blocks_per_lvl * num_high_levels
             
             grid_high = (total_blocks_high, B)
             
+            # [FIXED CALL START]
             hierarchical_attention_backward_high_level_kernel[grid_high](
+                # 1. Pointers
                 DS, Q, Weights, grad_output_4d, gather_table,
                 dK, dV,
-                *DS.stride(), *Q.stride(), *Weights.stride(),
-                *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
-                sm_scale, # [FIX] Pass Scaling Factor
+                idx_table,  # <--- [FIX 1] Added Lookup_ptr
+                
+                # 2. Strides
+                *DS.stride(), 
+                *Q.stride(), 
+                *Weights.stride(),
+                *grad_output_4d.stride(), 
+                *dK.stride(), 
+                *gather_table.stride(), # sg_node, sg_dim
+                idx_table.stride(-2), idx_table.stride(-1), # <--- [FIX 2] Added sl_n, sl_lvl
+                
+                # 3. Scalar
+                sm_scale,   # <--- [FIX 3] Added sm_scale (positional arg)
+
+                # 4. Meta-parameters (constexpr)
                 H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
                 N=N,
                 START_LEVEL=CUTOFF_LEVEL + 1,
                 LEVELS=LEVELS,
                 num_warps=2
             )
+            # [FIXED CALL END]
 
         # --- BRANCH 1: dQ (Independent) ---
         grid_dq = (N, B)
@@ -1307,23 +1312,11 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             HAS_MASK=HAS_MASK, num_warps=2
         )
 
-
         # --- DEBUG: CHECK FOR EXPLODING GRADIENTS ---
-        # 1. Sync GPU to ensure kernels are done writing to dQ, dK, dV
-        torch.cuda.synchronize()
-
-        # 2. Print Stats
-        # Using .float() to prevent overflow if they are fp16 during the sum/mean calculation
-        print(f" -> Grad dQ Mean: {dQ.float().abs().mean().item():.6f} | Max: {dQ.float().abs().max().item():.6f}")
-        print(f" -> Grad dK Mean: {dK.float().abs().mean().item():.6f} | Max: {dK.float().abs().max().item():.6f}")
-        print(f" -> Grad dV Mean: {dV.float().abs().mean().item():.6f} | Max: {dV.float().abs().max().item():.6f}")
-        print(f" -> Grad DS Mean: {DS.float().abs().mean().item():.6f} | Max: {DS.float().abs().max().item():.6f}")
-        print(f" -> Weights Mean: {Weights.float().abs().mean().item():.6f} | Max: {Weights.float().abs().max().item():.6f}")
-        print(f" -> Grad output Mean: {grad_output.float().abs().mean().item():.6f} | Max: {grad_output.float().abs().max().item():.6f}")
+        # torch.cuda.synchronize()
+        # print(f" -> Grad dQ Mean: {dQ.float().abs().mean().item():.6f}")
             
-        # [FIX] Return tuple must match inputs: (Q, K, V, idx, gather, Weights, mask)
-        # Weights (6th input) corresponds to DS gradient
-        return dQ, dK, dV, None, None, DS, None
+        return dQ, dK, dV, None, None, None
 
 def hierarchical_fused_attention(Q, K, V, idx_table, gather_table, mask_table=None):
     """
