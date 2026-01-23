@@ -566,7 +566,7 @@ def hierarchical_attention_backward_dS_kernel(
     
     ds_self = w_self * (dp_self - sum_wdp) * sm_scale
     ds_cross = w_cross * (dp_cross - sum_wdp[:, None]) * sm_scale
-    ds_cross = tl.where(mask_valid_cross[None, :], ds_cross, 0.0)
+
     # -----------------------------------------------------------
     # 5. Store dS
     # -----------------------------------------------------------
@@ -2234,6 +2234,19 @@ def run_full_suite_update_X_from_Y():
 
     print(f"   -> Ref Grad Y Mean: {y_ref.grad.float().abs().mean():.4f} | Max: {y_ref.grad.float().abs().max():.4f}")
     print(f"   -> Tri Grad Y Mean: {y_tri.grad.float().abs().mean():.4f} | Max: {y_tri.grad.float().abs().max():.4f}")
+
+
+    # Calculate magnitudes
+    grad_ref_mag = y_ref.grad.float().abs().mean()
+    grad_tri_mag = y_tri.grad.float().abs().mean()
+
+    print(f"Ref Grad Magnitude: {grad_ref_mag:.6f}")
+    print(f"Tri Grad Magnitude: {grad_tri_mag:.6f}")
+
+    # Calculate Relative Error
+    # Avoid division by zero by adding a tiny epsilon
+    rel_error = diff_grad_y / (grad_ref_mag + 1e-6)
+    print(f"Relative Error: {rel_error:.6f}")
     
     # Dynamic tolerance based on dtype
     # FP32: stricter (e.g., 1e-4), FP16: looser (e.g., 1e-2)
