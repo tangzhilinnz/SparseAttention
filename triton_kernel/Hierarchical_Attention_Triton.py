@@ -1104,7 +1104,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         sm_scale = 1.0 / math.sqrt(D)
         
         # FIXED: Added 'tri_attn.' prefix
-        tri_attn.hierarchical_attention_forward_kernel[grid](
+        hierarchical_attention_forward_kernel[grid](
             Q, K, V,
             idx_table, mask_ptr_safe,
             Out, Weights,
@@ -1145,7 +1145,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         mask_ptr_safe = mask_table if HAS_MASK else Weights
         
         # FIXED: Added 'tri_attn.' prefix
-        tri_attn.hierarchical_attention_backward_dS_kernel[grid_ds](
+        hierarchical_attention_backward_dS_kernel[grid_ds](
             grad_output_4d, Weights, V, idx_table, DS, mask_ptr_safe,
             *grad_output_4d.stride(), *Weights.stride(), *V.stride(), 
             *idx_table.stride(), *DS.stride(),            
@@ -1163,7 +1163,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         # Step A: Leaf Kernel (Level 0)
         grid_leaf = (N, B)
         # FIXED: Added 'tri_attn.' prefix
-        tri_attn.hierarchical_attention_backward_dK_dV_leaf_kernel[grid_leaf](
+        hierarchical_attention_backward_dK_dV_leaf_kernel[grid_leaf](
             DS, Q, Weights, grad_output_4d, gather_table,
             dK, dV,
             *DS.stride(), *Q.stride(), *Weights.stride(), 
@@ -1183,7 +1183,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             grid_low = (total_blocks_low, B)
             
             # FIXED: Added 'tri_attn.' prefix
-            tri_attn.hierarchical_attention_backward_low_level_kernel[grid_low](
+            hierarchical_attention_backward_low_level_kernel[grid_low](
                 DS, Q, Weights, grad_output_4d, gather_table,
                 dK, dV,
                 *DS.stride(), *Q.stride(), *Weights.stride(),
@@ -1208,7 +1208,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             grid_high = (total_blocks_high, B)
             
             # FIXED: Added 'tri_attn.' prefix
-            tri_attn.hierarchical_attention_backward_high_level_kernel[grid_high](
+            hierarchical_attention_backward_high_level_kernel[grid_high](
                 DS, Q, Weights, grad_output_4d, gather_table,
                 dK, dV,
                 *DS.stride(), *Q.stride(), *Weights.stride(),
@@ -1222,7 +1222,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         # --- BRANCH 1: dQ (Independent) ---
         grid_dq = (N, B)
         # FIXED: Added 'tri_attn.' prefix
-        tri_attn.hierarchical_attention_backward_dQ_kernel[grid_dq](
+        hierarchical_attention_backward_dQ_kernel[grid_dq](
             DS, K, idx_table, dQ, mask_ptr_safe,
             *DS.stride(), *K.stride(), *idx_table.stride(), *dQ.stride(),
             H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=32, LEVELS=LEVELS,
