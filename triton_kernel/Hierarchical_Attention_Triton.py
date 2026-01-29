@@ -2259,7 +2259,7 @@ def run_full_suite_update_X_from_Y():
     try:
         assert torch.allclose(out_ref, out_tri, atol=tol), f"Forward pass mismatch! (tol={tol})"
         assert torch.allclose(x_ref.grad, x_tri.grad, atol=tol), f"Gradient X mismatch! (tol={tol})"
-        # assert torch.allclose(y_ref.grad, y_tri.grad, atol=tol), f"Gradient Y mismatch! (tol={tol})"
+        assert torch.allclose(y_ref.grad, y_tri.grad, atol=tol), f"Gradient Y mismatch! (tol={tol})"
         print(f"SUCCESS: Triton kernel matches PyTorch reference (within {check_dtype} tolerance).")
     except AssertionError as e:
         print(f"FAILURE: {e}")
