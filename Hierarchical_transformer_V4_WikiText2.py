@@ -291,8 +291,8 @@ class HierarchicalSparseAttention(nn.Module):
             return self.cached_idx_table, self.cached_causal_mask
 
         # Placeholder: Ensure 'build_hierarchical_index_lookup_table' is available
-        # idx_table, mask = build_hierarchical_index_lookup_table(L, device=device, dtype=torch.int64)
-        idx_table, mask = None, None 
+        idx_table, mask = build_hierarchical_index_lookup_table(L, device=device, dtype=torch.int64)
+        #idx_table, mask = None, None 
         
         self.cached_idx_table = idx_table
         self.cached_causal_mask = mask
