@@ -134,7 +134,7 @@ vocab_builder = VocabBuilder(train_texts, max_vocab_size=35000)
 print("\n<> Creating Datasets...")
 # HYPERPARAMETER: max_len
 # INCREASED TO 512 (Point 7: Increase context length)
-MAX_LEN = 512
+MAX_LEN = 256
 train_dataset = WikiTextDataset(train_texts, vocab_builder, max_len=MAX_LEN)
 valid_dataset = WikiTextDataset(valid_texts, vocab_builder, max_len=MAX_LEN)
 test_dataset = WikiTextDataset(test_texts, vocab_builder, max_len=MAX_LEN)
@@ -362,7 +362,7 @@ def train_transformer_model(model, train_loader, valid_loader, criterion=None, n
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
     
     # CHANGED: Use Cosine Annealing (Point 7: Better scheduler)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs+20, verbose=False)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, verbose=False)
     
     # --- AMP CHANGE 1: Initialize GradScaler ---
     # This manages the dynamic loss scaling (critical for FP16 stability)
@@ -617,7 +617,7 @@ results = train_transformer_model(
     criterion=None, 
     num_epochs=num_epochs,
     learning_rate=learning_rate,
-    patience=10 # Auto-exit if no improvement for 6 epochs
+    patience=100 # Auto-exit if no improvement for 6 epochs
 )
 
 # Run Final Evaluation on Test Set
