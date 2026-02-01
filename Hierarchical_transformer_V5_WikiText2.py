@@ -244,7 +244,7 @@ import torch.nn.functional as F
 import math
 
 class HierarchicalSparseAttention(nn.Module):
-    def __init__(self, dim, num_heads, dropout=0.1, window_size=32):
+    def __init__(self, dim, num_heads, dropout=0.1, window_size=50):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
