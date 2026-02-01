@@ -134,7 +134,7 @@ vocab_builder = VocabBuilder(train_texts, max_vocab_size=35000)
 # Create datasets
 print("\n<> Creating Datasets...")
 # HYPERPARAMETER: max_len
-MAX_LEN = 256
+MAX_LEN = 128
 train_dataset = WikiTextDataset(train_texts, vocab_builder, max_len=MAX_LEN)
 valid_dataset = WikiTextDataset(valid_texts, vocab_builder, max_len=MAX_LEN)
 test_dataset = WikiTextDataset(test_texts, vocab_builder, max_len=MAX_LEN)
@@ -244,7 +244,7 @@ import torch.nn.functional as F
 import math
 
 class HierarchicalSparseAttention(nn.Module):
-    def __init__(self, dim, num_heads, dropout=0.1, window_size=10):
+    def __init__(self, dim, num_heads, dropout=0.1, window_size=8):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -944,7 +944,7 @@ model = model.to(device)
 print(f"Using device: {device}")
 
 # Training parameters
-num_epochs = 100     # SET HIGH as requested (auto-exit will stop it)
+num_epochs = 30     # SET HIGH as requested (auto-exit will stop it)
 learning_rate = 1e-4 # LOWERED for stability with larger model
 
 print("\n<> Starting Training...")
