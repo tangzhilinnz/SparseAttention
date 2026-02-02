@@ -5,7 +5,7 @@ import os
 # CRITICAL FIX: GPU SELECTION MUST BE FIRST
 # ==========================================
 # Set this before importing torch or calling torch.cuda to avoid OOM
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 
 import datasets
 # Essential PyTorch imports
@@ -524,7 +524,7 @@ def build_hierarchical_index_lookup_table(seq_len, device="cuda", dtype=torch.in
 #            return (output, attn_weights) if return_attention else output
 
 class HierarchicalSparseAttention(nn.Module):
-    def __init__(self, dim, num_heads, dropout=0.1, window_size=32):
+    def __init__(self, dim, num_heads, dropout=0.1, window_size=16):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
