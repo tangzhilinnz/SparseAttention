@@ -524,7 +524,7 @@ def build_hierarchical_index_lookup_table(seq_len, device="cuda", dtype=torch.in
 #            return (output, attn_weights) if return_attention else output
 
 class HierarchicalSparseAttention(nn.Module):
-    def __init__(self, dim, num_heads, dropout=0.1, window_size=16):
+    def __init__(self, dim, num_heads, dropout=0.1, window_size=32):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -648,7 +648,8 @@ class HierarchicalSparseAttention(nn.Module):
         H, Dh = self.num_heads, self.head_dim
         assert y_in is not None
 
-        if self.sizes is None: self.sizes, self.offsets = self.build_level_info(N)
+        if self.sizes is None or (self.sizes[0] != N // 2): 
+            self.sizes, self.offsets = self.build_level_info(N)
 
         Q_p_all = self.Wq_y(y_in).view(B, -1, H, Dh).transpose(1, 2)
         K_p_all = self.Wk_y(y_in).view(B, -1, H, Dh).transpose(1, 2)
@@ -1299,10 +1300,13 @@ def evaluate_wikitext_103(model, test_loader, device, sliding_window=False, stri
         
         # Determine context length from model config
         # Handle DataParallel wrapper if present
-        if isinstance(model, nn.DataParallel):
-            max_len = model.module.d_model if hasattr(model.module, 'd_model') else 2048
-        else:
-            max_len = model.d_model if hasattr(model, 'd_model') else 2048
+
+        #if isinstance(model, nn.DataParallel):
+        #    max_len = model.module.d_model if hasattr(model.module, 'd_model') else 2048
+        #else:
+        #    max_len = model.d_model if hasattr(model, 'd_model') else 2048
+
+        max_len = 2048
 
         # 2. Iterate with stride
         with torch.no_grad():
