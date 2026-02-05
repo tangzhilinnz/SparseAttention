@@ -37,8 +37,15 @@ def set_seed(seed=42):
 set_seed()
 
 # ==========================================
-# 2. DATA PROCESSING (QMSum Optimized)
+# 2. DATA PROCESSING (QMSum Fixed)
 # ==========================================
+
+# Direct URLs to raw JSONL files (Fixes the "Dataset not found" error)
+QMSUM_URLS = {
+    "train": "https://github.com/Yale-LILY/QMSum/raw/master/data/ALL/train.jsonl",
+    "validation": "https://github.com/Yale-LILY/QMSum/raw/master/data/ALL/val.jsonl",
+    "test": "https://github.com/Yale-LILY/QMSum/raw/master/data/ALL/test.jsonl"
+}
 
 class EfficientVocabBuilder:
     def __init__(self, dataset_split, max_vocab_size=30000):
@@ -52,16 +59,17 @@ class EfficientVocabBuilder:
         word_counts = collections.Counter()
         
         for item in tqdm(dataset_split, desc="Building Vocab"):
-            # 1. Add Query
-            word_counts.update(item['query'].lower().split())
-            # 2. Add Summary
-            word_counts.update(item['answer'].lower().split())
-            # 3. Add Transcript
-            speakers = item['meeting_transcripts']['speaker']
-            contents = item['meeting_transcripts']['content']
-            for s, c in zip(speakers, contents):
-                word_counts.update(s.lower().split())
-                word_counts.update(c.lower().split())
+            # 1. Add Transcripts
+            if 'meeting_transcripts' in item:
+                for turn in item['meeting_transcripts']:
+                    word_counts.update(turn['speaker'].lower().split())
+                    word_counts.update(turn['content'].lower().split())
+            
+            # 2. Add Queries & Answers
+            if 'specific_query_list' in item:
+                for qa in item['specific_query_list']:
+                    word_counts.update(qa['query'].lower().split())
+                    word_counts.update(qa['answer'].lower().split())
         
         most_common = word_counts.most_common(self.max_vocab_size - 5)
         for word, count in most_common:
@@ -84,14 +92,10 @@ class QMSumDataset(Dataset):
         eos_idx = self.vocab.word2idx['<EOS>']
         
         ids = [self.vocab.word2idx.get(w, unk_idx) for w in words]
-        if add_eos:
-            ids.append(eos_idx)
-            
-        # Truncate
+        if add_eos: ids.append(eos_idx)
+        
         if len(ids) > max_len:
             ids = ids[:max_len-1] + [eos_idx] if add_eos else ids[:max_len]
-            
-        # Pad
         if len(ids) < max_len:
             ids = ids + [self.vocab.word2idx['<PAD>']] * (max_len - len(ids))
             
@@ -103,21 +107,23 @@ class QMSumDataset(Dataset):
         
         print("Formatting QMSum samples...")
         for item in tqdm(dataset_split):
-            # Source: Query <SEP> Transcript
-            query = "query: " + item['query']
+            # 1. Flatten the Transcript once per meeting
             transcript = " context: "
-            speakers = item['meeting_transcripts']['speaker']
-            contents = item['meeting_transcripts']['content']
-            for s, c in zip(speakers, contents):
-                transcript += f"{s}: {c} "
+            if 'meeting_transcripts' in item:
+                for turn in item['meeting_transcripts']:
+                    transcript += f"{turn['speaker']}: {turn['content']} "
             
-            full_src_text = query + sep_token + transcript
-            summary_text = item['answer']
-            
-            src_tensor = self._text_to_indices(full_src_text, self.max_src_len)
-            trg_tensor = self._text_to_indices(summary_text, self.max_trg_len)
-            
-            processed.append({'src': src_tensor, 'trg': trg_tensor})
+            # 2. Create one sample for EACH Query in the meeting
+            if 'specific_query_list' in item:
+                for qa in item['specific_query_list']:
+                    query = "query: " + qa['query']
+                    full_src_text = query + sep_token + transcript
+                    summary_text = qa['answer']
+                    
+                    src_tensor = self._text_to_indices(full_src_text, self.max_src_len)
+                    trg_tensor = self._text_to_indices(summary_text, self.max_trg_len)
+                    
+                    processed.append({'src': src_tensor, 'trg': trg_tensor})
             
         return processed
 
