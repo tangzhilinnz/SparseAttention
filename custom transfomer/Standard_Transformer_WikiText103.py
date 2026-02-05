@@ -170,7 +170,7 @@ test_dataset = LargeScaleWikiTextDataset(dataset['test'], vocab_builder, max_len
 
 # Dataloaders
 # Increased Batch Size for A100 80G
-batch_size = 32 
+batch_size = 8 
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, drop_last=True, num_workers=4)
 valid_loader = DataLoader(valid_dataset, batch_size=batch_size, drop_last=True, num_workers=4)
 test_loader = DataLoader(test_dataset, batch_size=batch_size, drop_last=True, num_workers=4)
