@@ -3,7 +3,7 @@ import os
 # CRITICAL FIX: GPU SELECTION MUST BE FIRST
 # ==========================================
 # Set this before importing torch or calling torch.cuda to avoid OOM
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 
 import datasets
 # Essential PyTorch imports
@@ -639,7 +639,7 @@ if torch.cuda.device_count() > 1:
 model = model.to(device)
 
 # Training parameters
-num_epochs = 100       # WT103 converges slower, but 40 epochs is usually plenty
+num_epochs = 30       # WT103 converges slower, but 40 epochs is usually plenty
 learning_rate = 2e-4  # Standard LR for this model size
 
 print("\n<> Starting Training on WikiText-103...")

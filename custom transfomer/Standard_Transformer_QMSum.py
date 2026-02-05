@@ -4,7 +4,7 @@ import os
 # 1. SETUP & IMPORTS
 # ==========================================
 # CRITICAL: Set GPU before any torch imports
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 
 import torch
 import torch.nn as nn
@@ -20,6 +20,7 @@ import math
 import collections
 from datetime import timedelta
 import time
+import urllib.request
 
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -37,16 +38,45 @@ def set_seed(seed=42):
 set_seed()
 
 # ==========================================
-# 2. DATA PROCESSING (FIXED QMSum Loading)
+# 2. DATA PROCESSING (QMSum Fixed)
 # ==========================================
 
-# 1. Define Official GitHub URLs for QMSum
-# This fixes the "DatasetNotFoundError" by loading raw JSONL files directly
-QMSUM_URLS = {
-    "train": "https://github.com/Yale-LILY/QMSum/raw/master/data/ALL/train.jsonl",
-    "validation": "https://github.com/Yale-LILY/QMSum/raw/master/data/ALL/val.jsonl",
-    "test": "https://github.com/Yale-LILY/QMSum/raw/master/data/ALL/test.jsonl"
-}
+def download_qmsum_data():
+    """
+    Downloads QMSum JSONL files locally to avoid HTTP errors during load_dataset.
+    """
+    base_url = "https://raw.githubusercontent.com/Yale-LILY/QMSum/master/data/ALL/jsonl/"
+    files = ["train.jsonl", "val.jsonl", "test.jsonl"]
+    save_dir = "qmsum_data"
+    
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+        
+    local_paths = {}
+    print(f"\n<> Checking local QMSum data in './{save_dir}'...")
+    
+    for file in files:
+        url = base_url + file
+        path = os.path.join(save_dir, file)
+        local_paths[file.split('.')[0]] = path
+        
+        if not os.path.exists(path):
+            print(f"   Downloading {file} from {url}...")
+            try:
+                urllib.request.urlretrieve(url, path)
+            except Exception as e:
+                print(f"   Error downloading {file}: {e}")
+                print("   Please check your internet connection or URL.")
+                raise e
+        else:
+            print(f"   Found {file}, skipping download.")
+            
+    # Map 'val' from filename to 'validation' for datasets standard
+    return {
+        "train": local_paths["train"],
+        "validation": local_paths["val"], 
+        "test": local_paths["test"]
+    }
 
 class EfficientVocabBuilder:
     def __init__(self, dataset_split, max_vocab_size=30000):
@@ -95,8 +125,10 @@ class QMSumDataset(Dataset):
         ids = [self.vocab.word2idx.get(w, unk_idx) for w in words]
         if add_eos: ids.append(eos_idx)
         
+        # Truncate
         if len(ids) > max_len:
             ids = ids[:max_len-1] + [eos_idx] if add_eos else ids[:max_len]
+        # Pad
         if len(ids) < max_len:
             ids = ids + [self.vocab.word2idx['<PAD>']] * (max_len - len(ids))
             
@@ -160,6 +192,7 @@ class StandardMultiHeadAttention(nn.Module):
         # Scaled Dot Product
         scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.head_dim)
         if mask is not None:
+            # Mask shape (B, 1, 1, Seq) or (B, 1, Seq, Seq)
             scores = scores.masked_fill(mask == 0, float('-inf'))
         
         attn = torch.softmax(scores, dim=-1)
@@ -242,11 +275,14 @@ class TransformerSeq2Seq(nn.Module):
         elif isinstance(module, nn.Embedding): torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def make_src_mask(self, src):
+        # (B, 1, 1, Seq)
         return (src != self.pad_idx).unsqueeze(1).unsqueeze(2)
     
     def make_trg_mask(self, trg):
+        # (B, 1, Seq, Seq)
+        N, trg_len = trg.shape
         trg_pad_mask = (trg != self.pad_idx).unsqueeze(1).unsqueeze(2)
-        trg_sub_mask = torch.tril(torch.ones((trg.shape[1], trg.shape[1]), device=trg.device)).bool()
+        trg_sub_mask = torch.tril(torch.ones((trg_len, trg_len), device=trg.device)).bool()
         return trg_pad_mask & trg_sub_mask
 
     def forward(self, src, trg):
@@ -373,9 +409,12 @@ def train_seq2seq(model, train_loader, valid_loader, num_epochs=20, patience=20)
 # ==========================================
 # 5. EXECUTION
 # ==========================================
-print("\n<> Loading QMSum Dataset from GitHub (JSONL)...")
-# FIXED: Replaced "qmsum" with manual json loading
-dataset = load_dataset('json', data_files=QMSUM_URLS)
+# 1. Download data locally
+data_files = download_qmsum_data()
+
+# 2. Load from local files
+print("\n<> Loading QMSum Dataset from local files...")
+dataset = load_dataset("json", data_files=data_files)
 
 vocab_builder = EfficientVocabBuilder(dataset['train'], max_vocab_size=30000)
 train_dataset = QMSumDataset(dataset['train'], vocab_builder)
