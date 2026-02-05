@@ -209,18 +209,15 @@ class MultiHeadAttention(nn.Module):
 
         # 2. FlashAttention Implementation
         if not return_attention:
-            # F.scaled_dot_product_attention automatically selects FlashAttention-2 on A100
-            # It handles scaling (1/sqrt(dim)), softmax, and dropout internally.
-            
-            # Ensure mask is broadcastable if provided. 
-            # Your make_causal_mask returns [1, 1, Seq, Seq], which works perfectly here.
-            output = F.scaled_dot_product_attention(
-                Q, K, V,
-                attn_mask=mask, 
-                dropout_p=self.dropout.p if self.training else 0.0,
-                is_causal=False # We use explicit mask, so is_causal=False
-            )
-            attn_weights = None # FlashAttention does not produce materialized weights
+            # Wrap strictly around the attention call
+            with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False):
+                output = F.scaled_dot_product_attention(
+                    Q, K, V,
+                    attn_mask=mask, 
+                    dropout_p=self.dropout.p if self.training else 0.0,
+                    is_causal=False 
+                )
+            attn_weights = None
             
         else:
             # 3. Fallback for Visualization (Standard Implementation)
