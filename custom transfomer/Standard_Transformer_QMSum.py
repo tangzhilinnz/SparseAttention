@@ -58,25 +58,21 @@ def download_qmsum_data():
     for file in files:
         url = base_url + file
         path = os.path.join(save_dir, file)
-        local_paths[file.split('.')[0]] = path
+        # Map 'val' filename to 'validation' key for consistency
+        key = "validation" if "val" in file else file.split('.')[0]
+        local_paths[key] = path
         
         if not os.path.exists(path):
-            print(f"   Downloading {file} from {url}...")
+            print(f"   Downloading {file}...")
             try:
                 urllib.request.urlretrieve(url, path)
             except Exception as e:
                 print(f"   Error downloading {file}: {e}")
-                print("   Please check your internet connection or URL.")
                 raise e
         else:
             print(f"   Found {file}, skipping download.")
             
-    # Map 'val' from filename to 'validation' for datasets standard
-    return {
-        "train": local_paths["train"],
-        "validation": local_paths["val"], 
-        "test": local_paths["test"]
-    }
+    return local_paths
 
 class EfficientVocabBuilder:
     def __init__(self, dataset_split, max_vocab_size=30000):
@@ -90,13 +86,11 @@ class EfficientVocabBuilder:
         word_counts = collections.Counter()
         
         for item in tqdm(dataset_split, desc="Building Vocab"):
-            # 1. Add Transcripts
             if 'meeting_transcripts' in item:
                 for turn in item['meeting_transcripts']:
                     word_counts.update(turn['speaker'].lower().split())
                     word_counts.update(turn['content'].lower().split())
             
-            # 2. Add Queries & Answers
             if 'specific_query_list' in item:
                 for qa in item['specific_query_list']:
                     word_counts.update(qa['query'].lower().split())
@@ -125,10 +119,8 @@ class QMSumDataset(Dataset):
         ids = [self.vocab.word2idx.get(w, unk_idx) for w in words]
         if add_eos: ids.append(eos_idx)
         
-        # Truncate
         if len(ids) > max_len:
             ids = ids[:max_len-1] + [eos_idx] if add_eos else ids[:max_len]
-        # Pad
         if len(ids) < max_len:
             ids = ids + [self.vocab.word2idx['<PAD>']] * (max_len - len(ids))
             
@@ -140,13 +132,11 @@ class QMSumDataset(Dataset):
         
         print("Formatting QMSum samples...")
         for item in tqdm(dataset_split):
-            # 1. Flatten the Transcript once per meeting
             transcript = " context: "
             if 'meeting_transcripts' in item:
                 for turn in item['meeting_transcripts']:
                     transcript += f"{turn['speaker']}: {turn['content']} "
             
-            # 2. Create one sample for EACH Query in the meeting
             if 'specific_query_list' in item:
                 for qa in item['specific_query_list']:
                     query = "query: " + qa['query']
@@ -167,7 +157,7 @@ class QMSumDataset(Dataset):
         return self.data[idx]
 
 # ==========================================
-# 3. MODEL ARCHITECTURE (Standard Transformer)
+# 3. MODEL ARCHITECTURE
 # ==========================================
 
 class StandardMultiHeadAttention(nn.Module):
@@ -189,10 +179,8 @@ class StandardMultiHeadAttention(nn.Module):
         K = self.k_proj(key).view(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
         V = self.v_proj(value).view(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # Scaled Dot Product
         scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.head_dim)
         if mask is not None:
-            # Mask shape (B, 1, 1, Seq) or (B, 1, Seq, Seq)
             scores = scores.masked_fill(mask == 0, float('-inf'))
         
         attn = torch.softmax(scores, dim=-1)
@@ -275,14 +263,11 @@ class TransformerSeq2Seq(nn.Module):
         elif isinstance(module, nn.Embedding): torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def make_src_mask(self, src):
-        # (B, 1, 1, Seq)
         return (src != self.pad_idx).unsqueeze(1).unsqueeze(2)
     
     def make_trg_mask(self, trg):
-        # (B, 1, Seq, Seq)
-        N, trg_len = trg.shape
         trg_pad_mask = (trg != self.pad_idx).unsqueeze(1).unsqueeze(2)
-        trg_sub_mask = torch.tril(torch.ones((trg_len, trg_len), device=trg.device)).bool()
+        trg_sub_mask = torch.tril(torch.ones((trg.shape[1], trg.shape[1]), device=trg.device)).bool()
         return trg_pad_mask & trg_sub_mask
 
     def forward(self, src, trg):
@@ -303,40 +288,63 @@ class TransformerSeq2Seq(nn.Module):
 # 4. TRAINING LOOP
 # ==========================================
 
+def calculate_accuracy(predictions, targets, pad_idx=0):
+    predicted_tokens = predictions.argmax(dim=-1)
+    non_pad_mask = targets != pad_idx
+    correct = (predicted_tokens == targets) & non_pad_mask
+    return correct.sum().item(), non_pad_mask.sum().item()
+
 def validate_seq2seq(model, loader, criterion):
     model.eval()
     total_loss = 0
+    total_correct = 0
+    total_tokens = 0
+    
     with torch.no_grad():
         for batch in loader:
             src = batch['src'].to(device)
             trg = batch['trg'].to(device)
             sos_tokens = torch.full((trg.shape[0], 1), 2, device=device, dtype=torch.long)
             trg_input = torch.cat([sos_tokens, trg[:, :-1]], dim=1)
+            
             with torch.cuda.amp.autocast():
                 output = model(src, trg_input)
-                loss = criterion(output.reshape(-1, output.shape[-1]), trg.reshape(-1))
+                output_flat = output.reshape(-1, output.shape[-1])
+                trg_flat = trg.reshape(-1)
+                
+                loss = criterion(output_flat, trg_flat)
+                n_correct, n_total = calculate_accuracy(output_flat, trg_flat)
+                
             total_loss += loss.item()
-    return total_loss / len(loader)
+            total_correct += n_correct
+            total_tokens += n_total
+            
+    avg_loss = total_loss / len(loader)
+    avg_acc = total_correct / total_tokens if total_tokens > 0 else 0
+    return avg_loss, avg_acc
 
 def train_seq2seq(model, train_loader, valid_loader, num_epochs=20, patience=20):
     criterion = nn.CrossEntropyLoss(ignore_index=0) 
     optimizer = optim.AdamW(model.parameters(), lr=1e-4)
     scaler = torch.cuda.amp.GradScaler()
     
-    train_losses, valid_losses, epoch_times = [], [], []
+    history = {'train_loss': [], 'train_acc': [], 'valid_loss': [], 'valid_acc': [], 'epoch_times': []}
     best_valid_loss = float('inf')
     total_start_time = time.time()
     patience_counter = 0
     
     print(f"\n{'='*50}")
-    print(f"<> Training QMSum (Standard Encoder-Decoder)")
+    print(f"<> Training QMSum (Loss + Accuracy)")
     print(f"<> Patience: {patience}")
     print(f"{'='*50}")
 
     for epoch in range(num_epochs):
         epoch_start_time = time.time()
         model.train()
-        total_train_loss = 0
+        
+        train_loss_accum = 0
+        train_correct_accum = 0
+        train_tokens_accum = 0
         
         progress = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
         for batch in progress:
@@ -348,32 +356,47 @@ def train_seq2seq(model, train_loader, valid_loader, num_epochs=20, patience=20)
             optimizer.zero_grad()
             with torch.cuda.amp.autocast():
                 output = model(src, trg_input)
-                loss = criterion(output.reshape(-1, output.shape[-1]), trg.reshape(-1))
-            
+                output_flat = output.reshape(-1, output.shape[-1])
+                trg_flat = trg.reshape(-1)
+                
+                loss = criterion(output_flat, trg_flat)
+                
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
             
-            total_train_loss += loss.item()
-            progress.set_postfix({'loss': f"{loss.item():.4f}"})
+            # Metrics
+            with torch.no_grad():
+                n_correct, n_total = calculate_accuracy(output_flat, trg_flat)
+                train_correct_accum += n_correct
+                train_tokens_accum += n_total
+                train_loss_accum += loss.item()
             
-        avg_train_loss = total_train_loss / len(train_loader)
-        avg_valid_loss = validate_seq2seq(model, valid_loader, criterion)
+            current_acc = train_correct_accum / train_tokens_accum if train_tokens_accum > 0 else 0
+            progress.set_postfix({'loss': f"{loss.item():.4f}", 'acc': f"{current_acc:.2%}"})
+            
+        avg_train_loss = train_loss_accum / len(train_loader)
+        avg_train_acc = train_correct_accum / train_tokens_accum
+        
+        avg_valid_loss, avg_valid_acc = validate_seq2seq(model, valid_loader, criterion)
         epoch_duration = time.time() - epoch_start_time
         
-        train_losses.append(avg_train_loss)
-        valid_losses.append(avg_valid_loss)
-        epoch_times.append(epoch_duration)
+        history['train_loss'].append(avg_train_loss)
+        history['train_acc'].append(avg_train_acc)
+        history['valid_loss'].append(avg_valid_loss)
+        history['valid_acc'].append(avg_valid_acc)
+        history['epoch_times'].append(epoch_duration)
         
-        print(f"Summary: Train Loss: {avg_train_loss:.4f} | Valid Loss: {avg_valid_loss:.4f}")
+        print(f"Summary: Train Loss: {avg_train_loss:.4f}, Acc: {avg_train_acc:.2%} | Valid Loss: {avg_valid_loss:.4f}, Acc: {avg_valid_acc:.2%}")
         
+        # CHANGED: Added stats to print statement
         if avg_valid_loss < best_valid_loss:
             best_valid_loss = avg_valid_loss
             patience_counter = 0
             torch.save(model.state_dict(), "best_qmsum_model.pt")
-            print(f"  > New Best Model Saved!")
+            print(f"  > New Best Model Saved! (Loss: {avg_valid_loss:.4f} | Acc: {avg_valid_acc:.2%})")
         else:
             patience_counter += 1
             if patience_counter >= patience:
@@ -382,29 +405,33 @@ def train_seq2seq(model, train_loader, valid_loader, num_epochs=20, patience=20)
 
     # --- PLOTTING ---
     total_time = time.time() - total_start_time
-    plt.figure(figsize=(15, 5))
+    plt.figure(figsize=(15, 6))
+    
     plt.subplot(1, 2, 1)
-    plt.plot(train_losses, label='Training Loss')
-    plt.plot(valid_losses, label='Validation Loss')
-    plt.title('QMSum Loss')
+    plt.plot(history['train_loss'], label='Train Loss', color='blue')
+    plt.plot(history['valid_loss'], label='Valid Loss', color='cyan', linestyle='--')
+    plt.title('Loss')
     plt.xlabel('Epoch')
-    plt.ylabel('Loss')
     plt.legend()
-    plt.grid(True)
+    plt.grid(True, alpha=0.3)
+    
     plt.subplot(1, 2, 2)
-    plt.plot(epoch_times, color='orange', marker='o')
-    plt.title('Epoch Duration')
+    plt.plot(history['train_acc'], label='Train Acc', color='green')
+    plt.plot(history['valid_acc'], label='Valid Acc', color='lime', linestyle='--')
+    plt.title('Accuracy')
     plt.xlabel('Epoch')
-    plt.ylabel('Time (s)')
-    plt.grid(True)
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
     plt.tight_layout()
     plt.savefig('qmsum_training_history.png')
     plt.close()
 
     print(f"\n{'='*50}")
     print("<> Training Complete!")
-    print(f"Best validation loss: {best_valid_loss:.4f}")
+    print(f"Best Valid Loss: {best_valid_loss:.4f}")
     print(f"Total time: {timedelta(seconds=int(total_time))}")
+    print("Plot saved to: qmsum_training_history.png")
 
 # ==========================================
 # 5. EXECUTION
@@ -412,7 +439,7 @@ def train_seq2seq(model, train_loader, valid_loader, num_epochs=20, patience=20)
 # 1. Download data locally
 data_files = download_qmsum_data()
 
-# 2. Load from local files
+# 2. Load
 print("\n<> Loading QMSum Dataset from local files...")
 dataset = load_dataset("json", data_files=data_files)
 
