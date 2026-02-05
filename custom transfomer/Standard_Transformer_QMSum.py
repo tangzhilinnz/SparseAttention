@@ -4,7 +4,7 @@ import os
 # 1. SETUP & IMPORTS
 # ==========================================
 # CRITICAL: Set GPU before any torch imports
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import torch
 import torch.nn as nn
@@ -37,10 +37,11 @@ def set_seed(seed=42):
 set_seed()
 
 # ==========================================
-# 2. DATA PROCESSING (QMSum Fixed)
+# 2. DATA PROCESSING (FIXED QMSum Loading)
 # ==========================================
 
-# Direct URLs to raw JSONL files (Fixes the "Dataset not found" error)
+# 1. Define Official GitHub URLs for QMSum
+# This fixes the "DatasetNotFoundError" by loading raw JSONL files directly
 QMSUM_URLS = {
     "train": "https://github.com/Yale-LILY/QMSum/raw/master/data/ALL/train.jsonl",
     "validation": "https://github.com/Yale-LILY/QMSum/raw/master/data/ALL/val.jsonl",
@@ -134,7 +135,7 @@ class QMSumDataset(Dataset):
         return self.data[idx]
 
 # ==========================================
-# 3. MODEL ARCHITECTURE
+# 3. MODEL ARCHITECTURE (Standard Transformer)
 # ==========================================
 
 class StandardMultiHeadAttention(nn.Module):
@@ -156,13 +157,13 @@ class StandardMultiHeadAttention(nn.Module):
         K = self.k_proj(key).view(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
         V = self.v_proj(value).view(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
 
+        # Scaled Dot Product
         scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.head_dim)
         if mask is not None:
             scores = scores.masked_fill(mask == 0, float('-inf'))
         
         attn = torch.softmax(scores, dim=-1)
         attn = self.dropout(attn)
-        
         out = torch.matmul(attn, V)
         out = out.transpose(1, 2).contiguous().view(B, -1, self.d_model)
         return self.out_proj(out)
@@ -173,7 +174,6 @@ class PositionwiseFeedForward(nn.Module):
         self.fc1 = nn.Linear(d_model, d_ff)
         self.fc2 = nn.Linear(d_ff, d_model)
         self.dropout = nn.Dropout(dropout)
-    
     def forward(self, x):
         return self.fc2(self.dropout(F.relu(self.fc1(x))))
 
@@ -185,7 +185,6 @@ class EncoderLayer(nn.Module):
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
-        
     def forward(self, x, mask=None):
         norm_x = self.norm1(x)
         attn_out = self.self_attn(norm_x, norm_x, norm_x, mask=mask)
@@ -205,7 +204,6 @@ class DecoderLayer(nn.Module):
         self.norm2 = nn.LayerNorm(d_model)
         self.norm3 = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
-        
     def forward(self, x, enc_output, src_mask=None, trg_mask=None):
         norm_x = self.norm1(x)
         self_attn_out = self.self_attn(norm_x, norm_x, norm_x, mask=trg_mask)
@@ -224,10 +222,8 @@ class TransformerSeq2Seq(nn.Module):
         self.pad_idx = pad_idx
         self.embedding = nn.Embedding(vocab_size, d_model, padding_idx=pad_idx)
         self.pos_encoding = self._create_pos_encoding(d_model, 5000)
-        
         self.encoder_layers = nn.ModuleList([EncoderLayer(d_model, num_heads, d_ff, dropout) for _ in range(num_layers)])
         self.decoder_layers = nn.ModuleList([DecoderLayer(d_model, num_heads, d_ff, dropout) for _ in range(num_layers)])
-        
         self.fc_out = nn.Linear(d_model, vocab_size)
         self.scale = math.sqrt(d_model)
         self.dropout = nn.Dropout(dropout)
@@ -242,43 +238,33 @@ class TransformerSeq2Seq(nn.Module):
         return nn.Parameter(pe.unsqueeze(0), requires_grad=False)
     
     def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        if isinstance(module, nn.Linear): torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.Embedding): torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def make_src_mask(self, src):
         return (src != self.pad_idx).unsqueeze(1).unsqueeze(2)
-
+    
     def make_trg_mask(self, trg):
-        N, trg_len = trg.shape
         trg_pad_mask = (trg != self.pad_idx).unsqueeze(1).unsqueeze(2)
-        trg_sub_mask = torch.tril(torch.ones((trg_len, trg_len), device=trg.device)).bool()
+        trg_sub_mask = torch.tril(torch.ones((trg.shape[1], trg.shape[1]), device=trg.device)).bool()
         return trg_pad_mask & trg_sub_mask
 
     def forward(self, src, trg):
         src_mask = self.make_src_mask(src)
         trg_mask = self.make_trg_mask(trg)
-        
-        # Encode
         x = self.embedding(src) * self.scale
         x = x + self.pos_encoding[:, :src.shape[1], :]
         x = self.dropout(x)
-        for layer in self.encoder_layers:
-            x = layer(x, mask=src_mask)
+        for layer in self.encoder_layers: x = layer(x, mask=src_mask)
         enc_output = x
-        
-        # Decode
         x = self.embedding(trg) * self.scale
         x = x + self.pos_encoding[:, :trg.shape[1], :]
         x = self.dropout(x)
-        for layer in self.decoder_layers:
-            x = layer(x, enc_output, src_mask=src_mask, trg_mask=trg_mask)
-            
+        for layer in self.decoder_layers: x = layer(x, enc_output, src_mask=src_mask, trg_mask=trg_mask)
         return self.fc_out(x)
 
 # ==========================================
-# 4. TRAINING LOOP (With Visualization)
+# 4. TRAINING LOOP
 # ==========================================
 
 def validate_seq2seq(model, loader, criterion):
@@ -290,7 +276,6 @@ def validate_seq2seq(model, loader, criterion):
             trg = batch['trg'].to(device)
             sos_tokens = torch.full((trg.shape[0], 1), 2, device=device, dtype=torch.long)
             trg_input = torch.cat([sos_tokens, trg[:, :-1]], dim=1)
-            
             with torch.cuda.amp.autocast():
                 output = model(src, trg_input)
                 loss = criterion(output.reshape(-1, output.shape[-1]), trg.reshape(-1))
@@ -302,7 +287,6 @@ def train_seq2seq(model, train_loader, valid_loader, num_epochs=20, patience=20)
     optimizer = optim.AdamW(model.parameters(), lr=1e-4)
     scaler = torch.cuda.amp.GradScaler()
     
-    # Logging
     train_losses, valid_losses, epoch_times = [], [], []
     best_valid_loss = float('inf')
     total_start_time = time.time()
@@ -310,7 +294,7 @@ def train_seq2seq(model, train_loader, valid_loader, num_epochs=20, patience=20)
     
     print(f"\n{'='*50}")
     print(f"<> Training QMSum (Standard Encoder-Decoder)")
-    print(f"<> Auto-Exit Patience set to: {patience}")
+    print(f"<> Patience: {patience}")
     print(f"{'='*50}")
 
     for epoch in range(num_epochs):
@@ -322,7 +306,6 @@ def train_seq2seq(model, train_loader, valid_loader, num_epochs=20, patience=20)
         for batch in progress:
             src = batch['src'].to(device)
             trg = batch['trg'].to(device)
-            
             sos_tokens = torch.full((trg.shape[0], 1), 2, device=device, dtype=torch.long)
             trg_input = torch.cat([sos_tokens, trg[:, :-1]], dim=1)
             
@@ -342,19 +325,14 @@ def train_seq2seq(model, train_loader, valid_loader, num_epochs=20, patience=20)
             
         avg_train_loss = total_train_loss / len(train_loader)
         avg_valid_loss = validate_seq2seq(model, valid_loader, criterion)
-        
         epoch_duration = time.time() - epoch_start_time
         
-        # Store Stats
         train_losses.append(avg_train_loss)
         valid_losses.append(avg_valid_loss)
         epoch_times.append(epoch_duration)
         
-        print(f"Epoch {epoch+1} Summary:")
-        print(f"  > Train Loss: {avg_train_loss:.4f} | Valid Loss: {avg_valid_loss:.4f}")
-        print(f"  > Duration:   {timedelta(seconds=int(epoch_duration))}")
+        print(f"Summary: Train Loss: {avg_train_loss:.4f} | Valid Loss: {avg_valid_loss:.4f}")
         
-        # Checkpointing & Patience
         if avg_valid_loss < best_valid_loss:
             best_valid_loss = avg_valid_loss
             patience_counter = 0
@@ -362,15 +340,13 @@ def train_seq2seq(model, train_loader, valid_loader, num_epochs=20, patience=20)
             print(f"  > New Best Model Saved!")
         else:
             patience_counter += 1
-            print(f"  > No improvement. Patience: {patience_counter}/{patience}")
             if patience_counter >= patience:
-                print(f"\n<> Early stopping triggered at epoch {epoch+1}")
+                print(f"\n<> Patience limit reached ({patience_counter}). Stopping.")
                 break
 
     # --- PLOTTING ---
     total_time = time.time() - total_start_time
     plt.figure(figsize=(15, 5))
-
     plt.subplot(1, 2, 1)
     plt.plot(train_losses, label='Training Loss')
     plt.plot(valid_losses, label='Validation Loss')
@@ -379,40 +355,32 @@ def train_seq2seq(model, train_loader, valid_loader, num_epochs=20, patience=20)
     plt.ylabel('Loss')
     plt.legend()
     plt.grid(True)
-
     plt.subplot(1, 2, 2)
     plt.plot(epoch_times, color='orange', marker='o')
     plt.title('Epoch Duration')
     plt.xlabel('Epoch')
     plt.ylabel('Time (s)')
     plt.grid(True)
-
     plt.tight_layout()
     plt.savefig('qmsum_training_history.png')
     plt.close()
 
     print(f"\n{'='*50}")
     print("<> Training Complete!")
-    print(f"{'='*50}")
     print(f"Best validation loss: {best_valid_loss:.4f}")
     print(f"Total time: {timedelta(seconds=int(total_time))}")
-    print(f"Plot saved to: qmsum_training_history.png")
 
 # ==========================================
 # 5. EXECUTION
 # ==========================================
+print("\n<> Loading QMSum Dataset from GitHub (JSONL)...")
+# FIXED: Replaced "qmsum" with manual json loading
+dataset = load_dataset('json', data_files=QMSUM_URLS)
 
-print("\n<> Loading QMSum Dataset...")
-dataset = load_dataset("qmsum")
 vocab_builder = EfficientVocabBuilder(dataset['train'], max_vocab_size=30000)
+train_dataset = QMSumDataset(dataset['train'], vocab_builder)
+valid_dataset = QMSumDataset(dataset['validation'], vocab_builder)
 
-MAX_SRC_LEN = 4096
-MAX_TRG_LEN = 512
-
-train_dataset = QMSumDataset(dataset['train'], vocab_builder, MAX_SRC_LEN, MAX_TRG_LEN)
-valid_dataset = QMSumDataset(dataset['validation'], vocab_builder, MAX_SRC_LEN, MAX_TRG_LEN)
-
-# Batch size 4 fits on A100 (80G) with 4096 context
 BATCH_SIZE = 4 
 train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
 valid_loader = DataLoader(valid_dataset, batch_size=BATCH_SIZE, drop_last=True)
@@ -422,15 +390,12 @@ model = TransformerSeq2Seq(
     vocab_size=len(vocab_builder.word2idx),
     d_model=512,
     num_heads=8,
-    d_ff=2048,      # Standard 4x scaling
-    num_layers=6,   # 6 Encoder + 6 Decoder
-    dropout=0.2,    # Higher dropout for QMSum
+    d_ff=2048,
+    num_layers=6,
+    dropout=0.2,
     pad_idx=0
 )
-
-if torch.cuda.device_count() > 1:
-    model = nn.DataParallel(model)
+if torch.cuda.device_count() > 1: model = nn.DataParallel(model)
 model = model.to(device)
 
-# Run Training (Epochs = 20, Patience = 20)
 train_seq2seq(model, train_loader, valid_loader, num_epochs=20, patience=20)
