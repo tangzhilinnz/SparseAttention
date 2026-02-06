@@ -1,0 +1,101 @@
+<> Epoch 23 Results:
+<>  Time: 0:15:16
+Train Loss: 4.3813 | Train PPL: 79.95
+Valid Loss: 4.3577 | Valid PPL: 78.08
+<> Saved new best model with validation loss: 4.3577
+Epoch 24/30: 100%|██████████████████████████████████████████████████████████████████████████████████████████████| 6258/6258 [15:14<00:00,  6.84it/s, loss=4.6807, ppl=107.84]
+<> Validating...
+
+<> Epoch 24 Results:
+<>  Time: 0:15:16
+Train Loss: 4.3740 | Train PPL: 79.36
+Valid Loss: 4.3528 | Valid PPL: 77.70
+<> Saved new best model with validation loss: 4.3528
+Epoch 25/30: 100%|██████████████████████████████████████████████████████████████████████████████████████████████| 6258/6258 [15:15<00:00,  6.84it/s, loss=4.6801, ppl=107.78]
+<> Validating...
+
+<> Epoch 25 Results:
+<>  Time: 0:15:16
+Train Loss: 4.3679 | Train PPL: 78.88
+Valid Loss: 4.3496 | Valid PPL: 77.45
+<> Saved new best model with validation loss: 4.3496
+Epoch 26/30: 100%|██████████████████████████████████████████████████████████████████████████████████████████████| 6258/6258 [15:15<00:00,  6.84it/s, loss=4.6712, ppl=106.83]
+<> Validating...
+
+<> Epoch 26 Results:
+<>  Time: 0:15:16
+Train Loss: 4.3631 | Train PPL: 78.50
+Valid Loss: 4.3467 | Valid PPL: 77.22
+<> Saved new best model with validation loss: 4.3467
+Epoch 27/30: 100%|██████████████████████████████████████████████████████████████████████████████████████████████| 6258/6258 [15:16<00:00,  6.83it/s, loss=4.6722, ppl=106.93]
+<> Validating...
+
+<> Epoch 27 Results:
+<>  Time: 0:15:18
+Train Loss: 4.3595 | Train PPL: 78.22
+Valid Loss: 4.3443 | Valid PPL: 77.04
+<> Saved new best model with validation loss: 4.3443
+Epoch 28/30: 100%|██████████████████████████████████████████████████████████████████████████████████████████████| 6258/6258 [19:51<00:00,  5.25it/s, loss=4.6683, ppl=106.51]
+<> Validating...
+
+<> Epoch 28 Results:
+<>  Time: 0:19:52
+Train Loss: 4.3569 | Train PPL: 78.01
+Valid Loss: 4.3436 | Valid PPL: 76.99
+<> Saved new best model with validation loss: 4.3436
+Epoch 29/30: 100%|██████████████████████████████████████████████████████████████████████████████████████████████| 6258/6258 [37:21<00:00,  2.79it/s, loss=4.6650, ppl=106.16]
+<> Validating...
+
+<> Epoch 29 Results:
+<>  Time: 0:37:23
+Train Loss: 4.3551 | Train PPL: 77.88
+Valid Loss: 4.3434 | Valid PPL: 76.97
+<> Saved new best model with validation loss: 4.3434
+Epoch 30/30: 100%|██████████████████████████████████████████████████████████████████████████████████████████████| 6258/6258 [15:14<00:00,  6.84it/s, loss=4.6642, ppl=106.08]
+<> Validating...
+
+<> Epoch 30 Results:
+<>  Time: 0:15:16
+Train Loss: 4.3542 | Train PPL: 77.80
+Valid Loss: 4.3431 | Valid PPL: 76.94
+<> Saved new best model with validation loss: 4.3431
+
+==================================================
+<> Training Complete!
+==================================================
+Best validation loss: 4.3431
+Total time: 8:04:15
+
+<> Training Finished. Loading Best Model for Evaluation...
+<> Loaded checkpoint from epoch 29 (Loss: 4.3431)
+
+Running Standard Evaluation...
+
+==================================================
+<> Starting STANDARD CHUNKED Evaluation...
+==================================================
+Evaluating: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 14/14 [00:04<00:00,  3.14it/s]
+==================================================
+RESULTS: Standard Chunked
+==================================================
+Total Tokens: 229376
+Average Loss: 3.3128
+PERPLEXITY  : 27.46
+==================================================
+
+
+Running Sliding Window Evaluation (This will take longer)...
+
+==================================================
+<> Starting SLIDING WINDOW Evaluation (Stride=512)...
+<> Note: This provides the most accurate Perplexity.
+==================================================
+>> Flattening test data for sliding window...
+Sliding Window: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 447/447 [00:07<00:00, 63.48it/s]
+==================================================
+RESULTS: Sliding Window
+==================================================
+Total Tokens: 228864
+Average Loss: 3.3059
+PERPLEXITY  : 27.27
+==================================================

@@ -524,7 +524,7 @@ def build_hierarchical_index_lookup_table(seq_len, device="cuda", dtype=torch.in
 #            return (output, attn_weights) if return_attention else output
 
 class HierarchicalSparseAttention(nn.Module):
-    def __init__(self, dim, num_heads, dropout=0.1, window_size=10):
+    def __init__(self, dim, num_heads, dropout=0.1, window_size=22):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
