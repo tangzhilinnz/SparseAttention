@@ -254,290 +254,23 @@ def build_hierarchical_index_lookup_table(seq_len, device="cuda", dtype=torch.in
 
     return idx_map, causal_mask
 
-#class HierarchicalSparseAttention(nn.Module):
-#    def __init__(self, dim, num_heads, dropout=0.1):
-#        super().__init__()
-#        self.dim = dim
-#        self.num_heads = num_heads
-#        self.head_dim = dim // num_heads
-#
-#        # --- Y Updates (Bottom-Up) ---
-#        # NOTE: Wq_y, Wk_y, Wv_y are kept in case you want to switch back to attention,
-#        # but for MLP mode, we primarily use merge_layer.
-#        self.Wq_y = nn.Linear(dim, dim, bias=False)
-#        self.Wk_y = nn.Linear(dim, dim, bias=False)
-#        self.Wv_y = nn.Linear(dim, dim, bias=False)
-#        self.out_proj_y = nn.Linear(dim, dim)
-#
-#        # --- NEW: MLP Merge Layer for cross_update_Y_MLP ---
-#        # Takes concatenated Left+Right (2*dim) and projects to Parent (dim)
-#        self.merge_layer = nn.Linear(2 * dim, dim)
-#
-#        # --- X Updates (Top-Down) ---
-#        self.Wq_x = nn.Linear(dim, dim, bias=False)
-#        self.Wk_x = nn.Linear(dim, dim, bias=False)
-#        self.Wv_x = nn.Linear(dim, dim, bias=False)
-#        self.out_proj_x = nn.Linear(dim, dim)
-#
-#        self.dropout = nn.Dropout(dropout)
-#        
-#        self.cached_idx_table = None
-#        self.cached_causal_mask = None
-#        self.cached_seq_len = -1
-#
-#        self.sizes = None
-#        self.offsets = None
-#
-#    def _get_lookup_table(self, L, device):
-#        """Smart retrieval: Returns cached table if L matches, otherwise recomputes."""
-#        if (self.cached_idx_table is not None and 
-#            self.cached_seq_len == L and 
-#            self.cached_idx_table.device == device):
-#            return self.cached_idx_table, self.cached_causal_mask
-#
-#        idx_table, mask = build_hierarchical_index_lookup_table(L, device=device, dtype=torch.int64)
-#        
-#        self.cached_idx_table = idx_table
-#        self.cached_causal_mask = mask
-#        self.cached_seq_len = L
-#        
-#        return idx_table, mask
-#
-#    @staticmethod
-#    def generate_span_input_Y(x):
-#        """Initializes Y by averaging adjacent pairs of X."""
-#        B, N, D = x.shape
-#        Y_levels = []
-#        curr = x
-#        while curr.size(1) > 1:
-#            L = curr.size(1)
-#            even = L - (L % 2)
-#            curr_pairs = curr[:, :even, :].reshape(B, even // 2, 2, D)
-#            parents = 0.5 * curr_pairs[:, :, 0, :] + 0.5 * curr_pairs[:, :, 1, :]
-#            Y_levels.append(parents)
-#            curr = parents
-#        
-#        if not Y_levels:
-#            return None
-#            
-#        return torch.cat(Y_levels, dim=1)
-#
-#    @staticmethod
-#    def build_level_info(N):
-#        sizes = []
-#        curr = N
-#        while curr > 1:
-#            sizes.append(curr // 2)
-#            curr = curr // 2
-#        offsets = [0]
-#        for s in sizes[:-1]:
-#            offsets.append(offsets[-1] + s)
-#        return sizes, offsets
-#
-#    def cross_update_Y(self, x, y_in):
-#        """
-#        Architecture: Recursive Parent-Self Attention.
-#        
-#        Refactored Layout: (Batch, Heads, Sequence, Head_Dim) aka (B, H, N, Dh).
-#        This matches standard PyTorch MultiheadAttention implementation details.
-#        """
-#        B, N, D = x.shape
-#        H, Dh = self.num_heads, self.head_dim
-#        assert y_in is not None
-#
-#        if self.sizes is None: self.sizes, self.offsets = self.build_level_info(N)
-#
-#        # -------------------------------------------------------
-#        # OPTIMIZATION: Global Parent Projection (Standard Layout)
-#        # -------------------------------------------------------
-#        # Input: (B, Total_Parents, D)
-#        # 1. Project -> (B, Total_Parents, H, Dh)
-#        # 2. Transpose -> (B, H, Total_Parents, Dh)
-#        Q_p_all = self.Wq_y(y_in).view(B, -1, H, Dh).transpose(1, 2)
-#        K_p_all = self.Wk_y(y_in).view(B, -1, H, Dh).transpose(1, 2)
-#        V_p_all = self.Wv_y(y_in).view(B, -1, H, Dh).transpose(1, 2)
-#        
-#        new_Y_levels = []
-#        prev_sources = x 
-#
-#        for level, parent_count in enumerate(self.sizes):
-#            # ---------------------------------------------------
-#            # 1. Prepare Children
-#            # ---------------------------------------------------
-#            useful_len = parent_count * 2
-#            children = prev_sources[:, :useful_len, :] 
-#            
-#            # Project Children -> (B, H, 2*P, Dh)
-#            K_c = self.Wk_y(children).view(B, -1, H, Dh).transpose(1, 2)
-#            V_c = self.Wv_y(children).view(B, -1, H, Dh).transpose(1, 2)
-#            V_c = self.dropout(V_c)
-#
-#            # ---------------------------------------------------
-#            # 2. Reshape Children to Pairs
-#            # ---------------------------------------------------
-#            # Current: (B, H, 2*P, Dh)
-#            # Target:  (B, H, P, 2, Dh)  <-- Group pairs together
-#            K_c_pairs = K_c.view(B, H, parent_count, 2, Dh)
-#            V_c_pairs = V_c.view(B, H, parent_count, 2, Dh)
-#
-#            # ---------------------------------------------------
-#            # 3. Slice Parents
-#            # ---------------------------------------------------
-#            # Current: (B, H, Total_Parents, Dh)
-#            # Target:  (B, H, P, Dh)
-#            offset = self.offsets[level]
-#            Q_p = Q_p_all[:, :, offset : offset + parent_count, :]
-#            K_p = K_p_all[:, :, offset : offset + parent_count, :]
-#            V_p = V_p_all[:, :, offset : offset + parent_count, :]
-#
-#            # ---------------------------------------------------
-#            # 4. Form Attention Pool
-#            # ---------------------------------------------------
-#            # Parent (Self) needs to be unsqueezed to match Child pairs structure
-#            # K_p: (B, H, P, Dh) -> (B, H, P, 1, Dh)
-#            # Pool: Concat along the 'pair' dim -> (B, H, P, 3, Dh)
-#            # Pool Order: [Parent(Self), Child_Left, Child_Right]
-#            K_pool = torch.cat([K_p.unsqueeze(3), K_c_pairs], dim=3)
-#            V_pool = torch.cat([V_p.unsqueeze(3), V_c_pairs], dim=3)
-#
-#            # ---------------------------------------------------
-#            # 5. Attention Scores
-#            # ---------------------------------------------------
-#            # Q: (B, H, P, Dh) -> (B, H, P, 1, Dh)
-#            # K_pool: (B, H, P, 3, Dh) -> Transpose to (B, H, P, Dh, 3)
-#            
-#            # Matmul: (B,H,P,1,Dh) @ (B,H,P,Dh,3) -> (B, H, P, 1, 3)
-#            # This computes 3 scores per parent: Self, Left, Right
-#            logits = torch.matmul(Q_p.unsqueeze(3), K_pool.transpose(-1, -2))
-#            logits = logits / math.sqrt(Dh)
-#            
-#            weights = F.softmax(logits, dim=-1) # (B, H, P, 1, 3)
-#
-#            # ---------------------------------------------------
-#            # 6. Weighted Sum
-#            # ---------------------------------------------------
-#            # V_pool: (B, H, P, 3, Dh)
-#            # Matmul: (B,H,P,1,3) @ (B,H,P,3,Dh) -> (B, H, P, 1, Dh)
-#            attn_out = torch.matmul(weights, V_pool)
-#            
-#            # ---------------------------------------------------
-#            # 7. Merge Heads
-#            # ---------------------------------------------------
-#            # 1. Squeeze the '1' dim: (B, H, P, Dh)
-#            # 2. Transpose back to Sequence First: (B, P, H, Dh)
-#            # 3. Flatten/Reshape: (B, P, D)
-#            attn_out = attn_out.squeeze(3).transpose(1, 2).contiguous().reshape(B, parent_count, D)
-#            
-#            new_Y_levels.append(attn_out)
-#            prev_sources = attn_out
-#
-#        return self.out_proj_y(torch.cat(new_Y_levels, dim=1))
-#
-#    def update_X_from_Y(self, x, y, mask=None):
-#        B, N, D = x.shape
-#        H, Dh = self.num_heads, self.head_dim
-#
-#        if y is None: return x
-#
-#        # Concatenate inputs once to allow unified K/V calculation
-#        XY = torch.cat([x, y], dim=1)
-#
-#        # --- Inline Split Heads ---
-#        Q = self.Wq_x(x).view(B, N, H, Dh).transpose(1, 2)
-#        
-#        # Calculate K, V on combined input
-#        kv_input = self.Wk_x(XY).view(B, -1, H, Dh).transpose(1, 2)
-#        v_input = self.Wv_x(XY).view(B, -1, H, Dh).transpose(1, 2)
-#
-#        K_full = kv_input
-#        V_full = self.dropout(v_input)
-#
-#        idx_table, neighbor_causal_mask = self._get_lookup_table(N, device=x.device)
-#            
-#        # Self: The leaves attending to themselves
-#        K_self = K_full[:, :, :N, :]                 
-#        V_self = V_full[:, :, :N, :]                 
-#
-#        # Gather neighbors using index table
-#        gather_indices = idx_table
-#        
-#        neighbors_k = K_full[:, :, gather_indices, :] 
-#        neighbors_v = V_full[:, :, gather_indices, :]
-#
-#        # Compute Self Logits
-#        self_logits = torch.einsum('b h n d, b h n d -> b h n', Q, K_self) / math.sqrt(Dh)
-#
-#        # Compute Neighbor Logits
-#        neighbors_logits = torch.einsum('b h l x d, b h l n d -> b h l n', Q.unsqueeze(3), neighbors_k)
-#        neighbors_logits = neighbors_logits / math.sqrt(Dh)
-#
-#        # Apply Causal Mask
-#        if mask is not None:
-#            neighbors_logits = neighbors_logits.masked_fill(neighbor_causal_mask, float('-inf'))
-#
-#        # Concatenate (Self + Neighbors)
-#        all_v = torch.cat([V_self.unsqueeze(3), neighbors_v], dim=3)             
-#        all_logits = torch.cat([self_logits.unsqueeze(3), neighbors_logits], dim=3) 
-#
-#        # Attention Softmax & Weighted Sum
-#        max_logits = all_logits.max(dim=-1, keepdim=True)[0]
-#        weights = F.softmax(all_logits - max_logits, dim=-1)             
-#            
-#        output_leaf = torch.einsum('b h l n, b h l n d -> b h l d', weights, all_v)
-#
-#        # --- Inline Merge Heads ---
-#        return output_leaf.transpose(1, 2).reshape(B, N, D)
-#
-#    def _standard_attention(self, Q, K, V, mask):
-#        D_head = Q.size(-1)
-#        scores = torch.matmul(Q, K.transpose(-1, -2)) / math.sqrt(D_head)
-#        
-#        if mask is not None:
-#            scores = scores.masked_fill(mask == 0, float('-inf'))
-#            
-#        attn = self.dropout(torch.softmax(scores, dim=-1))
-#        return torch.matmul(attn, V), attn
-#
-#    def forward(self, query, key, value, y=None, mask=None, return_attention=False):
-#        x = query 
-#        B, L_Q, D = x.size()
-#        H, Dh = self.num_heads, self.head_dim
-#        L_K = key.size(1)
-#        L_V = value.size(1)
-#
-#        if L_Q == L_K == L_V and y is not None:
-#            # Hierarchical Update
-#            output_leaf = self.update_X_from_Y(x, y, mask)
-#            output = self.out_proj_x(output_leaf)
-#            return (output, None) if return_attention else output
-#        else:
-#            # Standard Attention Fallback
-#            Q = self.Wq_x(query).view(B, L_Q, H, Dh).transpose(1, 2)
-#            K = self.Wk_x(key).view(B, L_K, H, Dh).transpose(1, 2)
-#            V = self.Wv_x(value).view(B, L_V, H, Dh).transpose(1, 2)
-#            
-#            output_leaf, attn_weights = self._standard_attention(Q, K, V, mask)
-#            
-#            output = output_leaf.transpose(1, 2).reshape(B, L_Q, D)
-#            output = self.out_proj_x(output)
-#            
-#            return (output, attn_weights) if return_attention else output
-
 class HierarchicalSparseAttention(nn.Module):
-    def __init__(self, dim, num_heads, dropout=0.1, window_size=22):
+    def __init__(self, dim, num_heads, dropout=0.1):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
-        self.window_size = window_size 
 
         # --- Y Updates (Bottom-Up) ---
+        # NOTE: Wq_y, Wk_y, Wv_y are kept in case you want to switch back to attention,
+        # but for MLP mode, we primarily use merge_layer.
         self.Wq_y = nn.Linear(dim, dim, bias=False)
         self.Wk_y = nn.Linear(dim, dim, bias=False)
         self.Wv_y = nn.Linear(dim, dim, bias=False)
         self.out_proj_y = nn.Linear(dim, dim)
 
-        # Merge Layer for MLP mode
+        # --- NEW: MLP Merge Layer for cross_update_Y_MLP ---
+        # Takes concatenated Left+Right (2*dim) and projects to Parent (dim)
         self.merge_layer = nn.Linear(2 * dim, dim)
 
         # --- X Updates (Top-Down) ---
@@ -548,33 +281,21 @@ class HierarchicalSparseAttention(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
         
-        # --- Caching ---
         self.cached_idx_table = None
         self.cached_causal_mask = None
         self.cached_seq_len = -1
-        
-        # SWA Index Cache
-        self.cached_swa_indices = None
-        self.cached_swa_offsets_len = -1
 
         self.sizes = None
         self.offsets = None
 
     def _get_lookup_table(self, L, device):
-        """Smart retrieval: Returns cached hierarchical table if L matches."""
+        """Smart retrieval: Returns cached table if L matches, otherwise recomputes."""
         if (self.cached_idx_table is not None and 
             self.cached_seq_len == L and 
             self.cached_idx_table.device == device):
             return self.cached_idx_table, self.cached_causal_mask
 
-        # Placeholder: Ensure 'build_hierarchical_index_lookup_table' is available
-        # If not available, we use a dummy for safety in this snippet
-        try:
-            idx_table, mask = build_hierarchical_index_lookup_table(L, device=device, dtype=torch.int64)
-        except NameError:
-            # Fallback (Dummy)
-            idx_table = torch.zeros((L, 4), device=device, dtype=torch.long)
-            mask = torch.zeros((L, 4), device=device, dtype=torch.bool)
+        idx_table, mask = build_hierarchical_index_lookup_table(L, device=device, dtype=torch.int64)
         
         self.cached_idx_table = idx_table
         self.cached_causal_mask = mask
@@ -582,38 +303,9 @@ class HierarchicalSparseAttention(nn.Module):
         
         return idx_table, mask
 
-    def _get_swa_indices(self, L, device):
-        """
-        Generates indices for sliding window attention.
-        Updated: NOW INCLUDES 0 (Self).
-        Range: [i - w + 1, ..., i, ..., i + w - 1]
-        """
-        # Range: [-window_size + 1, ..., window_size - 1]
-        # This includes 0, so 'self' is implicitly part of the window
-        offsets = torch.arange(-self.window_size + 1, self.window_size, device=device)
-        
-        if (self.cached_swa_indices is not None and 
-            self.cached_swa_indices.shape[0] == L and
-            self.cached_swa_offsets_len == len(offsets) and
-            self.cached_swa_indices.device == device):
-            return self.cached_swa_indices
-
-        # Shape: (1, num_offsets)
-        offsets = offsets.unsqueeze(0) 
-        
-        # Shape: (L, 1)
-        base_indices = torch.arange(L, device=device).unsqueeze(1)
-        
-        # Broadcast add: (L, num_offsets)
-        swa_indices = base_indices + offsets
-        
-        self.cached_swa_indices = swa_indices
-        self.cached_swa_offsets_len = len(offsets.squeeze())
-        return swa_indices
-
     @staticmethod
     def generate_span_input_Y(x):
-        # (Same as before)
+        """Initializes Y by averaging adjacent pairs of X."""
         B, N, D = x.shape
         Y_levels = []
         curr = x
@@ -627,11 +319,11 @@ class HierarchicalSparseAttention(nn.Module):
         
         if not Y_levels:
             return None
+            
         return torch.cat(Y_levels, dim=1)
 
     @staticmethod
     def build_level_info(N):
-        # (Same as before)
         sizes = []
         curr = N
         while curr > 1:
@@ -643,14 +335,24 @@ class HierarchicalSparseAttention(nn.Module):
         return sizes, offsets
 
     def cross_update_Y(self, x, y_in):
-        # (Same as before)
+        """
+        Architecture: Recursive Parent-Self Attention.
+        
+        Refactored Layout: (Batch, Heads, Sequence, Head_Dim) aka (B, H, N, Dh).
+        This matches standard PyTorch MultiheadAttention implementation details.
+        """
         B, N, D = x.shape
         H, Dh = self.num_heads, self.head_dim
         assert y_in is not None
 
-        if self.sizes is None or (self.sizes[0] != N // 2): 
-            self.sizes, self.offsets = self.build_level_info(N)
+        if self.sizes is None: self.sizes, self.offsets = self.build_level_info(N)
 
+        # -------------------------------------------------------
+        # OPTIMIZATION: Global Parent Projection (Standard Layout)
+        # -------------------------------------------------------
+        # Input: (B, Total_Parents, D)
+        # 1. Project -> (B, Total_Parents, H, Dh)
+        # 2. Transpose -> (B, H, Total_Parents, Dh)
         Q_p_all = self.Wq_y(y_in).view(B, -1, H, Dh).transpose(1, 2)
         K_p_all = self.Wk_y(y_in).view(B, -1, H, Dh).transpose(1, 2)
         V_p_all = self.Wv_y(y_in).view(B, -1, H, Dh).transpose(1, 2)
@@ -659,30 +361,71 @@ class HierarchicalSparseAttention(nn.Module):
         prev_sources = x 
 
         for level, parent_count in enumerate(self.sizes):
+            # ---------------------------------------------------
+            # 1. Prepare Children
+            # ---------------------------------------------------
             useful_len = parent_count * 2
             children = prev_sources[:, :useful_len, :] 
             
+            # Project Children -> (B, H, 2*P, Dh)
             K_c = self.Wk_y(children).view(B, -1, H, Dh).transpose(1, 2)
             V_c = self.Wv_y(children).view(B, -1, H, Dh).transpose(1, 2)
             V_c = self.dropout(V_c)
 
+            # ---------------------------------------------------
+            # 2. Reshape Children to Pairs
+            # ---------------------------------------------------
+            # Current: (B, H, 2*P, Dh)
+            # Target:  (B, H, P, 2, Dh)  <-- Group pairs together
             K_c_pairs = K_c.view(B, H, parent_count, 2, Dh)
             V_c_pairs = V_c.view(B, H, parent_count, 2, Dh)
 
+            # ---------------------------------------------------
+            # 3. Slice Parents
+            # ---------------------------------------------------
+            # Current: (B, H, Total_Parents, Dh)
+            # Target:  (B, H, P, Dh)
             offset = self.offsets[level]
             Q_p = Q_p_all[:, :, offset : offset + parent_count, :]
             K_p = K_p_all[:, :, offset : offset + parent_count, :]
             V_p = V_p_all[:, :, offset : offset + parent_count, :]
 
+            # ---------------------------------------------------
+            # 4. Form Attention Pool
+            # ---------------------------------------------------
+            # Parent (Self) needs to be unsqueezed to match Child pairs structure
+            # K_p: (B, H, P, Dh) -> (B, H, P, 1, Dh)
+            # Pool: Concat along the 'pair' dim -> (B, H, P, 3, Dh)
+            # Pool Order: [Parent(Self), Child_Left, Child_Right]
             K_pool = torch.cat([K_p.unsqueeze(3), K_c_pairs], dim=3)
             V_pool = torch.cat([V_p.unsqueeze(3), V_c_pairs], dim=3)
 
+            # ---------------------------------------------------
+            # 5. Attention Scores
+            # ---------------------------------------------------
+            # Q: (B, H, P, Dh) -> (B, H, P, 1, Dh)
+            # K_pool: (B, H, P, 3, Dh) -> Transpose to (B, H, P, Dh, 3)
+            
+            # Matmul: (B,H,P,1,Dh) @ (B,H,P,Dh,3) -> (B, H, P, 1, 3)
+            # This computes 3 scores per parent: Self, Left, Right
             logits = torch.matmul(Q_p.unsqueeze(3), K_pool.transpose(-1, -2))
             logits = logits / math.sqrt(Dh)
             
-            weights = F.softmax(logits, dim=-1)
+            weights = F.softmax(logits, dim=-1) # (B, H, P, 1, 3)
+
+            # ---------------------------------------------------
+            # 6. Weighted Sum
+            # ---------------------------------------------------
+            # V_pool: (B, H, P, 3, Dh)
+            # Matmul: (B,H,P,1,3) @ (B,H,P,3,Dh) -> (B, H, P, 1, Dh)
             attn_out = torch.matmul(weights, V_pool)
             
+            # ---------------------------------------------------
+            # 7. Merge Heads
+            # ---------------------------------------------------
+            # 1. Squeeze the '1' dim: (B, H, P, Dh)
+            # 2. Transpose back to Sequence First: (B, P, H, Dh)
+            # 3. Flatten/Reshape: (B, P, D)
             attn_out = attn_out.squeeze(3).transpose(1, 2).contiguous().reshape(B, parent_count, D)
             
             new_Y_levels.append(attn_out)
@@ -691,9 +434,6 @@ class HierarchicalSparseAttention(nn.Module):
         return self.out_proj_y(torch.cat(new_Y_levels, dim=1))
 
     def update_X_from_Y(self, x, y, mask=None):
-        """
-        Fused Attention: SWA (includes Self) + Hierarchical
-        """
         B, N, D = x.shape
         H, Dh = self.num_heads, self.head_dim
 
@@ -702,81 +442,51 @@ class HierarchicalSparseAttention(nn.Module):
         # Concatenate inputs once to allow unified K/V calculation
         XY = torch.cat([x, y], dim=1)
 
-        # Q is only derived from X (leaves)
+        # --- Inline Split Heads ---
         Q = self.Wq_x(x).view(B, N, H, Dh).transpose(1, 2)
         
-        # K, V derived from XY (leaves + hierarchy)
+        # Calculate K, V on combined input
         kv_input = self.Wk_x(XY).view(B, -1, H, Dh).transpose(1, 2)
         v_input = self.Wv_x(XY).view(B, -1, H, Dh).transpose(1, 2)
 
         K_full = kv_input
         V_full = self.dropout(v_input)
 
-        # ---------------------------------------------------------
-        # 1. SLIDING WINDOW LOGITS (Includes Self)
-        # ---------------------------------------------------------
-        # Get indices: (N, num_swa_neighbors)
-        # This now includes index '0' (self) relative to current pos.
-        swa_indices = self._get_swa_indices(N, device=x.device)
-        
-        # Valid Mask (Padding Check): 
-        # Check if index is within [0, N). SWA only attends to leaves (x), not Y.
-        swa_valid_mask = (swa_indices >= 0) & (swa_indices < N)
-        
-        # Clamp to avoid gather errors (invalid entries masked out later)
-        safe_swa_indices = swa_indices.clamp(0, N - 1)
-        
-        # Gather SWA K/V
-        # Shape: (B, H, N, W, D)
-        swa_k = K_full[:, :, safe_swa_indices, :]
-        swa_v = V_full[:, :, safe_swa_indices, :]
-        
-        # Compute Logits
-        swa_logits = torch.einsum('b h l x d, b h l n d -> b h l n', Q.unsqueeze(3), swa_k)
-        swa_logits = swa_logits / math.sqrt(Dh)
-        
-        # Apply Boundary Padding Mask (Indices that were out of [0, N))
-        swa_logits = swa_logits.masked_fill(~swa_valid_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
-        
-        # Apply Causal Mask (if needed)
-        if mask is not None:
-            # We want to mask where neighbor_index > current_index
-            row_indices = torch.arange(N, device=x.device).unsqueeze(1) # (N, 1)
-            causal_mask_bool = safe_swa_indices > row_indices
-            swa_logits = swa_logits.masked_fill(causal_mask_bool.unsqueeze(0).unsqueeze(0), float('-inf'))
-
-        # ---------------------------------------------------------
-        # 2. HIERARCHICAL NEIGHBOR LOGITS
-        # ---------------------------------------------------------
-        # Get indices for long-range hierarchical connections
         idx_table, neighbor_causal_mask = self._get_lookup_table(N, device=x.device)
+            
+        # Self: The leaves attending to themselves
+        K_self = K_full[:, :, :N, :]                 
+        V_self = V_full[:, :, :N, :]                 
+
+        # Gather neighbors using index table
+        gather_indices = idx_table
         
-        # Gather Hierarchical K/V
-        hier_k = K_full[:, :, idx_table, :] 
-        hier_v = V_full[:, :, idx_table, :]
+        neighbors_k = K_full[:, :, gather_indices, :] 
+        neighbors_v = V_full[:, :, gather_indices, :]
 
-        hier_logits = torch.einsum('b h l x d, b h l n d -> b h l n', Q.unsqueeze(3), hier_k)
-        hier_logits = hier_logits / math.sqrt(Dh)
+        # Compute Self Logits
+        self_logits = torch.einsum('b h n d, b h n d -> b h n', Q, K_self) / math.sqrt(Dh)
 
+        # Compute Neighbor Logits
+        neighbors_logits = torch.einsum('b h l x d, b h l n d -> b h l n', Q.unsqueeze(3), neighbors_k)
+        neighbors_logits = neighbors_logits / math.sqrt(Dh)
+
+        # Apply Causal Mask
         if mask is not None:
-            hier_logits = hier_logits.masked_fill(neighbor_causal_mask, float('-inf'))
+            neighbors_logits = neighbors_logits.masked_fill(neighbor_causal_mask, float('-inf'))
 
-        # ---------------------------------------------------------
-        # 3. FUSION & OUTPUT
-        # ---------------------------------------------------------
-        # Concatenate: [SWA (Local+Self), Hierarchical (Global)]
-        all_logits = torch.cat([swa_logits, hier_logits], dim=3)
-        all_v = torch.cat([swa_v, hier_v], dim=3)
+        # Concatenate (Self + Neighbors)
+        all_v = torch.cat([V_self.unsqueeze(3), neighbors_v], dim=3)             
+        all_logits = torch.cat([self_logits.unsqueeze(3), neighbors_logits], dim=3) 
 
-        # Attention Softmax
+        # Attention Softmax & Weighted Sum
         max_logits = all_logits.max(dim=-1, keepdim=True)[0]
-        weights = F.softmax(all_logits - max_logits, dim=-1)              
+        weights = F.softmax(all_logits - max_logits, dim=-1)             
             
         output_leaf = torch.einsum('b h l n, b h l n d -> b h l d', weights, all_v)
 
-        output = output_leaf.transpose(1, 2).reshape(B, N, D)
-
-        return self.out_proj_x(output)
+        # --- Inline Merge Heads ---
+        return output_leaf.transpose(1, 2).reshape(B, N, D)
 
     def _standard_attention(self, Q, K, V, mask):
         D_head = Q.size(-1)
@@ -796,10 +506,12 @@ class HierarchicalSparseAttention(nn.Module):
         L_V = value.size(1)
 
         if L_Q == L_K == L_V and y is not None:
+            # Hierarchical Update
             output_leaf = self.update_X_from_Y(x, y, mask)
-            output = output_leaf 
+            output = self.out_proj_x(output_leaf)
             return (output, None) if return_attention else output
         else:
+            # Standard Attention Fallback
             Q = self.Wq_x(query).view(B, L_Q, H, Dh).transpose(1, 2)
             K = self.Wk_x(key).view(B, L_K, H, Dh).transpose(1, 2)
             V = self.Wv_x(value).view(B, L_V, H, Dh).transpose(1, 2)
@@ -810,6 +522,294 @@ class HierarchicalSparseAttention(nn.Module):
             output = self.out_proj_x(output)
             
             return (output, attn_weights) if return_attention else output
+
+#class HierarchicalSparseAttention(nn.Module):
+#    def __init__(self, dim, num_heads, dropout=0.1, window_size=22):
+#        super().__init__()
+#        self.dim = dim
+#        self.num_heads = num_heads
+#        self.head_dim = dim // num_heads
+#        self.window_size = window_size 
+#
+#        # --- Y Updates (Bottom-Up) ---
+#        self.Wq_y = nn.Linear(dim, dim, bias=False)
+#        self.Wk_y = nn.Linear(dim, dim, bias=False)
+#        self.Wv_y = nn.Linear(dim, dim, bias=False)
+#        self.out_proj_y = nn.Linear(dim, dim)
+#
+#        # Merge Layer for MLP mode
+#        self.merge_layer = nn.Linear(2 * dim, dim)
+#
+#        # --- X Updates (Top-Down) ---
+#        self.Wq_x = nn.Linear(dim, dim, bias=False)
+#        self.Wk_x = nn.Linear(dim, dim, bias=False)
+#        self.Wv_x = nn.Linear(dim, dim, bias=False)
+#        self.out_proj_x = nn.Linear(dim, dim)
+#
+#        self.dropout = nn.Dropout(dropout)
+#        
+#        # --- Caching ---
+#        self.cached_idx_table = None
+#        self.cached_causal_mask = None
+#        self.cached_seq_len = -1
+#        
+#        # SWA Index Cache
+#        self.cached_swa_indices = None
+#        self.cached_swa_offsets_len = -1
+#
+#        self.sizes = None
+#        self.offsets = None
+#
+#    def _get_lookup_table(self, L, device):
+#        """Smart retrieval: Returns cached hierarchical table if L matches."""
+#        if (self.cached_idx_table is not None and 
+#            self.cached_seq_len == L and 
+#            self.cached_idx_table.device == device):
+#            return self.cached_idx_table, self.cached_causal_mask
+#
+#        # Placeholder: Ensure 'build_hierarchical_index_lookup_table' is available
+#        # If not available, we use a dummy for safety in this snippet
+#        try:
+#            idx_table, mask = build_hierarchical_index_lookup_table(L, device=device, dtype=torch.int64)
+#        except NameError:
+#            # Fallback (Dummy)
+#            idx_table = torch.zeros((L, 4), device=device, dtype=torch.long)
+#            mask = torch.zeros((L, 4), device=device, dtype=torch.bool)
+#        
+#        self.cached_idx_table = idx_table
+#        self.cached_causal_mask = mask
+#        self.cached_seq_len = L
+#        
+#        return idx_table, mask
+#
+#    def _get_swa_indices(self, L, device):
+#        """
+#        Generates indices for sliding window attention.
+#        Updated: NOW INCLUDES 0 (Self).
+#        Range: [i - w + 1, ..., i, ..., i + w - 1]
+#        """
+#        # Range: [-window_size + 1, ..., window_size - 1]
+#        # This includes 0, so 'self' is implicitly part of the window
+#        offsets = torch.arange(-self.window_size + 1, self.window_size, device=device)
+#        
+#        if (self.cached_swa_indices is not None and 
+#            self.cached_swa_indices.shape[0] == L and
+#            self.cached_swa_offsets_len == len(offsets) and
+#            self.cached_swa_indices.device == device):
+#            return self.cached_swa_indices
+#
+#        # Shape: (1, num_offsets)
+#        offsets = offsets.unsqueeze(0) 
+#        
+#        # Shape: (L, 1)
+#        base_indices = torch.arange(L, device=device).unsqueeze(1)
+#        
+#        # Broadcast add: (L, num_offsets)
+#        swa_indices = base_indices + offsets
+#        
+#        self.cached_swa_indices = swa_indices
+#        self.cached_swa_offsets_len = len(offsets.squeeze())
+#        return swa_indices
+#
+#    @staticmethod
+#    def generate_span_input_Y(x):
+#        # (Same as before)
+#        B, N, D = x.shape
+#        Y_levels = []
+#        curr = x
+#        while curr.size(1) > 1:
+#            L = curr.size(1)
+#            even = L - (L % 2)
+#            curr_pairs = curr[:, :even, :].reshape(B, even // 2, 2, D)
+#            parents = 0.5 * curr_pairs[:, :, 0, :] + 0.5 * curr_pairs[:, :, 1, :]
+#            Y_levels.append(parents)
+#            curr = parents
+#        
+#        if not Y_levels:
+#            return None
+#        return torch.cat(Y_levels, dim=1)
+#
+#    @staticmethod
+#    def build_level_info(N):
+#        # (Same as before)
+#        sizes = []
+#        curr = N
+#        while curr > 1:
+#            sizes.append(curr // 2)
+#            curr = curr // 2
+#        offsets = [0]
+#        for s in sizes[:-1]:
+#            offsets.append(offsets[-1] + s)
+#        return sizes, offsets
+#
+#    def cross_update_Y(self, x, y_in):
+#        # (Same as before)
+#        B, N, D = x.shape
+#        H, Dh = self.num_heads, self.head_dim
+#        assert y_in is not None
+#
+#        if self.sizes is None or (self.sizes[0] != N // 2): 
+#            self.sizes, self.offsets = self.build_level_info(N)
+#
+#        Q_p_all = self.Wq_y(y_in).view(B, -1, H, Dh).transpose(1, 2)
+#        K_p_all = self.Wk_y(y_in).view(B, -1, H, Dh).transpose(1, 2)
+#        V_p_all = self.Wv_y(y_in).view(B, -1, H, Dh).transpose(1, 2)
+#        
+#        new_Y_levels = []
+#        prev_sources = x 
+#
+#        for level, parent_count in enumerate(self.sizes):
+#            useful_len = parent_count * 2
+#            children = prev_sources[:, :useful_len, :] 
+#            
+#            K_c = self.Wk_y(children).view(B, -1, H, Dh).transpose(1, 2)
+#            V_c = self.Wv_y(children).view(B, -1, H, Dh).transpose(1, 2)
+#            V_c = self.dropout(V_c)
+#
+#            K_c_pairs = K_c.view(B, H, parent_count, 2, Dh)
+#            V_c_pairs = V_c.view(B, H, parent_count, 2, Dh)
+#
+#            offset = self.offsets[level]
+#            Q_p = Q_p_all[:, :, offset : offset + parent_count, :]
+#            K_p = K_p_all[:, :, offset : offset + parent_count, :]
+#            V_p = V_p_all[:, :, offset : offset + parent_count, :]
+#
+#            K_pool = torch.cat([K_p.unsqueeze(3), K_c_pairs], dim=3)
+#            V_pool = torch.cat([V_p.unsqueeze(3), V_c_pairs], dim=3)
+#
+#            logits = torch.matmul(Q_p.unsqueeze(3), K_pool.transpose(-1, -2))
+#            logits = logits / math.sqrt(Dh)
+#            
+#            weights = F.softmax(logits, dim=-1)
+#            attn_out = torch.matmul(weights, V_pool)
+#            
+#            attn_out = attn_out.squeeze(3).transpose(1, 2).contiguous().reshape(B, parent_count, D)
+#            
+#            new_Y_levels.append(attn_out)
+#            prev_sources = attn_out
+#
+#        return self.out_proj_y(torch.cat(new_Y_levels, dim=1))
+#
+#    def update_X_from_Y(self, x, y, mask=None):
+#        """
+#        Fused Attention: SWA (includes Self) + Hierarchical
+#        """
+#        B, N, D = x.shape
+#        H, Dh = self.num_heads, self.head_dim
+#
+#        if y is None: return x
+#
+#        # Concatenate inputs once to allow unified K/V calculation
+#        XY = torch.cat([x, y], dim=1)
+#
+#        # Q is only derived from X (leaves)
+#        Q = self.Wq_x(x).view(B, N, H, Dh).transpose(1, 2)
+#        
+#        # K, V derived from XY (leaves + hierarchy)
+#        kv_input = self.Wk_x(XY).view(B, -1, H, Dh).transpose(1, 2)
+#        v_input = self.Wv_x(XY).view(B, -1, H, Dh).transpose(1, 2)
+#
+#        K_full = kv_input
+#        V_full = self.dropout(v_input)
+#
+#        # ---------------------------------------------------------
+#        # 1. SLIDING WINDOW LOGITS (Includes Self)
+#        # ---------------------------------------------------------
+#        # Get indices: (N, num_swa_neighbors)
+#        # This now includes index '0' (self) relative to current pos.
+#        swa_indices = self._get_swa_indices(N, device=x.device)
+#        
+#        # Valid Mask (Padding Check): 
+#        # Check if index is within [0, N). SWA only attends to leaves (x), not Y.
+#        swa_valid_mask = (swa_indices >= 0) & (swa_indices < N)
+#        
+#        # Clamp to avoid gather errors (invalid entries masked out later)
+#        safe_swa_indices = swa_indices.clamp(0, N - 1)
+#        
+#        # Gather SWA K/V
+#        # Shape: (B, H, N, W, D)
+#        swa_k = K_full[:, :, safe_swa_indices, :]
+#        swa_v = V_full[:, :, safe_swa_indices, :]
+#        
+#        # Compute Logits
+#        swa_logits = torch.einsum('b h l x d, b h l n d -> b h l n', Q.unsqueeze(3), swa_k)
+#        swa_logits = swa_logits / math.sqrt(Dh)
+#        
+#        # Apply Boundary Padding Mask (Indices that were out of [0, N))
+#        swa_logits = swa_logits.masked_fill(~swa_valid_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+#        
+#        # Apply Causal Mask (if needed)
+#        if mask is not None:
+#            # We want to mask where neighbor_index > current_index
+#            row_indices = torch.arange(N, device=x.device).unsqueeze(1) # (N, 1)
+#            causal_mask_bool = safe_swa_indices > row_indices
+#            swa_logits = swa_logits.masked_fill(causal_mask_bool.unsqueeze(0).unsqueeze(0), float('-inf'))
+#
+#        # ---------------------------------------------------------
+#        # 2. HIERARCHICAL NEIGHBOR LOGITS
+#        # ---------------------------------------------------------
+#        # Get indices for long-range hierarchical connections
+#        idx_table, neighbor_causal_mask = self._get_lookup_table(N, device=x.device)
+#        
+#        # Gather Hierarchical K/V
+#        hier_k = K_full[:, :, idx_table, :] 
+#        hier_v = V_full[:, :, idx_table, :]
+#
+#        hier_logits = torch.einsum('b h l x d, b h l n d -> b h l n', Q.unsqueeze(3), hier_k)
+#        hier_logits = hier_logits / math.sqrt(Dh)
+#
+#        if mask is not None:
+#            hier_logits = hier_logits.masked_fill(neighbor_causal_mask, float('-inf'))
+#
+#        # ---------------------------------------------------------
+#        # 3. FUSION & OUTPUT
+#        # ---------------------------------------------------------
+#        # Concatenate: [SWA (Local+Self), Hierarchical (Global)]
+#        all_logits = torch.cat([swa_logits, hier_logits], dim=3)
+#        all_v = torch.cat([swa_v, hier_v], dim=3)
+#
+#        # Attention Softmax
+#        max_logits = all_logits.max(dim=-1, keepdim=True)[0]
+#        weights = F.softmax(all_logits - max_logits, dim=-1)              
+#            
+#        output_leaf = torch.einsum('b h l n, b h l n d -> b h l d', weights, all_v)
+#
+#        output = output_leaf.transpose(1, 2).reshape(B, N, D)
+#
+#        return self.out_proj_x(output)
+#
+#    def _standard_attention(self, Q, K, V, mask):
+#        D_head = Q.size(-1)
+#        scores = torch.matmul(Q, K.transpose(-1, -2)) / math.sqrt(D_head)
+#        
+#        if mask is not None:
+#            scores = scores.masked_fill(mask == 0, float('-inf'))
+#            
+#        attn = self.dropout(torch.softmax(scores, dim=-1))
+#        return torch.matmul(attn, V), attn
+#
+#    def forward(self, query, key, value, y=None, mask=None, return_attention=False):
+#        x = query 
+#        B, L_Q, D = x.size()
+#        H, Dh = self.num_heads, self.head_dim
+#        L_K = key.size(1)
+#        L_V = value.size(1)
+#
+#        if L_Q == L_K == L_V and y is not None:
+#            output_leaf = self.update_X_from_Y(x, y, mask)
+#            output = output_leaf 
+#            return (output, None) if return_attention else output
+#        else:
+#            Q = self.Wq_x(query).view(B, L_Q, H, Dh).transpose(1, 2)
+#            K = self.Wk_x(key).view(B, L_K, H, Dh).transpose(1, 2)
+#            V = self.Wv_x(value).view(B, L_V, H, Dh).transpose(1, 2)
+#            
+#            output_leaf, attn_weights = self._standard_attention(Q, K, V, mask)
+#            
+#            output = output_leaf.transpose(1, 2).reshape(B, L_Q, D)
+#            output = self.out_proj_x(output)
+#            
+#            return (output, attn_weights) if return_attention else output
 
 class PositionwiseFeedForward(nn.Module):
     def __init__(self, d_model, d_ff, dropout=0.1):
