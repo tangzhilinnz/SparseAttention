@@ -5,7 +5,7 @@ import os
 # CRITICAL FIX: GPU SELECTION MUST BE FIRST
 # ==========================================
 # Set this before importing torch or calling torch.cuda to avoid OOM
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import datasets
 # Essential PyTorch imports
@@ -149,18 +149,15 @@ class LargeScaleWikiTextDataset(Dataset):
 
 # --- LOAD DATA ---
 print("\n<> Loading WikiText-103 Dataset...")
-# CHANGED: 'wikitext-103-v1'
 dataset = load_dataset("wikitext", "wikitext-103-v1")
 
-# CHANGED: Increased Vocab Size for WT103
 # Standard WT103 is ~267k. Setting to 50k for efficiency with custom attention.
-# If you want the full benchmark, set max_vocab_size=267735
 VOCAB_SIZE = 50000 
 vocab_builder = EfficientVocabBuilder(dataset['train'], max_vocab_size=VOCAB_SIZE)
 
 # Create Datasets
 print("\n<> Processing Training Data (This may take 1-2 mins)...")
-MAX_LEN = 2048 # Reduced slightly from 4096 to ensure safety with batching on A100
+MAX_LEN = 2048 
 train_dataset = LargeScaleWikiTextDataset(dataset['train'], vocab_builder, max_len=MAX_LEN)
 
 print("\n<> Processing Validation Data...")
@@ -170,7 +167,6 @@ print("\n<> Processing Test Data...")
 test_dataset = LargeScaleWikiTextDataset(dataset['test'], vocab_builder, max_len=MAX_LEN)
 
 # Dataloaders
-# Increased Batch Size for A100 80G
 batch_size = 8 
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, drop_last=True, num_workers=4)
 valid_loader = DataLoader(valid_dataset, batch_size=batch_size, drop_last=True, num_workers=4)
@@ -192,21 +188,6 @@ def build_hierarchical_index_lookup_table(seq_len, device="cuda", dtype=torch.in
     """
     Build a hierarchical index lookup table storing only neighbor nodes
     across different levels (excluding the leaf itself).
-
-    The relationship follows:
-        level 0: n ^ 1
-        level 1: (n // 2 + seq_len) ^ 1
-        level 2: (n1 // 2 + seq_len) ^ 1
-        ...
-    Stops when the next index exceeds total_nodes - 2.
-
-    Args:
-        seq_len (int): number of leaf tokens (must be a power of 2)
-        device (str): 'cuda' or 'cpu'
-        dtype (torch.dtype): index dtype (default int32)
-
-    Returns:
-        idx_map: [seq_len, level_num] int tensor
     """
     assert (seq_len & (seq_len - 1)) == 0, "seq_len must be a power of 2"
 
@@ -215,49 +196,31 @@ def build_hierarchical_index_lookup_table(seq_len, device="cuda", dtype=torch.in
     level_num = int(math.log2(seq_len))
 
     # 1. Initialize Tensors
-    # Mask defaults to True (attend to everything), we set False to mask out future tokens.
     causal_mask = torch.full((seq_len, level_num), False, dtype=torch.bool, device=device)
-    
-    # Map defaults to -1 (padding/invalid)
     idx_map = torch.full((seq_len, level_num), -1, dtype=dtype, device=device)
 
     for n in range(seq_len):
         n_cur = n # Starts as the leaf index
         
         for lvl in range(level_num):
-            # --- 1. Calculate the Neighbor (n_next) and Self/Ancestor (pair) ---
             if lvl == 0:
                 n_next = n_cur ^ 1  # Sibling leaf
                 pair = n_cur        # The leaf itself
             else:
-                # Formula: (Child_Index // 2) + Offset
-                # Note: We use n_cur (which is the *neighbor* from prev loop).
-                # This works because floor(neighbor / 2) == floor(self / 2).
                 n_next = (n_cur // 2 + seq_len) ^ 1 # Uncle
                 pair = (n_cur // 2 + seq_len)       # Parent
 
-            # --- 2. Boundary Check ---
-            # If the neighbor is the Root or out of bounds
             if n_next > max_valid:
                 break
 
-            # --- 3. Causal Masking Logic ---
-            # If our Ancestor (pair) appears BEFORE the Neighbor (n_next),
-            # it means the Neighbor is in the "Future" (Right branch).
-            # We must mask it out.
             if pair < n_next:
                 causal_mask[n, lvl] = True
 
-            # --- 4. Update for next iteration ---
             idx_map[n, lvl] = n_next
-            n_cur = n_next # Climb up via the neighbor
+            n_cur = n_next 
 
     return idx_map, causal_mask
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import math
 
 class HierarchicalSparseAttention(nn.Module):
     def __init__(self, dim, num_heads, dropout=0.1, window_size=22):
@@ -287,6 +250,7 @@ class HierarchicalSparseAttention(nn.Module):
         self.cached_idx_table = None
         self.cached_causal_mask = None
         self.cached_seq_len = -1
+        
         self.cached_swa_indices = None
         self.cached_swa_offsets_len = -1
 
@@ -299,8 +263,9 @@ class HierarchicalSparseAttention(nn.Module):
             self.cached_idx_table.device == device):
             return self.cached_idx_table, self.cached_causal_mask
 
+        # DIRECT CALL: Removed try/except to prevent silent failure
         idx_table, mask = build_hierarchical_index_lookup_table(L, device=device, dtype=torch.int64)
-  
+        
         self.cached_idx_table = idx_table
         self.cached_causal_mask = mask
         self.cached_seq_len = L
@@ -323,9 +288,87 @@ class HierarchicalSparseAttention(nn.Module):
         self.cached_swa_offsets_len = len(offsets)
         return swa_indices
 
+    @staticmethod
+    def generate_span_input_Y(x):
+        B, N, D = x.shape
+        Y_levels = []
+        curr = x
+        while curr.size(1) > 1:
+            L = curr.size(1)
+            even = L - (L % 2)
+            curr_pairs = curr[:, :even, :].reshape(B, even // 2, 2, D)
+            parents = 0.5 * curr_pairs[:, :, 0, :] + 0.5 * curr_pairs[:, :, 1, :]
+            Y_levels.append(parents)
+            curr = parents
+        
+        if not Y_levels:
+            return None
+        return torch.cat(Y_levels, dim=1)
+
+    @staticmethod
+    def build_level_info(N):
+        sizes = []
+        curr = N
+        while curr > 1:
+            sizes.append(curr // 2)
+            curr = curr // 2
+        offsets = [0]
+        for s in sizes[:-1]:
+            offsets.append(offsets[-1] + s)
+        return sizes, offsets
+
+    def cross_update_Y(self, x, y_in):
+        # Bottom-Up Logic
+        B, N, D = x.shape
+        H, Dh = self.num_heads, self.head_dim
+        assert y_in is not None
+
+        if self.sizes is None or (self.sizes[0] != N // 2): 
+            self.sizes, self.offsets = self.build_level_info(N)
+
+        Q_p_all = self.Wq_y(y_in).view(B, -1, H, Dh).transpose(1, 2)
+        K_p_all = self.Wk_y(y_in).view(B, -1, H, Dh).transpose(1, 2)
+        V_p_all = self.Wv_y(y_in).view(B, -1, H, Dh).transpose(1, 2)
+        
+        new_Y_levels = []
+        prev_sources = x 
+
+        for level, parent_count in enumerate(self.sizes):
+            useful_len = parent_count * 2
+            children = prev_sources[:, :useful_len, :] 
+            
+            K_c = self.Wk_y(children).view(B, -1, H, Dh).transpose(1, 2)
+            V_c = self.Wv_y(children).view(B, -1, H, Dh).transpose(1, 2)
+            V_c = self.dropout(V_c)
+
+            K_c_pairs = K_c.view(B, H, parent_count, 2, Dh)
+            V_c_pairs = V_c.view(B, H, parent_count, 2, Dh)
+
+            offset = self.offsets[level]
+            Q_p = Q_p_all[:, :, offset : offset + parent_count, :]
+            K_p = K_p_all[:, :, offset : offset + parent_count, :]
+            V_p = V_p_all[:, :, offset : offset + parent_count, :]
+
+            K_pool = torch.cat([K_p.unsqueeze(3), K_c_pairs], dim=3)
+            V_pool = torch.cat([V_p.unsqueeze(3), V_c_pairs], dim=3)
+
+            logits = torch.matmul(Q_p.unsqueeze(3), K_pool.transpose(-1, -2))
+            logits = logits / math.sqrt(Dh)
+            
+            weights = F.softmax(logits, dim=-1)
+            attn_out = torch.matmul(weights, V_pool)
+            
+            attn_out = attn_out.squeeze(3).transpose(1, 2).contiguous().reshape(B, parent_count, D)
+            
+            new_Y_levels.append(attn_out)
+            prev_sources = attn_out
+
+        return self.out_proj_y(torch.cat(new_Y_levels, dim=1))
+
     def update_X_from_Y(self, x, y, mask=None, disable_hierarchy=False):
         """
         Fused Attention: SWA + (Optional) Hierarchical Connections
+        Top-Down Logic
         """
         B, N, D = x.shape
         H, Dh = self.num_heads, self.head_dim
@@ -390,283 +433,6 @@ class HierarchicalSparseAttention(nn.Module):
 
         return self.out_proj_x(output)
 
-    def forward(self, query, key, value, y=None, mask=None, return_attention=False, disable_hierarchy=False):
-        x = query 
-        B, L_Q, D = x.size()
-        H, Dh = self.num_heads, self.head_dim
-        
-        # Use Hierarchical/SWA path if inputs match and we are in self-attention mode
-        if L_Q == key.size(1) == value.size(1):
-            output = self.update_X_from_Y(x, y, mask, disable_hierarchy=disable_hierarchy)
-            return (output, None) if return_attention else output
-        
-        # Fallback for Cross-Attention or non-matching lengths
-        else:
-            Q = self.Wq_x(query).view(B, L_Q, H, Dh).transpose(1, 2)
-            K = self.Wk_x(key).view(B, -1, H, Dh).transpose(1, 2)
-            V = self.Wv_x(value).view(B, -1, H, Dh).transpose(1, 2)
-            
-            # Standard attention helper (omitted here for brevity, use your existing one)
-            output_leaf, attn_weights = self._standard_attention(Q, K, V, mask)
-            output = self.out_proj_x(output_leaf.transpose(1, 2).reshape(B, L_Q, D))
-            
-            return (output, attn_weights) if return_attention else output
-
-class HierarchicalSparseAttention(nn.Module):
-    def __init__(self, dim, num_heads, dropout=0.1, window_size=22):
-        super().__init__()
-        self.dim = dim
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.window_size = window_size 
-
-        # --- Y Updates (Bottom-Up) ---
-        self.Wq_y = nn.Linear(dim, dim, bias=False)
-        self.Wk_y = nn.Linear(dim, dim, bias=False)
-        self.Wv_y = nn.Linear(dim, dim, bias=False)
-        self.out_proj_y = nn.Linear(dim, dim)
-
-        # Merge Layer for MLP mode
-        self.merge_layer = nn.Linear(2 * dim, dim)
-
-        # --- X Updates (Top-Down) ---
-        self.Wq_x = nn.Linear(dim, dim, bias=False)
-        self.Wk_x = nn.Linear(dim, dim, bias=False)
-        self.Wv_x = nn.Linear(dim, dim, bias=False)
-        self.out_proj_x = nn.Linear(dim, dim)
-
-        self.dropout = nn.Dropout(dropout)
-        
-        # --- Caching ---
-        self.cached_idx_table = None
-        self.cached_causal_mask = None
-        self.cached_seq_len = -1
-        
-        # SWA Index Cache
-        self.cached_swa_indices = None
-        self.cached_swa_offsets_len = -1
-
-        self.sizes = None
-        self.offsets = None
-
-    def _get_lookup_table(self, L, device):
-        """Smart retrieval: Returns cached hierarchical table if L matches."""
-        if (self.cached_idx_table is not None and 
-            self.cached_seq_len == L and 
-            self.cached_idx_table.device == device):
-            return self.cached_idx_table, self.cached_causal_mask
-
-        # Placeholder: Ensure 'build_hierarchical_index_lookup_table' is available
-        # If not available, we use a dummy for safety in this snippet
-        try:
-            idx_table, mask = build_hierarchical_index_lookup_table(L, device=device, dtype=torch.int64)
-        except NameError:
-            # Fallback (Dummy)
-            idx_table = torch.zeros((L, 4), device=device, dtype=torch.long)
-            mask = torch.zeros((L, 4), device=device, dtype=torch.bool)
-        
-        self.cached_idx_table = idx_table
-        self.cached_causal_mask = mask
-        self.cached_seq_len = L
-        
-        return idx_table, mask
-
-    def _get_swa_indices(self, L, device):
-        """
-        Generates indices for sliding window attention.
-        Updated: NOW INCLUDES 0 (Self).
-        Range: [i - w + 1, ..., i, ..., i + w - 1]
-        """
-        # Range: [-window_size + 1, ..., window_size - 1]
-        # This includes 0, so 'self' is implicitly part of the window
-        offsets = torch.arange(-self.window_size + 1, self.window_size, device=device)
-        
-        if (self.cached_swa_indices is not None and 
-            self.cached_swa_indices.shape[0] == L and
-            self.cached_swa_offsets_len == len(offsets) and
-            self.cached_swa_indices.device == device):
-            return self.cached_swa_indices
-
-        # Shape: (1, num_offsets)
-        offsets = offsets.unsqueeze(0) 
-        
-        # Shape: (L, 1)
-        base_indices = torch.arange(L, device=device).unsqueeze(1)
-        
-        # Broadcast add: (L, num_offsets)
-        swa_indices = base_indices + offsets
-        
-        self.cached_swa_indices = swa_indices
-        self.cached_swa_offsets_len = len(offsets.squeeze())
-        return swa_indices
-
-    @staticmethod
-    def generate_span_input_Y(x):
-        # (Same as before)
-        B, N, D = x.shape
-        Y_levels = []
-        curr = x
-        while curr.size(1) > 1:
-            L = curr.size(1)
-            even = L - (L % 2)
-            curr_pairs = curr[:, :even, :].reshape(B, even // 2, 2, D)
-            parents = 0.5 * curr_pairs[:, :, 0, :] + 0.5 * curr_pairs[:, :, 1, :]
-            Y_levels.append(parents)
-            curr = parents
-        
-        if not Y_levels:
-            return None
-        return torch.cat(Y_levels, dim=1)
-
-    @staticmethod
-    def build_level_info(N):
-        # (Same as before)
-        sizes = []
-        curr = N
-        while curr > 1:
-            sizes.append(curr // 2)
-            curr = curr // 2
-        offsets = [0]
-        for s in sizes[:-1]:
-            offsets.append(offsets[-1] + s)
-        return sizes, offsets
-
-    def cross_update_Y(self, x, y_in):
-        # (Same as before)
-        B, N, D = x.shape
-        H, Dh = self.num_heads, self.head_dim
-        assert y_in is not None
-
-        if self.sizes is None or (self.sizes[0] != N // 2): 
-            self.sizes, self.offsets = self.build_level_info(N)
-
-        Q_p_all = self.Wq_y(y_in).view(B, -1, H, Dh).transpose(1, 2)
-        K_p_all = self.Wk_y(y_in).view(B, -1, H, Dh).transpose(1, 2)
-        V_p_all = self.Wv_y(y_in).view(B, -1, H, Dh).transpose(1, 2)
-        
-        new_Y_levels = []
-        prev_sources = x 
-
-        for level, parent_count in enumerate(self.sizes):
-            useful_len = parent_count * 2
-            children = prev_sources[:, :useful_len, :] 
-            
-            K_c = self.Wk_y(children).view(B, -1, H, Dh).transpose(1, 2)
-            V_c = self.Wv_y(children).view(B, -1, H, Dh).transpose(1, 2)
-            V_c = self.dropout(V_c)
-
-            K_c_pairs = K_c.view(B, H, parent_count, 2, Dh)
-            V_c_pairs = V_c.view(B, H, parent_count, 2, Dh)
-
-            offset = self.offsets[level]
-            Q_p = Q_p_all[:, :, offset : offset + parent_count, :]
-            K_p = K_p_all[:, :, offset : offset + parent_count, :]
-            V_p = V_p_all[:, :, offset : offset + parent_count, :]
-
-            K_pool = torch.cat([K_p.unsqueeze(3), K_c_pairs], dim=3)
-            V_pool = torch.cat([V_p.unsqueeze(3), V_c_pairs], dim=3)
-
-            logits = torch.matmul(Q_p.unsqueeze(3), K_pool.transpose(-1, -2))
-            logits = logits / math.sqrt(Dh)
-            
-            weights = F.softmax(logits, dim=-1)
-            attn_out = torch.matmul(weights, V_pool)
-            
-            attn_out = attn_out.squeeze(3).transpose(1, 2).contiguous().reshape(B, parent_count, D)
-            
-            new_Y_levels.append(attn_out)
-            prev_sources = attn_out
-
-        return self.out_proj_y(torch.cat(new_Y_levels, dim=1))
-
-    def update_X_from_Y(self, x, y, mask=None):
-        """
-        Fused Attention: SWA (includes Self) + Hierarchical
-        """
-        B, N, D = x.shape
-        H, Dh = self.num_heads, self.head_dim
-
-        if y is None: return x
-
-        # Concatenate inputs once to allow unified K/V calculation
-        XY = torch.cat([x, y], dim=1)
-
-        # Q is only derived from X (leaves)
-        Q = self.Wq_x(x).view(B, N, H, Dh).transpose(1, 2)
-        
-        # K, V derived from XY (leaves + hierarchy)
-        kv_input = self.Wk_x(XY).view(B, -1, H, Dh).transpose(1, 2)
-        v_input = self.Wv_x(XY).view(B, -1, H, Dh).transpose(1, 2)
-
-        K_full = kv_input
-        V_full = self.dropout(v_input)
-
-        # ---------------------------------------------------------
-        # 1. SLIDING WINDOW LOGITS (Includes Self)
-        # ---------------------------------------------------------
-        # Get indices: (N, num_swa_neighbors)
-        # This now includes index '0' (self) relative to current pos.
-        swa_indices = self._get_swa_indices(N, device=x.device)
-        
-        # Valid Mask (Padding Check): 
-        # Check if index is within [0, N). SWA only attends to leaves (x), not Y.
-        swa_valid_mask = (swa_indices >= 0) & (swa_indices < N)
-        
-        # Clamp to avoid gather errors (invalid entries masked out later)
-        safe_swa_indices = swa_indices.clamp(0, N - 1)
-        
-        # Gather SWA K/V
-        # Shape: (B, H, N, W, D)
-        swa_k = K_full[:, :, safe_swa_indices, :]
-        swa_v = V_full[:, :, safe_swa_indices, :]
-        
-        # Compute Logits
-        swa_logits = torch.einsum('b h l x d, b h l n d -> b h l n', Q.unsqueeze(3), swa_k)
-        swa_logits = swa_logits / math.sqrt(Dh)
-        
-        # Apply Boundary Padding Mask (Indices that were out of [0, N))
-        swa_logits = swa_logits.masked_fill(~swa_valid_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
-        
-        # Apply Causal Mask (if needed)
-        if mask is not None:
-            # We want to mask where neighbor_index > current_index
-            row_indices = torch.arange(N, device=x.device).unsqueeze(1) # (N, 1)
-            causal_mask_bool = safe_swa_indices > row_indices
-            swa_logits = swa_logits.masked_fill(causal_mask_bool.unsqueeze(0).unsqueeze(0), float('-inf'))
-
-        # ---------------------------------------------------------
-        # 2. HIERARCHICAL NEIGHBOR LOGITS
-        # ---------------------------------------------------------
-        # Get indices for long-range hierarchical connections
-        idx_table, neighbor_causal_mask = self._get_lookup_table(N, device=x.device)
-        
-        # Gather Hierarchical K/V
-        hier_k = K_full[:, :, idx_table, :] 
-        hier_v = V_full[:, :, idx_table, :]
-
-        hier_logits = torch.einsum('b h l x d, b h l n d -> b h l n', Q.unsqueeze(3), hier_k)
-        hier_logits = hier_logits / math.sqrt(Dh)
-
-        if mask is not None:
-            hier_logits = hier_logits.masked_fill(neighbor_causal_mask, float('-inf'))
-
-        # ---------------------------------------------------------
-        # 3. FUSION & OUTPUT
-        # ---------------------------------------------------------
-        # Concatenate: [SWA (Local+Self), Hierarchical (Global)]
-        all_logits = torch.cat([swa_logits, hier_logits], dim=3)
-        all_v = torch.cat([swa_v, hier_v], dim=3)
-
-        # Attention Softmax
-        max_logits = all_logits.max(dim=-1, keepdim=True)[0]
-        weights = F.softmax(all_logits - max_logits, dim=-1)              
-            
-        output_leaf = torch.einsum('b h l n, b h l n d -> b h l d', weights, all_v)
-
-        output = output_leaf.transpose(1, 2).reshape(B, N, D)
-
-        return self.out_proj_x(output)
-
     def _standard_attention(self, Q, K, V, mask):
         D_head = Q.size(-1)
         scores = torch.matmul(Q, K.transpose(-1, -2)) / math.sqrt(D_head)
@@ -677,26 +443,25 @@ class HierarchicalSparseAttention(nn.Module):
         attn = self.dropout(torch.softmax(scores, dim=-1))
         return torch.matmul(attn, V), attn
 
-    def forward(self, query, key, value, y=None, mask=None, return_attention=False):
+    def forward(self, query, key, value, y=None, mask=None, return_attention=False, disable_hierarchy=False):
         x = query 
         B, L_Q, D = x.size()
         H, Dh = self.num_heads, self.head_dim
-        L_K = key.size(1)
-        L_V = value.size(1)
-
-        if L_Q == L_K == L_V and y is not None:
-            output_leaf = self.update_X_from_Y(x, y, mask)
-            output = output_leaf 
+        
+        # Use Hierarchical/SWA path if inputs match and we are in self-attention mode
+        if L_Q == key.size(1) == value.size(1):
+            # We assume Bottom-Up (cross_update_Y) is done by DecoderLayer before calling this
+            output = self.update_X_from_Y(x, y, mask, disable_hierarchy=disable_hierarchy)
             return (output, None) if return_attention else output
+        
+        # Fallback for Cross-Attention or non-matching lengths
         else:
             Q = self.Wq_x(query).view(B, L_Q, H, Dh).transpose(1, 2)
-            K = self.Wk_x(key).view(B, L_K, H, Dh).transpose(1, 2)
-            V = self.Wv_x(value).view(B, L_V, H, Dh).transpose(1, 2)
+            K = self.Wk_x(key).view(B, -1, H, Dh).transpose(1, 2)
+            V = self.Wv_x(value).view(B, -1, H, Dh).transpose(1, 2)
             
             output_leaf, attn_weights = self._standard_attention(Q, K, V, mask)
-            
-            output = output_leaf.transpose(1, 2).reshape(B, L_Q, D)
-            output = self.out_proj_x(output)
+            output = self.out_proj_x(output_leaf.transpose(1, 2).reshape(B, L_Q, D))
             
             return (output, attn_weights) if return_attention else output
 
@@ -730,44 +495,44 @@ class PositionalEncoding(nn.Module):
 class DecoderLayer(nn.Module):
     def __init__(self, d_model, num_heads, d_ff, dropout=0.1):
         super().__init__()
-        # Note: dim=d_model to match your previous code hyperparameters
         self.self_attn = HierarchicalSparseAttention(d_model, num_heads, dropout)
         self.feed_forward = PositionwiseFeedForward(d_model, d_ff, dropout)
 
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
-
-        # --- NEW: Norm for Y ---
         self.norm_y = nn.LayerNorm(d_model)
-
         self.dropout = nn.Dropout(dropout)
         
-    def forward(self, x, y, mask=None, return_attention=False):
-        ## Update Y (Hierarchy)
-        ## Using the specific cross_update_Y method from your Attention class
-        #y_next = self.self_attn.cross_update_Y(x, y_in=y)
+    def forward(self, x, y, mask=None, return_attention=False, disable_hierarchy=False):
         
-        # 1. Update Y (Hierarchy) with Residual + Norm
-        # We use 'norm_y(y)' as input to be safe, similar to Pre-LN for x
-        y_norm = self.norm_y(y)
+        # --- 1. Update Y (Hierarchy) with Residual + Norm ---
+        if not disable_hierarchy and y is not None:
+            # Bottom-Up Logic
+            y_norm = self.norm_y(y)
+            y_delta = self.self_attn.cross_update_Y(x, y_in=y_norm)
+            y_next = y + self.dropout(y_delta)
+        else:
+            # Disable hierarchy: y_next is None or bypassed
+            y_next = y if y is not None else None 
         
-        # Calculate the update (delta)
-        y_delta = self.self_attn.cross_update_Y(x, y_in=y_norm)
-        
-        # Apply Residual Connection to Y
-        y_next = y + self.dropout(y_delta)
-
-    
-        # PRE-LAYER NORMALIZATION (Apply Norm BEFORE Attention)
-        # This significantly improves stability and convergence speed
-        
-        # Norm -> Attention -> Add
+        # --- 2. Update X (Pre-LN) ---
         norm_x = self.norm1(x)
 
         if return_attention:
-            attn_output, self_attn_weights = self.self_attn(norm_x, norm_x, norm_x, y=y_next, mask=mask, return_attention=True)
+            attn_output, self_attn_weights = self.self_attn(
+                norm_x, norm_x, norm_x, 
+                y=y_next, 
+                mask=mask, 
+                return_attention=True,
+                disable_hierarchy=disable_hierarchy
+            )
         else:
-            attn_output = self.self_attn(norm_x, norm_x, norm_x, y=y_next, mask=mask)
+            attn_output = self.self_attn(
+                norm_x, norm_x, norm_x, 
+                y=y_next, 
+                mask=mask,
+                disable_hierarchy=disable_hierarchy
+            )
             
         x = x + self.dropout(attn_output) # Residual
         
@@ -800,7 +565,6 @@ class TransformerLM(nn.Module):
         self.apply(self._init_weights)
         
     def _init_weights(self, module):
-        # Initialize weights with small std (0.02) to prevent high starting loss
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
@@ -813,7 +577,7 @@ class TransformerLM(nn.Module):
         mask = torch.tril(torch.ones((seq_len, seq_len), device=x.device)).bool()
         return mask.unsqueeze(0).unsqueeze(0)
 
-    def forward(self, trg, return_attention=False):
+    def forward(self, trg, return_attention=False, disable_hierarchy=False):
         x = self.embedding(trg) * math.sqrt(self.d_model)
         x = self.pos_encoding(x)
 
@@ -826,15 +590,15 @@ class TransformerLM(nn.Module):
         
         for layer in self.layers:
             if return_attention:
-                x, y, attention = layer(x, y, mask=trg_mask, return_attention=True)
+                x, y, attention = layer(x, y, mask=trg_mask, return_attention=True, disable_hierarchy=disable_hierarchy)
                 attentions.append(attention)
             else:
-                x, y = layer(x, y, mask=trg_mask)
+                x, y = layer(x, y, mask=trg_mask, disable_hierarchy=disable_hierarchy)
         
         output = self.fc_out(x)
         return output
     
-    def generate(self, src, start_token=2, max_len=50, temperature=1.0):
+    def generate(self, src, start_token=2, max_len=50, temperature=1.0, disable_hierarchy=False):
         self.eval()
         device = next(self.parameters()).device
         
@@ -845,7 +609,7 @@ class TransformerLM(nn.Module):
             
         with torch.no_grad():
             for _ in range(max_len):
-                logits = self.forward(current_tokens)
+                logits = self.forward(current_tokens, disable_hierarchy=disable_hierarchy)
                 last_token_logits = logits[:, -1, :] / temperature
                 probs = F.softmax(last_token_logits, dim=-1)
                 next_token = torch.multinomial(probs, 1)
@@ -858,37 +622,29 @@ class TransformerLM(nn.Module):
         return current_tokens
 
 # ==========================================
-# 3. TRAINING LOOP (Added Auto-Exit / Early Stopping)
+# 3. TRAINING LOOP
 # ==========================================
 
-def train_transformer_model(model, train_loader, valid_loader, criterion=None, num_epochs=100, learning_rate=3e-4, patience=10):
+def train_transformer_model(model, train_loader, valid_loader, criterion=None, num_epochs=100, learning_rate=3e-4, patience=10, disable_hierarchy=False):
     if criterion is None:
-        # NOTE: Using Label Smoothing for better generalization
         criterion = nn.CrossEntropyLoss(ignore_index=0, label_smoothing=0.1)
     
     device = next(model.parameters()).device
     
     print(f"\n{'='*50}")
     print(f"<> Training Transformer Model (AMP Enabled)")
+    print(f"<> Mode: {'SWA Only (Ablation)' if disable_hierarchy else 'Full Hierarchical Attention'}")
     print(f"{'='*50}")
     
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
-    
-    # CHANGED: Use Cosine Annealing (Point 7: Better scheduler)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, verbose=False)
-    
-    # --- AMP CHANGE 1: Initialize GradScaler ---
-    # This manages the dynamic loss scaling (critical for FP16 stability)
     scaler = torch.cuda.amp.GradScaler() 
 
     best_valid_loss = float('inf')
     train_losses, valid_losses = [], []
     epoch_times = []
     
-    # --- EARLY STOPPING VARIABLES ---
     patience_counter = 0
-    
-    # Gradient Accumulation Steps (Simulate larger batch size)
     accumulation_steps = 16 
 
     for epoch in range(num_epochs):
@@ -909,39 +665,26 @@ def train_transformer_model(model, train_loader, valid_loader, criterion=None, n
             input_ids = batch['input_ids'].to(device)
             labels = batch['label'].to(device)
             
-            # --- AMP CHANGE 2: Run forward pass in autocast context ---
-            # Operations here will automatically choose FP16 or FP32
             with torch.cuda.amp.autocast():
-                outputs = model(input_ids)
+                # PASS ABLATION FLAG HERE
+                outputs = model(input_ids, disable_hierarchy=disable_hierarchy)
                 
                 output_dim = outputs.shape[-1]
                 outputs = outputs.contiguous().view(-1, output_dim)
                 labels = labels.contiguous().view(-1)
                 
                 loss = criterion(outputs, labels)
-                
-                # Divide loss by accumulation steps
                 loss = loss / accumulation_steps
             
-            # --- AMP CHANGE 3: Scale loss and backward ---
-            # Instead of loss.backward(), we scale it first to prevent underflow
             scaler.scale(loss).backward()
             
             if (batch_idx + 1) % accumulation_steps == 0:
-                # Unscale gradients before clipping (required for correct clipping)
                 scaler.unscale_(optimizer)
-                
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                
-                # Step with scaler (it will skip update if NaNs found)
                 scaler.step(optimizer)
-                
-                # Update scaler factor for next iteration
                 scaler.update()
-                
                 optimizer.zero_grad()
             
-            # Multiply back for reporting (use .item() to detach from graph)
             total_train_loss += loss.item() * accumulation_steps
             
             progress_bar.set_postfix({
@@ -961,9 +704,9 @@ def train_transformer_model(model, train_loader, valid_loader, criterion=None, n
                 input_ids = batch['input_ids'].to(device)
                 labels = batch['label'].to(device)
                 
-                # --- AMP CHANGE 4: Validation also benefits from AMP speedup ---
                 with torch.cuda.amp.autocast():
-                    outputs = model(input_ids)
+                    # PASS ABLATION FLAG HERE
+                    outputs = model(input_ids, disable_hierarchy=disable_hierarchy)
                     
                     output_dim = outputs.shape[-1]
                     outputs = outputs.contiguous().view(-1, output_dim)
@@ -975,7 +718,6 @@ def train_transformer_model(model, train_loader, valid_loader, criterion=None, n
         
         avg_valid_loss = total_valid_loss / len(valid_loader)
         
-        # CHANGED: Scheduler step now per epoch without metric
         scheduler.step()
         
         epoch_end_time = time.time()
@@ -990,19 +732,16 @@ def train_transformer_model(model, train_loader, valid_loader, criterion=None, n
         train_losses.append(avg_train_loss)
         valid_losses.append(avg_valid_loss)
         
-        # --- AUTO-EXIT (EARLY STOPPING) LOGIC ---
         if avg_valid_loss < best_valid_loss:
             best_valid_loss = avg_valid_loss
-            patience_counter = 0 # Reset counter
+            patience_counter = 0 
             
-            # Save the underlying model
             model_to_save = model.module if hasattr(model, 'module') else model
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model_to_save.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'loss': best_valid_loss,
-                # Good practice: Save scaler state too
                 'scaler_state_dict': scaler.state_dict()
             }, 'best_transformer_wikitext.pt')
             print(f'<> Saved new best model with validation loss: {best_valid_loss:.4f}')
@@ -1015,9 +754,7 @@ def train_transformer_model(model, train_loader, valid_loader, criterion=None, n
     
     total_time = sum(epoch_times)
     
-    # Plot results
     plt.figure(figsize=(15, 5))
-    
     plt.subplot(1, 2, 1)
     plt.plot(train_losses, label='Training Loss')
     plt.plot(valid_losses, label='Validation Loss')
@@ -1054,7 +791,7 @@ def train_transformer_model(model, train_loader, valid_loader, criterion=None, n
     
     return results
 
-def evaluate_test_set(model, test_loader):
+def evaluate_test_set(model, test_loader, disable_hierarchy=False):
     print(f"\n{'='*50}")
     print(f"<> FINAL TEST EVALUATION")
     print(f"{'='*50}")
@@ -1063,7 +800,6 @@ def evaluate_test_set(model, test_loader):
     device = next(model.parameters()).device
     total_loss = 0
     
-    # Use standard CrossEntropy (no smoothing) for fair score comparison
     eval_criterion = nn.CrossEntropyLoss(ignore_index=0)
     
     with torch.no_grad():
@@ -1072,8 +808,7 @@ def evaluate_test_set(model, test_loader):
             input_ids = batch['input_ids'].to(device)
             labels = batch['label'].to(device)
             
-            # --- IMPROVEMENT: Only pass input_ids ---
-            outputs = model(input_ids)
+            outputs = model(input_ids, disable_hierarchy=disable_hierarchy)
             
             output_dim = outputs.shape[-1]
             outputs = outputs.contiguous().view(-1, output_dim)
@@ -1097,30 +832,29 @@ print("\n<> Initializing Transformer Model...")
 vocab_size = len(vocab_builder.word2idx)
 print(f"Actual Vocab Size: {vocab_size}")
 
-# OPTIMIZED HYPERPARAMETERS FOR A100 & WT-103
+# --- ABLATION TOGGLE ---
+# Set this to True to train only SWA (No Hierarchy)
+DISABLE_HIERARCHY = True 
+
 model = TransformerLM(
     vocab_size=vocab_size,
-    d_model=768,          # Standard Base size (up from 512)
-    num_heads=12,         # Standard Base heads (up from 8)
-    d_ff=3072,            # Standard FFN size (4x d_model)
-    num_layers=12,        # Deep enough for WT103
-    dropout=0.15          # Slightly lower dropout as we have more data
+    d_model=768,          
+    num_heads=12,         
+    d_ff=3072,            
+    num_layers=12,        
+    dropout=0.15          
 )
 
-# ENABLE MULTI-GPU SUPPORT (DataParallel)
 if torch.cuda.device_count() > 1:
     print(f"<> Utilizing {torch.cuda.device_count()} GPUs!")
-    # Using DataParallel is okay, but DistributedDataParallel (DDP) is better for A100s.
-    # For a single script, DataParallel is easier to implement.
     model = nn.DataParallel(model)
 
 model = model.to(device)
 
-# Training parameters
-num_epochs = 30       # WT103 converges slower, but 40 epochs is usually plenty
-learning_rate = 2e-4  # Standard LR for this model size
+num_epochs = 30       
+learning_rate = 2e-4  
 
-print("\n<> Starting Training on WikiText-103...")
+print(f"\n<> Starting Training on WikiText-103 (Hierarchy Disabled: {DISABLE_HIERARCHY})...")
 results = train_transformer_model(
     model=model,
     train_loader=train_loader,
@@ -1128,7 +862,8 @@ results = train_transformer_model(
     criterion=None, 
     num_epochs=num_epochs,
     learning_rate=learning_rate,
-    patience=100 
+    patience=100,
+    disable_hierarchy=DISABLE_HIERARCHY
 )
 
 
@@ -1136,7 +871,7 @@ results = train_transformer_model(
 # 5. ADVANCED EVALUATION (Sliding Window)
 # ==========================================
 
-def evaluate_wikitext_103(model, test_loader, device, sliding_window=False, stride=512):
+def evaluate_wikitext_103(model, test_loader, device, sliding_window=False, stride=512, disable_hierarchy=False):
     """
     Evaluates the model on WikiText-103 using either:
     1. Standard Chunked evaluation (Fast, slightly higher PPL)
@@ -1146,8 +881,6 @@ def evaluate_wikitext_103(model, test_loader, device, sliding_window=False, stri
     total_loss = 0.0
     total_tokens = 0
     
-    # Use standard CrossEntropy with sum reduction to aggregate manually
-    # ignore_index=0 handles padding
     criterion = nn.CrossEntropyLoss(reduction='sum', ignore_index=0)
     
     print(f"\n{'='*50}")
@@ -1165,7 +898,7 @@ def evaluate_wikitext_103(model, test_loader, device, sliding_window=False, stri
                 input_ids = batch['input_ids'].to(device)
                 labels = batch['label'].to(device)
 
-                outputs = model(input_ids)
+                outputs = model(input_ids, disable_hierarchy=disable_hierarchy)
                 
                 # Flatten
                 shift_logits = outputs.view(-1, outputs.size(-1))
@@ -1177,40 +910,21 @@ def evaluate_wikitext_103(model, test_loader, device, sliding_window=False, stri
 
     else:
         # --- METHOD 2: Sliding Window Evaluation (SOTA Standard) ---
-        # 1. Reconstruct the full token stream from the loader
         raw_data = []
         print(">> Flattening test data for sliding window...")
         for batch in test_loader:
-            # batch['input_ids'] is [B, Seq_Len]
             raw_data.append(batch['input_ids'].cpu())
         
-        # Concatenate into one massive 1D tensor: [Total_Tokens]
         full_seq = torch.cat(raw_data).view(-1).to(device)
-        
-        # Determine context length from model config
-        # Handle DataParallel wrapper if present
-
-        #if isinstance(model, nn.DataParallel):
-        #    max_len = model.module.d_model if hasattr(model.module, 'd_model') else 2048
-        #else:
-        #    max_len = model.d_model if hasattr(model, 'd_model') else 2048
-
         max_len = 2048
 
-        # 2. Iterate with stride
         with torch.no_grad():
-            # Loop stops when we can't form a full window
             for i in tqdm(range(0, len(full_seq) - max_len, stride), desc="Sliding Window"):
-                # Input: [i : i+max_len]
                 input_window = full_seq[i : i + max_len].unsqueeze(0) # [1, Seq_Len]
-                
-                # Target: [i+1 : i+max_len+1]
-                # We only care about the targets corresponding to the STRIDE (the new tokens)
                 target_window = full_seq[i+1 : i + max_len + 1].unsqueeze(0)
 
-                outputs = model(input_window) # [1, Seq_Len, Vocab]
+                outputs = model(input_window, disable_hierarchy=disable_hierarchy) # [1, Seq_Len, Vocab]
 
-                # Focus on the last 'stride' tokens (where context is fullest)
                 logits_stride = outputs[:, -stride:, :]
                 labels_stride = target_window[:, -stride:]
 
@@ -1245,7 +959,6 @@ def evaluate_wikitext_103(model, test_loader, device, sliding_window=False, stri
 print("\n<> Training Finished. Loading Best Model for Evaluation...")
 
 # 1. Initialize a fresh model instance to ensure clean state
-# Ensure these params match your training config!
 best_model = TransformerLM(
     vocab_size=vocab_size,
     d_model=768, 
@@ -1261,8 +974,6 @@ if os.path.exists(checkpoint_path):
     checkpoint = torch.load(checkpoint_path)
     state_dict = checkpoint['model_state_dict']
     
-    # Handle DataParallel prefix ('module.') if it exists in saved dict but not in new model
-    # or vice versa.
     from collections import OrderedDict
     new_state_dict = OrderedDict()
     for k, v in state_dict.items():
@@ -1281,9 +992,8 @@ if torch.cuda.device_count() > 1:
 
 # 3. Run Standard Evaluation (Fast check)
 print("\nRunning Standard Evaluation...")
-evaluate_wikitext_103(best_model, test_loader, device, sliding_window=False)
+evaluate_wikitext_103(best_model, test_loader, device, sliding_window=False, disable_hierarchy=DISABLE_HIERARCHY)
 
 # 4. Run Sliding Window Evaluation (Accurate / Publication Ready)
-# Stride 512 is a good balance between speed and accuracy
 print("\nRunning Sliding Window Evaluation (This will take longer)...")
-evaluate_wikitext_103(best_model, test_loader, device, sliding_window=True, stride=512)
+evaluate_wikitext_103(best_model, test_loader, device, sliding_window=True, stride=512, disable_hierarchy=DISABLE_HIERARCHY)
