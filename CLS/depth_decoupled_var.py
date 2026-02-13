@@ -745,7 +745,15 @@ for base_lr in base_lrs:
 
         print(f"LR: {base_lr}, Epoch: {epoch+1}, Train Loss: {np.mean(all_train_loss_after_epoch):.4f}, Test Loss: {np.mean(all_test_loss):.4f}, Train Acc: {np.mean(all_train_accuracy):.4f}, Test Acc: {np.mean(all_acc):.4f}")
         # 每个epoch后保存结果到JSON文件
-        with open(f"/home/zyao8/ICML-work/transformer_hp_valid/data/{task_name}.json", 'w') as f:
-            json.dump(results, f, indent=2)
+        #with open(f"/home/zyao8/ICML-work/transformer_hp_valid/data/{task_name}.json", 'w') as f:
+        #    json.dump(results, f, indent=2)
         
+        my_path = "/home/ztang13/workspace/SparseAttention/CLS/data" 
+
+        if not os.path.exists(my_path):
+            os.makedirs(my_path)
+
+        with open(f"{my_path}/{task_name}.json", 'w') as f:
+            json.dump(results, f, indent=2)
+
         model.train()
