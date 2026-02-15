@@ -293,174 +293,6 @@ class DecoupledAttBlockFn(Function):
     def forward(
         ctx,
         h,                  # [b, n, d_model]
-        q_fwd, k_fwd, v_fwd, o_fwd,   # [d_model, d_model]
-        q_bwd, k_bwd, v_bwd, o_bwd,   # [d_model, d_model]
-        q_fwd_copy, k_fwd_copy, v_fwd_copy, o_fwd_copy, # [d_model, d_model]
-        alpha,              # scalar
-        inv_sqrt_n,         # scalar
-        num_heads,          # int
-        softmax,            # callable: softmax(x, dim=...)
-        softmax_prime=None  # (可不使用；softmax 的反传用标准公式更稳)
-    ):
-        # 保存必要张量
-        ctx.save_for_backward(h, q_fwd, k_fwd, v_fwd, o_fwd, q_bwd, k_bwd, v_bwd, o_bwd, q_fwd_copy, k_fwd_copy, v_fwd_copy, o_fwd_copy)
-        ctx.alpha = alpha
-        ctx.inv_sqrt_n = inv_sqrt_n
-        ctx.num_heads = num_heads
-        ctx.softmax = softmax
-        ctx.softmax_prime = softmax_prime
-
-        b, n, d_model = h.shape
-        assert d_model % num_heads == 0
-        head_dim = d_model // num_heads
-
-        # 线性投影
-        query = h @ q_fwd.T   # [b, n, d_model]
-        key   = h @ k_fwd.T   # [b, n, d_model]
-        value = h @ v_fwd.T   # [b, n, d_model]
-
-        queries = inv_sqrt_n * rearrange(query, "b s (h d) -> b h s d", h=num_heads)
-        keys = inv_sqrt_n * rearrange(key, "b s (h d) -> b h s d", h=num_heads)
-        values = inv_sqrt_n * rearrange(value, "b s (h d) -> b h s d", h=num_heads)
-
-    
-        energy = torch.einsum("bhqd, bhkd -> bhqk", queries, keys)  # [b,h,n,n]
-
-        #vansih-q,k,v,attention logits,attention scores
-        query_ref = h@ q_fwd_copy.T  # [b, n, d_model]
-        key_ref = h@ k_fwd_copy.T    # [b, n, d_model]
-        value_ref = h@ v_fwd_copy.T  # [b, n, d_model]
-        
-        queries_ref = inv_sqrt_n * rearrange(query_ref, "b s (h d) -> b h s d", h=num_heads)
-        keys_ref = inv_sqrt_n * rearrange(key_ref, "b s (h d) -> b h s d", h=num_heads)
-        values_ref = inv_sqrt_n * rearrange(value_ref, "b s (h d) -> b h s d", h=num_heads)
-        energy_ref = torch.einsum("bhqd, bhkd -> bhqk", queries_ref, keys_ref)  # [b,h,n,n]
-
-        scaling = 1.0 / head_dim
-        att_minus = F.softmax((energy - energy_ref)*scaling, dim=-1)
-
-        attn = softmax(scaling * energy, dim=-1)  # [b,h,n,n]
-
-        out = torch.einsum("bhqk, bhkd -> bhqd", attn, values)  # [b,h,n,d]
-        out_merge = rearrange(out, "b h n d -> b n (h d)")       # [b,n,d_model]
-        out_proj = out_merge @ o_fwd.T                           # [b,n,d_model]
-
-        y = h + alpha * out_proj
-        return y, queries-queries_ref, keys-keys_ref, values-values_ref, scaling*(energy-energy_ref), att_minus
-
-    @staticmethod
-    def backward(ctx, grad_y,q_diff=None, k_diff=None, v_diff=None, logits_diff=None, attn_diff=None):
-        """
-        grad_y: [b, n, d_model]
-        """
-        h, q_fwd, k_fwd, v_fwd, o_fwd, q_bwd, k_bwd, v_bwd, o_bwd, q_fwd_copy, k_fwd_copy, v_fwd_copy, o_fwd_copy = ctx.saved_tensors
-        alpha = ctx.alpha
-        inv_sqrt_n = ctx.inv_sqrt_n
-        num_heads = ctx.num_heads
-        softmax = ctx.softmax
-        b, n, d_model = h.shape
-        assert d_model % num_heads == 0
-        head_dim = d_model // num_heads
-
-        query = h @ q_fwd.T
-        key   = h @ k_fwd.T
-        value = h @ v_fwd.T
-
-        Q = inv_sqrt_n * rearrange(query, "b s (h d) -> b h s d", h=num_heads)
-        K = inv_sqrt_n * rearrange(key, "b s (h d) -> b h s d", h=num_heads)
-        V = inv_sqrt_n * rearrange(value, "b s (h d) -> b h s d", h=num_heads)
-
-        energy = torch.einsum("bhqd, bhkd -> bhqk", Q, K)  # [b,h,n,n]
-        scaling = 1.0 / head_dim
-        logits = scaling * energy
-        A = softmax(logits, dim=-1)  # attention, [b,h,n,n]
-
-        out = torch.einsum("bhqk, bhkd -> bhqd", A, V)      # [b,h,n,d]
-        out_merge = rearrange(out, "b h n d -> b n (h d)")   # [b,n,d_model]
-        # out_proj = out_merge @ o_fwd.T  (不必显式再算)
-
-        # ===== 2) residual：y = h + alpha*out_proj =====
-        grad_h = grad_y.clone()                 # skip connection
-        grad_out_proj = alpha * grad_y          # [b,n,d_model]
-
-        # ===== 3) out_proj = out_merge @ o_fwd.T =====
-        # grad_o_fwd: [d_model, d_model]
-        grad_o_fwd = grad_out_proj.reshape(-1, d_model).T @ out_merge.reshape(-1, d_model)
-
-        # Use o_fwd instead of o_bwd for backprop to previous layer
-        grad_out_merge = grad_out_proj @ o_fwd               # [b,n,d_model]
-        grad_out = rearrange(grad_out_merge, "b n (h d) -> b h n d", h=num_heads)  # [b,h,n,d]
-
-        # ===== 4) out = A @ V =====
-        # out[b,h,q,d] = sum_k A[b,h,q,k] * V[b,h,k,d]
-        grad_A = torch.einsum("bhqd, bhkd -> bhqk", grad_out, V)      # [b,h,n,n]
-        grad_V = torch.einsum("bhqk, bhqd -> bhkd", A, grad_out)      # [b,h,n,d]
-
-        tmp = (grad_A * A).sum(dim=-1, keepdim=True)                 # [b,h,n,1]
-        grad_logits = A * (grad_A - tmp)                              # [b,h,n,n]
-        grad_energy = scaling * grad_logits                           # [b,h,n,n]
-
-        # ===== 6) energy = Q @ K^T =====
-        # energy[b,h,q,k] = sum_d Q[b,h,q,d] * K[b,h,k,d]
-        grad_Q = torch.einsum("bhqk, bhkd -> bhqd", grad_energy, K)    # [b,h,n,d]
-        grad_K = torch.einsum("bhqk, bhqd -> bhkd", grad_energy, Q)    # [b,h,n,d]
-
-        grad_query = rearrange(inv_sqrt_n * grad_Q, "b h s d -> b s (h d)")
-        grad_key   = rearrange(inv_sqrt_n * grad_K, "b h s d -> b s (h d)")
-        grad_value = rearrange(inv_sqrt_n * grad_V, "b h s d -> b s (h d)")
-
-        # ===== 9) query = h @ q_fwd.T 等 =====
-        h_flat = h.reshape(-1, d_model)
-        grad_query_flat = grad_query.reshape(-1, d_model)
-        grad_key_flat   = grad_key.reshape(-1, d_model)
-        grad_value_flat = grad_value.reshape(-1, d_model)
-
-        # 参数梯度（标准链式法则，使用 forward weights）
-        grad_q_fwd = grad_query_flat.T @ h_flat   # [d_model, d_model]
-        grad_k_fwd = grad_key_flat.T   @ h_flat
-        grad_v_fwd = grad_value_flat.T @ h_flat
-
-        # [CHANGE]: Use q_fwd, k_fwd, v_fwd for backprop to h (Instead of _bwd)
-        grad_h_from_q = grad_query @ q_fwd        # [b,n,d_model]
-        grad_h_from_k = grad_key   @ k_fwd
-        grad_h_from_v = grad_value @ v_fwd
-        grad_h = grad_h + grad_h_from_q + grad_h_from_k + grad_h_from_v
-
-        ## ===== 10) 绑定 bwd 权重梯度（保持 Δ 固定） =====
-        #grad_q_bwd = grad_q_fwd.clone()
-        #grad_k_bwd = grad_k_fwd.clone()
-        #grad_v_bwd = grad_v_fwd.clone()
-        #grad_o_bwd = grad_o_fwd.clone()
-
-        # 其它非张量/超参不求导
-        grad_alpha = None
-        grad_inv_sqrt_n = None
-        grad_num_heads = None
-        grad_softmax = None
-        grad_softmax_prime = None
-        #-----
-        grad_q_fwd_copy = None
-        grad_k_fwd_copy = None
-        grad_v_fwd_copy = None
-        grad_o_fwd_copy = None
-
-        return (
-            grad_h,
-            grad_q_fwd, grad_k_fwd, grad_v_fwd, grad_o_fwd,
-            None, None, None, None,
-            None, None, None, None,
-            grad_alpha,
-            grad_inv_sqrt_n,
-            grad_num_heads,
-            grad_softmax,
-            grad_softmax_prime,
-        )
-
-class DecoupledAttBlockFn(Function):
-    @staticmethod
-    def forward(
-        ctx,
-        h,                  # [b, n, d_model]
         q_fwd, k_fwd, v_fwd, o_fwd,   # v_fwd is passed but IGNORED
         q_bwd, k_bwd, v_bwd, o_bwd,   # v_bwd is passed but IGNORED
         q_fwd_copy, k_fwd_copy, v_fwd_copy, o_fwd_copy, # v_fwd_copy is IGNORED
@@ -665,6 +497,69 @@ class DecoupledAttention(nn.Module):
             self.softmax,
             self.softmax_prime,
         )
+
+class DecoupledVitModel(nn.Module):
+    def __init__(self, n, L, seqlen, input_dim,num_heads, T):
+        super().__init__()
+        
+        self.embed_dim = n
+        self.input_dim = input_dim
+        self.L = L
+
+        self.embed = nn.Linear(self.input_dim, self.embed_dim, bias=False)  # 48 input features per patch
+        self.cls_token_embed = nn.Parameter(torch.randn(1,1, self.embed_dim))
+        self.pos_embed = nn.Parameter(torch.randn(1+seqlen, self.embed_dim))  #
+        self.num_head = num_heads
+
+        self.attention_h = []
+        for _ in range(L):
+            #n, T, L, num_heads,softmax=softmax, softmax_prime=None
+            self.attention_h.append(DecoupledAttention(n, T, L, num_heads, softmax, None))
+        self.mlp_h = []#nn.ModuleList
+        for _ in range(L):
+            # n, T, L, phi=relu, phi_prime=relu_prime
+            self.mlp_h.append(DecoupledFNN(n, T, L, relu, relu_prime))
+
+        self.attention = nn.ModuleList(self.attention_h)
+        self.fnn = nn.ModuleList(self.mlp_h)
+
+        self.class_head = nn.Linear(self.embed_dim, 10, bias=False)
+
+        #unit-variance initalizaion
+        nn.init.normal_(self.embed.weight, mean=0.0, std=set_variance)
+        nn.init.normal_(self.cls_token_embed, mean=0.0, std=set_variance)
+        nn.init.normal_(self.pos_embed, mean=0.0, std=set_variance)
+        nn.init.normal_(self.class_head.weight, mean=0.0, std=set_variance)
+        
+
+    def forward(self, x,flag_return_mid=False):
+        # 假设每个patch之间是independent的
+        B, T, _ = x.shape
+        x = self.embed(x)/math.sqrt(self.input_dim)
+
+        cls_tokens = repeat(self.cls_token_embed, '() n e -> b n e', b=B)#/math.sqrt(48)
+        x = torch.cat([cls_tokens, x], dim=1) #prepending the cls token
+        h = math.sqrt(1/2)*(x + self.pos_embed)#/math.sqrt(65)
+        # mid embedding
+        mid_layers = {}
+
+        # middle transformer blocks
+        for l in range(self.L):
+            # attention block
+            h,q_diff, k_diff, v_diff, logits_diff, attn_diff = self.attention[l](h)
+            if flag_return_mid:
+                mid_layers["layer{}_logits".format(l)] = logits_diff.clone().detach().cpu().numpy()
+                mid_layers["layer{}_attn".format(l)] = attn_diff.clone().detach().cpu().numpy()
+                mid_layers["layer{}_q".format(l)] = q_diff.clone().detach().cpu().numpy()
+                mid_layers["layer{}_k".format(l)] = k_diff.clone().detach().cpu().numpy()
+                mid_layers["layer{}_v".format(l)] = v_diff.clone().detach().cpu().numpy()
+            # fnn block
+            h,_,_ = self.fnn[l](h)
+        
+        # classification head
+        #h = self.class_head(h[:,0,:]) # only use cls token
+        classfiy_h = (1/self.embed_dim)*self.class_head(h[:,0,:])
+        return classfiy_h,mid_layers
 
 import math
 
