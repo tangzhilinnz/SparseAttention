@@ -317,12 +317,12 @@ class DecoupledAttBlockFn(Function):
         # 1. Projections (Q, K use weights; V is Identity)
         query = h @ q_fwd.T   
         key   = h @ k_fwd.T   
-        value = h             # [CHANGE] No projection
+        value = h             # No projection
 
         queries = inv_sqrt_n * rearrange(query, "b s (h d) -> b h s d", h=num_heads)
         keys    = inv_sqrt_n * rearrange(key,   "b s (h d) -> b h s d", h=num_heads)
         
-        # [CHANGE] No inv_sqrt_n scaling for values since it is just h
+        # No inv_sqrt_n scaling for values since it is just h
         values  = rearrange(value, "b s (h d) -> b h s d", h=num_heads)
 
         # 2. Attention Mechanism
@@ -331,11 +331,10 @@ class DecoupledAttBlockFn(Function):
         # 3. Reference Calculations
         query_ref = h @ q_fwd_copy.T
         key_ref   = h @ k_fwd_copy.T
-        value_ref = h         # [CHANGE] No projection
+        value_ref = h         # No projection
 
         queries_ref = inv_sqrt_n * rearrange(query_ref, "b s (h d) -> b h s d", h=num_heads)
         keys_ref    = inv_sqrt_n * rearrange(key_ref,   "b s (h d) -> b h s d", h=num_heads)
-        # [CHANGE] No inv_sqrt_n scaling
         values_ref  = rearrange(value_ref, "b s (h d) -> b h s d", h=num_heads)
         
         energy_ref = torch.einsum("bhqd, bhkd -> bhqk", queries_ref, keys_ref)
@@ -351,7 +350,6 @@ class DecoupledAttBlockFn(Function):
 
         y = h + alpha * out_proj
         
-        # Returns: y, q_diff, k_diff, v_diff (ZERO), energy_diff, attn_diff
         return y, queries-queries_ref, keys-keys_ref, torch.zeros_like(values), scaling*(energy-energy_ref), att_minus
 
     @staticmethod
@@ -368,11 +366,11 @@ class DecoupledAttBlockFn(Function):
         # Recompute Forward
         query = h @ q_fwd.T
         key   = h @ k_fwd.T
-        value = h # [CHANGE]
+        value = h 
 
         Q = inv_sqrt_n * rearrange(query, "b s (h d) -> b h s d", h=num_heads)
         K = inv_sqrt_n * rearrange(key, "b s (h d) -> b h s d", h=num_heads)
-        V = rearrange(value, "b s (h d) -> b h s d", h=num_heads) # [CHANGE]
+        V = rearrange(value, "b s (h d) -> b h s d", h=num_heads) 
 
         energy = torch.einsum("bhqd, bhkd -> bhqk", Q, K)
         scaling = 1.0 / head_dim
@@ -405,7 +403,7 @@ class DecoupledAttBlockFn(Function):
         grad_query = rearrange(inv_sqrt_n * grad_Q, "b h s d -> b s (h d)")
         grad_key   = rearrange(inv_sqrt_n * grad_K, "b h s d -> b s (h d)")
         
-        # [CHANGE] grad_value directly reshaped (no inv_sqrt_n)
+        # grad_value directly reshaped (no inv_sqrt_n)
         grad_value = rearrange(grad_V, "b h s d -> b s (h d)") 
 
         h_flat = h.reshape(-1, d_model)
@@ -414,15 +412,21 @@ class DecoupledAttBlockFn(Function):
 
         grad_q_fwd = grad_query_flat.T @ h_flat
         grad_k_fwd = grad_key_flat.T   @ h_flat
-        # [CHANGE] grad_v_fwd is None because V is not projected
-
-        # [CHANGE] Use q_fwd, k_fwd for backprop to h. 
-        # For V, we add grad_value directly to grad_h because V=h.
+        
+        # Use q_fwd, k_fwd for backprop to h. 
         grad_h_from_q = grad_query @ q_fwd
         grad_h_from_k = grad_key   @ k_fwd
         grad_h_from_v = grad_value # Direct connection
         
         grad_h = grad_h + grad_h_from_q + grad_h_from_k + grad_h_from_v
+
+        # --- MISSING DEFINITIONS FIXED HERE ---
+        grad_alpha = None
+        grad_inv_sqrt_n = None
+        grad_num_heads = None
+        grad_softmax = None
+        grad_softmax_prime = None
+        # --------------------------------------
 
         return (
             grad_h,
@@ -433,7 +437,7 @@ class DecoupledAttBlockFn(Function):
             grad_inv_sqrt_n,
             grad_num_heads,
             grad_softmax,
-            None
+            grad_softmax_prime
         )
 
 class DecoupledAttention(nn.Module):
