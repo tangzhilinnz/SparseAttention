@@ -600,7 +600,8 @@ for depth in depths:
         for epoch in range(epochs):
             # 1. Train Step
             model.train()
-            for batch_idx, (data, target) in enumerate(trainloader):
+            # ADDED TQDM HERE
+            for batch_idx, (data, target) in enumerate(tqdm(trainloader, desc=f"Ep {epoch+1} Train")):
                 data, target = data.to(device), target.to(device)
                 data = img_to_patch_pt(data, patch_size=patch_size, flatten_channels=True)
                 optimizer.zero_grad()
@@ -619,7 +620,8 @@ for depth in depths:
             
             # Test Loop
             with torch.no_grad():
-                for batch_idx, (data, target) in enumerate(testloader):
+                # ADDED TQDM HERE
+                for batch_idx, (data, target) in enumerate(tqdm(testloader, desc="Test")):
                     data, target = data.to(device), target.to(device)
                     data = img_to_patch_pt(data, patch_size=patch_size, flatten_channels=True)
                     output, mid_layers = model(data)
@@ -630,7 +632,8 @@ for depth in depths:
             
             # Train Eval Loop
             with torch.no_grad():
-                for batch_idx, (data, target) in enumerate(trainloader):
+                # ADDED TQDM HERE
+                for batch_idx, (data, target) in enumerate(tqdm(trainloader, desc="Train Eval")):
                     data, target = data.to(device), target.to(device)
                     data = img_to_patch_pt(data, patch_size=patch_size, flatten_channels=True)
                     output, mid_layers = model(data)
@@ -645,7 +648,8 @@ for depth in depths:
             all_valid_loss = []
             all_valid_accuracy = []
             with torch.no_grad():
-                for batch_idx, (data, target) in enumerate(validloader):
+                # ADDED TQDM HERE
+                for batch_idx, (data, target) in enumerate(tqdm(validloader, desc="Valid")):
                     data, target = data.to(device), target.to(device)
                     data = img_to_patch_pt(data, patch_size=patch_size, flatten_channels=True)
                     output, mid_layers = model(data)
@@ -679,8 +683,8 @@ for depth in depths:
                 min_test_loss = curr_test_loss
                 best_epoch = epoch + 1
 
-            if (epoch+1) % 10 == 0:
-                print(f"      [LR {base_lr} | Ep {epoch+1}] Train L: {curr_train_epoch_loss:.4f} | Test Acc: {curr_test_acc:.4f}")
+            # PRINT EVERY EPOCH AS REQUESTED
+            print(f"LR: {base_lr}, Epoch: {epoch+1}, Train Loss: {curr_train_epoch_loss:.4f}, Test Loss: {curr_test_loss:.4f}, Train Acc: {curr_train_acc:.4f}, Test Acc: {curr_test_acc:.4f}")
         
         # Save Summary for this LR
         results["summary"][lr_key] = {
