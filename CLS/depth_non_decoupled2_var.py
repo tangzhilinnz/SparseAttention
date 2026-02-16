@@ -704,12 +704,18 @@ for depth in depths:
         
         all_train_loss = []
         
+        # --- NEW: Tracking variables for Best metrics ---
+        best_test_acc = 0.0
+        best_test_loss = 0.0
+        best_train_acc = 0.0
+        best_train_loss = 0.0
+        best_epoch = -1
+        
         print(f"   -> LR: {base_lr} Started")
         
         for epoch in range(epochs):
             # 1. Train
             model.train()
-            # Added tqdm description
             for batch_idx, (data, target) in enumerate(tqdm(trainloader, desc=f"D{depth}|LR{base_lr}|Ep{epoch+1} Train", leave=False)):
                 data, target = data.to(device), target.to(device)
                 data = img_to_patch_pt(data, patch_size=patch_size, flatten_channels=True)
@@ -764,25 +770,51 @@ for depth in depths:
                     acc = (output.argmax(dim=1) == target).float().mean()
                     all_valid_accuracy.append(acc.item())
 
+            # Metrics for current epoch
+            curr_train_loss = float(np.mean(all_train_loss_after_epoch))
+            curr_train_acc = float(np.mean(all_train_accuracy))
+            curr_test_loss = float(np.mean(all_test_loss))
+            curr_test_acc = float(np.mean(all_acc))
             
+            # --- NEW: Update BEST metrics based on test accuracy ---
+            if curr_test_acc > best_test_acc:
+                best_test_acc = curr_test_acc
+                best_test_loss = curr_test_loss
+                best_train_acc = curr_train_acc
+                best_train_loss = curr_train_loss
+                best_epoch = epoch + 1
+
             # Save current epoch results
             current_results = results["training_results"][f"lr_{base_lr}"]
             current_results["epochs"].append(epoch + 1)
             current_results["train_loss"].append(float(np.mean(all_train_loss)))
-            current_results["test_loss"].append(float(np.mean(all_test_loss)))
-            current_results["valid_loss"].append(float(np.mean(all_valid_loss)))              # <-- add
-            current_results["train_accuracy"].append(float(np.mean(all_train_accuracy)))
-            current_results["test_accuracy"].append(float(np.mean(all_acc)))
-            current_results["valid_accuracy"].append(float(np.mean(all_valid_accuracy)))      # <-- add
-            current_results["train_epoch_loss"].append(float(np.mean(all_train_loss_after_epoch)))
+            current_results["test_loss"].append(curr_test_loss)
+            current_results["valid_loss"].append(float(np.mean(all_valid_loss)))
+            current_results["train_accuracy"].append(curr_train_acc)
+            current_results["test_accuracy"].append(curr_test_acc)
+            current_results["valid_accuracy"].append(float(np.mean(all_valid_accuracy)))
+            current_results["train_epoch_loss"].append(curr_train_loss)
 
-            # Print stats
-            print(f"LR: {base_lr}, Epoch: {epoch+1}, Train Loss: {np.mean(all_train_loss_after_epoch):.4f}, Test Loss: {np.mean(all_test_loss):.4f}, Train Acc: {np.mean(all_train_accuracy):.4f}, Test Acc: {np.mean(all_acc):.4f}")
+            # Print per-epoch stats
+            print(f"LR: {base_lr}, Epoch: {epoch+1}, Train Loss: {curr_train_loss:.4f}, Test Loss: {curr_test_loss:.4f}, Train Acc: {curr_train_acc:.4f}, Test Acc: {curr_test_acc:.4f}")
             
             # Save JSON after every epoch
             with open(f"{my_path}/{task_name}.json", 'w') as f:
                 json.dump(results, f, indent=2)
             
             model.train()
+
+        # --- NEW: Final Summary Print after all epochs for this LR ---
+        print(f"   -> LR {base_lr} Done. Best Result: Test Acc {best_test_acc:.4f}, Test Loss {best_test_loss:.4f}, Train Acc {best_train_acc:.4f}, Train Loss {best_train_loss:.4f} (Ep {best_epoch})")
+        
+        # Optional: Save Best metrics into the summary part of results
+        results["summary"] = results.get("summary", {})
+        results["summary"][f"lr_{base_lr}"] = {
+            "best_epoch": best_epoch,
+            "test_acc": best_test_acc,
+            "test_loss": best_test_loss,
+            "train_acc": best_train_acc,
+            "train_loss": best_train_loss
+        }
 
 print("\nAll experiments completed.")

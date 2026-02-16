@@ -593,6 +593,10 @@ for depth in depths:
         min_test_loss = float('inf')
         best_epoch = -1
         
+        # --- NEW TRACKING VARIABLES ---
+        best_epoch_train_acc = 0.0
+        best_epoch_train_loss = 0.0
+        
         all_train_loss = []
         
         print(f"   -> LR: {base_lr} Started")
@@ -600,7 +604,6 @@ for depth in depths:
         for epoch in range(epochs):
             # 1. Train Step
             model.train()
-            # ADDED TQDM HERE
             for batch_idx, (data, target) in enumerate(tqdm(trainloader, desc=f"Ep {epoch+1} Train")):
                 data, target = data.to(device), target.to(device)
                 data = img_to_patch_pt(data, patch_size=patch_size, flatten_channels=True)
@@ -620,7 +623,6 @@ for depth in depths:
             
             # Test Loop
             with torch.no_grad():
-                # ADDED TQDM HERE
                 for batch_idx, (data, target) in enumerate(tqdm(testloader, desc="Test")):
                     data, target = data.to(device), target.to(device)
                     data = img_to_patch_pt(data, patch_size=patch_size, flatten_channels=True)
@@ -632,7 +634,6 @@ for depth in depths:
             
             # Train Eval Loop
             with torch.no_grad():
-                # ADDED TQDM HERE
                 for batch_idx, (data, target) in enumerate(tqdm(trainloader, desc="Train Eval")):
                     data, target = data.to(device), target.to(device)
                     data = img_to_patch_pt(data, patch_size=patch_size, flatten_channels=True)
@@ -648,7 +649,6 @@ for depth in depths:
             all_valid_loss = []
             all_valid_accuracy = []
             with torch.no_grad():
-                # ADDED TQDM HERE
                 for batch_idx, (data, target) in enumerate(tqdm(validloader, desc="Valid")):
                     data, target = data.to(device), target.to(device)
                     data = img_to_patch_pt(data, patch_size=patch_size, flatten_channels=True)
@@ -660,7 +660,7 @@ for depth in depths:
 
             # Store metrics
             current_results = results["training_results"][lr_key]
-            curr_train_loss = float(np.mean(all_train_loss)) # Accumulating over time (raw)
+            curr_train_loss = float(np.mean(all_train_loss)) 
             curr_test_loss = float(np.mean(all_test_loss))
             curr_valid_loss = float(np.mean(all_valid_loss))
             curr_train_acc = float(np.mean(all_train_accuracy))
@@ -677,23 +677,27 @@ for depth in depths:
             current_results["valid_accuracy"].append(curr_valid_acc)
             current_results["train_epoch_loss"].append(curr_train_epoch_loss)
             
-            # Check Best
+            # --- UPDATED BEST LOGIC ---
             if curr_test_acc > best_test_acc:
                 best_test_acc = curr_test_acc
                 min_test_loss = curr_test_loss
                 best_epoch = epoch + 1
+                best_epoch_train_acc = curr_train_acc
+                best_epoch_train_loss = curr_train_epoch_loss
 
-            # PRINT EVERY EPOCH AS REQUESTED
             print(f"LR: {base_lr}, Epoch: {epoch+1}, Train Loss: {curr_train_epoch_loss:.4f}, Test Loss: {curr_test_loss:.4f}, Train Acc: {curr_train_acc:.4f}, Test Acc: {curr_test_acc:.4f}")
         
         # Save Summary for this LR
         results["summary"][lr_key] = {
             "best_test_acc": best_test_acc,
             "min_test_loss": min_test_loss,
-            "best_epoch": best_epoch
+            "best_epoch": best_epoch,
+            "best_epoch_train_acc": best_epoch_train_acc,
+            "best_epoch_train_loss": best_epoch_train_loss
         }
         
-        print(f"   -> LR {base_lr} Done. Best Acc: {best_test_acc:.4f} (Ep {best_epoch})")
+        # --- UPDATED FINAL PRINT ---
+        print(f"   -> LR {base_lr} Done. Best Result: Test Acc {best_test_acc:.4f}, Test Loss {min_test_loss:.4f}, Train Acc {best_epoch_train_acc:.4f}, Train Loss {best_epoch_train_loss:.4f} (Ep {best_epoch})")
 
         # Save to JSON
         with open(f"{my_path}/{task_name}.json", 'w') as f:
