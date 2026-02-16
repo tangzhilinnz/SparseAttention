@@ -35,7 +35,7 @@ set_variance = 1.0
 
 # VARIABLE parameters (Iterate over these)
 depths = [3, 6, 9]
-base_lrs = [0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.8, 2.0]
+base_lrs = [0.1, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0]
 
 # 1. Seed Setting
 def set_seed(seed=42):
@@ -604,7 +604,7 @@ for depth in depths:
         for epoch in range(epochs):
             # 1. Train Step
             model.train()
-            for batch_idx, (data, target) in enumerate(tqdm(trainloader, desc=f"Ep {epoch+1} Train")):
+            for batch_idx, (data, target) in enumerate(tqdm(trainloader, desc=f"Ep {epoch+1} Train", leave=False)):
                 data, target = data.to(device), target.to(device)
                 data = img_to_patch_pt(data, patch_size=patch_size, flatten_channels=True)
                 optimizer.zero_grad()
@@ -623,7 +623,7 @@ for depth in depths:
             
             # Test Loop
             with torch.no_grad():
-                for batch_idx, (data, target) in enumerate(tqdm(testloader, desc="Test")):
+                for batch_idx, (data, target) in enumerate(tqdm(testloader, desc="Test", leave=False)):
                     data, target = data.to(device), target.to(device)
                     data = img_to_patch_pt(data, patch_size=patch_size, flatten_channels=True)
                     output, mid_layers = model(data)
@@ -634,7 +634,7 @@ for depth in depths:
             
             # Train Eval Loop
             with torch.no_grad():
-                for batch_idx, (data, target) in enumerate(tqdm(trainloader, desc="Train Eval")):
+                for batch_idx, (data, target) in enumerate(tqdm(trainloader, desc="Train Eval", leave=False)):
                     data, target = data.to(device), target.to(device)
                     data = img_to_patch_pt(data, patch_size=patch_size, flatten_channels=True)
                     output, mid_layers = model(data)
@@ -649,7 +649,7 @@ for depth in depths:
             all_valid_loss = []
             all_valid_accuracy = []
             with torch.no_grad():
-                for batch_idx, (data, target) in enumerate(tqdm(validloader, desc="Valid")):
+                for batch_idx, (data, target) in enumerate(tqdm(validloader, desc="Valid", leave=False)):
                     data, target = data.to(device), target.to(device)
                     data = img_to_patch_pt(data, patch_size=patch_size, flatten_channels=True)
                     output, mid_layers = model(data)
