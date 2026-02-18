@@ -274,7 +274,7 @@ class DecoupledAttBlockFn(Function):
         # 3. Reference Calculations
         query_ref = h_norm @ q_fwd_copy.T
         key_ref   = h_norm @ k_fwd_copy.T
-        value_ref = h_norm          
+        value_ref = h_norm           
 
         queries_ref = inv_sqrt_n * rearrange(query_ref, "b s (h d) -> b h s d", h=num_heads)
         keys_ref    = inv_sqrt_n * rearrange(key_ref,   "b s (h d) -> b h s d", h=num_heads)
@@ -372,8 +372,8 @@ class DecoupledAttBlockFn(Function):
             grad_h,      # Residual
             grad_h_norm, # Normed Branch
             grad_q_fwd, grad_k_fwd, None, grad_o_fwd, 
-            None, None, None, None,                    
-            None, None, None, None,                    
+            None, None, None, None,                     
+            None, None, None, None,                     
             grad_alpha,
             grad_inv_sqrt_n,
             grad_num_heads,
@@ -581,21 +581,25 @@ for depth in depths:
             "epochs": [],
             "train_loss": [],
             "test_loss": [],
-            "valid_loss": [],
+            "valid_loss": [],       # <-- Added
             "train_accuracy": [],
             "test_accuracy": [],
-            "valid_accuracy": [],
+            "valid_accuracy": [],   # <-- Added
             "train_epoch_loss": []
         }
         
         # Track best performance for this LR
         best_test_acc = 0.0
-        min_test_loss = float('inf')
+        min_test_loss = 0.0
         best_epoch = -1
         
         # --- NEW TRACKING VARIABLES ---
         best_epoch_train_acc = 0.0
         best_epoch_train_loss = 0.0
+        
+        # NEW: Initialize Valid tracking for MINIMIZATION
+        best_valid_loss = float('inf')
+        best_valid_acc = 0.0
         
         all_train_loss = []
         
@@ -662,42 +666,48 @@ for depth in depths:
             current_results = results["training_results"][lr_key]
             curr_train_loss = float(np.mean(all_train_loss)) 
             curr_test_loss = float(np.mean(all_test_loss))
-            curr_valid_loss = float(np.mean(all_valid_loss))
+            curr_valid_loss = float(np.mean(all_valid_loss))    # <-- Calc Mean
             curr_train_acc = float(np.mean(all_train_accuracy))
             curr_test_acc = float(np.mean(all_acc))
-            curr_valid_acc = float(np.mean(all_valid_accuracy))
+            curr_valid_acc = float(np.mean(all_valid_accuracy)) # <-- Calc Mean
             curr_train_epoch_loss = float(np.mean(all_train_loss_after_epoch))
 
             current_results["epochs"].append(epoch + 1)
             current_results["train_loss"].append(curr_train_loss)
             current_results["test_loss"].append(curr_test_loss)
-            current_results["valid_loss"].append(curr_valid_loss)
+            current_results["valid_loss"].append(curr_valid_loss) # <-- Save
             current_results["train_accuracy"].append(curr_train_acc)
             current_results["test_accuracy"].append(curr_test_acc)
-            current_results["valid_accuracy"].append(curr_valid_acc)
+            current_results["valid_accuracy"].append(curr_valid_acc) # <-- Save
             current_results["train_epoch_loss"].append(curr_train_epoch_loss)
             
-            # --- UPDATED BEST LOGIC ---
-            if curr_test_acc > best_test_acc:
+            # --- UPDATED BEST LOGIC (Based on Min Valid Loss) ---
+            if curr_valid_loss < best_valid_loss:
+                best_valid_loss = curr_valid_loss  # New Min
+                best_valid_acc = curr_valid_acc
+                
+                # Snapshot other metrics at this epoch
                 best_test_acc = curr_test_acc
                 min_test_loss = curr_test_loss
                 best_epoch = epoch + 1
                 best_epoch_train_acc = curr_train_acc
                 best_epoch_train_loss = curr_train_epoch_loss
 
-            print(f"LR: {base_lr}, Epoch: {epoch+1}, Train Loss: {curr_train_epoch_loss:.4f}, Test Loss: {curr_test_loss:.4f}, Train Acc: {curr_train_acc:.4f}, Test Acc: {curr_test_acc:.4f}")
+            print(f"LR: {base_lr}, Epoch: {epoch+1}, Train Loss: {curr_train_epoch_loss:.4f}, Valid Loss: {curr_valid_loss:.4f}, Test Loss: {curr_test_loss:.4f}, Train Acc: {curr_train_acc:.4f}, Valid Acc: {curr_valid_acc:.4f}, Test Acc: {curr_test_acc:.4f}")
         
         # Save Summary for this LR
         results["summary"][lr_key] = {
             "best_test_acc": best_test_acc,
             "min_test_loss": min_test_loss,
+            "best_valid_acc": best_valid_acc,   # <-- Added
+            "best_valid_loss": best_valid_loss, # <-- Added
             "best_epoch": best_epoch,
             "best_epoch_train_acc": best_epoch_train_acc,
             "best_epoch_train_loss": best_epoch_train_loss
         }
         
         # --- UPDATED FINAL PRINT ---
-        print(f"   -> LR {base_lr} Done. Best Result: Test Acc {best_test_acc:.4f}, Test Loss {min_test_loss:.4f}, Train Acc {best_epoch_train_acc:.4f}, Train Loss {best_epoch_train_loss:.4f} (Ep {best_epoch})")
+        print(f"   -> LR {base_lr} Done. Best Result (Ep {best_epoch}): Test Acc {best_test_acc:.4f}, Test Loss {min_test_loss:.4f}, Valid Acc {best_valid_acc:.4f}, Valid Loss {best_valid_loss:.4f}, Train Acc {best_epoch_train_acc:.4f}, Train Loss {best_epoch_train_loss:.4f}")
 
         # Save to JSON
         with open(f"{my_path}/{task_name}.json", 'w') as f:
