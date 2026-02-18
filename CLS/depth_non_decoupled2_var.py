@@ -124,7 +124,7 @@ def img_to_patch_pt(x, patch_size, flatten_channels=True):
         x - torch.Tensor representing the image of shape [B, H, W, C]
         patch_size - Number of pixels per dimension of the patches (integer)
         flatten_channels - If True, the patches will be returned in a flattened format
-                                as a feature vector instead of a image grid.
+                                        as a feature vector instead of a image grid.
     """
     x = x.permute(0, 2, 3, 1)
     B, H, W, C = x.shape
@@ -148,34 +148,40 @@ def relu_prime(x):
 
 class DecoupledFNNBlockFn(Function):
     @staticmethod
-    def forward(ctx, h, U_fwd, U_bwd, W_fwd, W_bwd, U_fwd_copy, W_fwd_copy,
+    def forward(ctx, h, h_norm, U_fwd, U_bwd, W_fwd, W_bwd, U_fwd_copy, W_fwd_copy,
                 alpha, inv_sqrt_n, phi, phi_prime):
-        ctx.save_for_backward(h, U_fwd, U_bwd, W_fwd, W_bwd, U_fwd_copy, W_fwd_copy)
+        # Saved h_norm instead of h for backward of the branch
+        ctx.save_for_backward(h, h_norm, U_fwd, U_bwd, W_fwd, W_bwd, U_fwd_copy, W_fwd_copy)
         ctx.alpha = alpha
         ctx.inv_sqrt_n = inv_sqrt_n
         ctx.phi = phi
         ctx.phi_prime = phi_prime
 
-        x = inv_sqrt_n * (h @ U_fwd.T)      # [..., n]
+        # [PRE-NORM UPDATE]: Projections use h_norm
+        x = inv_sqrt_n * (h_norm @ U_fwd.T)     # [..., n]
+        
         a = phi(x)                          # [..., n]
         y_down = a @ W_fwd.T                # [..., n]
+        
+        # [PRE-NORM UPDATE]: Residual adds to original h
         y = h + alpha * y_down              # [..., n]
 
-        x_fwd_ref = inv_sqrt_n * (h @ U_fwd_copy.T)
+        # Reference using h_norm for consistency
+        x_fwd_ref = inv_sqrt_n * (h_norm @ U_fwd_copy.T)
         y_fwd_ref = a @ W_fwd_copy.T
 
         return y, x - x_fwd_ref, y_down - y_fwd_ref
 
     @staticmethod
     def backward(ctx, grad_y, grad_x_fwd_diff=None, grad_y_fwd_diff=None):
-        h, U_fwd, U_bwd, W_fwd, W_bwd, U_fwd_copy, W_fwd_copy = ctx.saved_tensors
+        h, h_norm, U_fwd, U_bwd, W_fwd, W_bwd, U_fwd_copy, W_fwd_copy = ctx.saved_tensors
         alpha = ctx.alpha
         inv_sqrt_n = ctx.inv_sqrt_n
         phi = ctx.phi
         phi_prime = ctx.phi_prime
 
-        # recompute
-        x = inv_sqrt_n * (h @ U_fwd.T)      # [..., n]
+        # recompute using h_norm
+        x = inv_sqrt_n * (h_norm @ U_fwd.T)     # [..., n]
         a = phi(x)                          # [..., n]
         da_dx = phi_prime(x)                # [..., n]
 
@@ -190,19 +196,19 @@ class DecoupledFNNBlockFn(Function):
         grad_x = grad_a * da_dx                 # [..., n]
 
         # ===== grad U_fwd =====
-        # grad_U[i,j] = (1/sqrt(n)) * sum_{...} grad_x[..., i] * h[..., j]
-        grad_U_fwd = inv_sqrt_n * torch.einsum("...i,...j->ij", grad_x, h)
+        # grad_U[i,j] = (1/sqrt(n)) * sum_{...} grad_x[..., i] * h_norm[..., j] (Using h_norm)
+        grad_U_fwd = inv_sqrt_n * torch.einsum("...i,...j->ij", grad_x, h_norm)
 
         # ===== decoupled path to h through U: use U_bwd =====
-        grad_h_from_x = inv_sqrt_n * (grad_x @ U_fwd)  # [..., n]
-        grad_h = grad_y + grad_h_from_x                # [..., n]
-
-        ## tie bwd grads
-        #grad_U_bwd = grad_U_fwd.clone()
-        #grad_W_bwd = grad_W_fwd.clone()
+        # [PRE-NORM UPDATE]: This gradient goes to h_norm, not h
+        grad_h_norm = inv_sqrt_n * (grad_x @ U_fwd)  # [..., n]
+        
+        # [PRE-NORM UPDATE]: grad_h is just the residual (identity)
+        grad_h = grad_y
 
         return (
             grad_h,
+            grad_h_norm, # Return gradient for the normalized input
             grad_U_fwd,
             None,
             grad_W_fwd,
@@ -223,6 +229,9 @@ class DecoupledFNN(nn.Module):
         self.L = L
         self.phi = phi
         self.phi_prime = phi_prime
+
+        # [PRE-NORM UPDATE]: Added RMSNorm
+        self.norm = nn.RMSNorm(n, elementwise_affine=False)
 
         # forward weights
         self.U_fwd = nn.Parameter(torch.randn(n, n))
@@ -248,8 +257,12 @@ class DecoupledFNN(nn.Module):
         self.inv_sqrt_n = 1.0 / math.sqrt(n)
 
     def forward(self, h):
+        # [PRE-NORM UPDATE]: Calculate Norm
+        h_norm = self.norm(h)
+
         return DecoupledFNNBlockFn.apply(
             h,
+            h_norm, # Pass norm
             self.U_fwd,
             self.U_bwd,
             self.W_fwd,
@@ -284,6 +297,7 @@ class DecoupledAttBlockFn(Function):
     def forward(
         ctx,
         h,                  # [b, n, d_model]
+        h_norm,             # [PRE-NORM UPDATE] [b, n, d_model]
         q_fwd, k_fwd, v_fwd, o_fwd,   # [d_model, d_model]
         q_bwd, k_bwd, v_bwd, o_bwd,   # [d_model, d_model]
         q_fwd_copy, k_fwd_copy, v_fwd_copy, o_fwd_copy, # [d_model, d_model]
@@ -294,7 +308,7 @@ class DecoupledAttBlockFn(Function):
         softmax_prime=None  # (可不使用；softmax 的反传用标准公式更稳)
     ):
         # 保存必要张量
-        ctx.save_for_backward(h, q_fwd, k_fwd, v_fwd, o_fwd, q_bwd, k_bwd, v_bwd, o_bwd, q_fwd_copy, k_fwd_copy, v_fwd_copy, o_fwd_copy)
+        ctx.save_for_backward(h, h_norm, q_fwd, k_fwd, v_fwd, o_fwd, q_bwd, k_bwd, v_bwd, o_bwd, q_fwd_copy, k_fwd_copy, v_fwd_copy, o_fwd_copy)
         ctx.alpha = alpha
         ctx.inv_sqrt_n = inv_sqrt_n
         ctx.num_heads = num_heads
@@ -305,10 +319,10 @@ class DecoupledAttBlockFn(Function):
         assert d_model % num_heads == 0
         head_dim = d_model // num_heads
 
-        # 线性投影
-        query = h @ q_fwd.T   # [b, n, d_model]
-        key   = h @ k_fwd.T   # [b, n, d_model]
-        value = h @ v_fwd.T   # [b, n, d_model]
+        # 线性投影 [PRE-NORM UPDATE]: Use h_norm
+        query = h_norm @ q_fwd.T   # [b, n, d_model]
+        key   = h_norm @ k_fwd.T   # [b, n, d_model]
+        value = h_norm @ v_fwd.T   # [b, n, d_model]
 
         queries = inv_sqrt_n * rearrange(query, "b s (h d) -> b h s d", h=num_heads)
         keys = inv_sqrt_n * rearrange(key, "b s (h d) -> b h s d", h=num_heads)
@@ -318,9 +332,10 @@ class DecoupledAttBlockFn(Function):
         energy = torch.einsum("bhqd, bhkd -> bhqk", queries, keys)  # [b,h,n,n]
 
         #vansih-q,k,v,attention logits,attention scores
-        query_ref = h@ q_fwd_copy.T  # [b, n, d_model]
-        key_ref = h@ k_fwd_copy.T    # [b, n, d_model]
-        value_ref = h@ v_fwd_copy.T  # [b, n, d_model]
+        # [PRE-NORM UPDATE]: Reference uses h_norm
+        query_ref = h_norm @ q_fwd_copy.T  # [b, n, d_model]
+        key_ref = h_norm @ k_fwd_copy.T    # [b, n, d_model]
+        value_ref = h_norm @ v_fwd_copy.T  # [b, n, d_model]
         
         queries_ref = inv_sqrt_n * rearrange(query_ref, "b s (h d) -> b h s d", h=num_heads)
         keys_ref = inv_sqrt_n * rearrange(key_ref, "b s (h d) -> b h s d", h=num_heads)
@@ -344,7 +359,7 @@ class DecoupledAttBlockFn(Function):
         """
         grad_y: [b, n, d_model]
         """
-        h, q_fwd, k_fwd, v_fwd, o_fwd, q_bwd, k_bwd, v_bwd, o_bwd, q_fwd_copy, k_fwd_copy, v_fwd_copy, o_fwd_copy = ctx.saved_tensors
+        h, h_norm, q_fwd, k_fwd, v_fwd, o_fwd, q_bwd, k_bwd, v_bwd, o_bwd, q_fwd_copy, k_fwd_copy, v_fwd_copy, o_fwd_copy = ctx.saved_tensors
         alpha = ctx.alpha
         inv_sqrt_n = ctx.inv_sqrt_n
         num_heads = ctx.num_heads
@@ -353,9 +368,10 @@ class DecoupledAttBlockFn(Function):
         assert d_model % num_heads == 0
         head_dim = d_model // num_heads
 
-        query = h @ q_fwd.T
-        key   = h @ k_fwd.T
-        value = h @ v_fwd.T
+        # [PRE-NORM UPDATE]: Recompute using h_norm
+        query = h_norm @ q_fwd.T
+        key   = h_norm @ k_fwd.T
+        value = h_norm @ v_fwd.T
 
         Q = inv_sqrt_n * rearrange(query, "b s (h d) -> b h s d", h=num_heads)
         K = inv_sqrt_n * rearrange(key, "b s (h d) -> b h s d", h=num_heads)
@@ -384,10 +400,10 @@ class DecoupledAttBlockFn(Function):
 
         # ===== 4) out = A @ V =====
         # out[b,h,q,d] = sum_k A[b,h,q,k] * V[b,h,k,d]
-        grad_A = torch.einsum("bhqd, bhkd -> bhqk", grad_out, V)       # [b,h,n,n]
-        grad_V = torch.einsum("bhqk, bhqd -> bhkd", A, grad_out)       # [b,h,n,d]
+        grad_A = torch.einsum("bhqd, bhkd -> bhqk", grad_out, V)        # [b,h,n,n]
+        grad_V = torch.einsum("bhqk, bhqd -> bhkd", A, grad_out)        # [b,h,n,d]
 
-        tmp = (grad_A * A).sum(dim=-1, keepdim=True)                 # [b,h,n,1]
+        tmp = (grad_A * A).sum(dim=-1, keepdim=True)                  # [b,h,n,1]
         grad_logits = A * (grad_A - tmp)                              # [b,h,n,n]
         grad_energy = scaling * grad_logits                           # [b,h,n,n]
 
@@ -401,7 +417,8 @@ class DecoupledAttBlockFn(Function):
         grad_value = rearrange(inv_sqrt_n * grad_V, "b h s d -> b s (h d)")
 
         # ===== 9) query = h @ q_fwd.T 等 =====
-        h_flat = h.reshape(-1, d_model)
+        # [PRE-NORM UPDATE]: Use h_norm for gradients
+        h_flat = h_norm.reshape(-1, d_model)
         grad_query_flat = grad_query.reshape(-1, d_model)
         grad_key_flat   = grad_key.reshape(-1, d_model)
         grad_value_flat = grad_value.reshape(-1, d_model)
@@ -415,7 +432,9 @@ class DecoupledAttBlockFn(Function):
         grad_h_from_q = grad_query @ q_fwd        # [b,n,d_model]
         grad_h_from_k = grad_key   @ k_fwd
         grad_h_from_v = grad_value @ v_fwd
-        grad_h = grad_h + grad_h_from_q + grad_h_from_k + grad_h_from_v
+        
+        # [PRE-NORM UPDATE]: Gradients flow to h_norm, not h (residual h is separate)
+        grad_h_norm = grad_h_from_q + grad_h_from_k + grad_h_from_v
 
         ## ===== 10) 绑定 bwd 权重梯度（保持 Δ 固定） =====
         #grad_q_bwd = grad_q_fwd.clone()
@@ -437,6 +456,7 @@ class DecoupledAttBlockFn(Function):
 
         return (
             grad_h,
+            grad_h_norm, # Return gradient for normalized input
             grad_q_fwd, grad_k_fwd, grad_v_fwd, grad_o_fwd,
             None, None, None, None,
             None, None, None, None,
@@ -456,6 +476,9 @@ class DecoupledAttention(nn.Module):
         self.num_heads = num_heads
         self.softmax = softmax
         self.softmax_prime = None
+
+        # [PRE-NORM UPDATE]: Added RMSNorm
+        self.norm = nn.RMSNorm(n, elementwise_affine=False)
 
         # forward weigths
         self.q_fwd = nn.Parameter(torch.randn(n, n))
@@ -496,8 +519,12 @@ class DecoupledAttention(nn.Module):
         self.inv_sqrt_n = 1.0 / math.sqrt(n) # width scaling
 
     def forward(self, h):
+        # [PRE-NORM UPDATE]: Calculate Norm
+        h_norm = self.norm(h)
+
         return DecoupledAttBlockFn.apply(
             h,
+            h_norm, # Pass norm
             self.q_fwd,
             self.k_fwd,
             self.v_fwd,
