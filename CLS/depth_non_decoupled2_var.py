@@ -737,8 +737,10 @@ for depth in depths:
         best_test_loss = 0.0
         best_train_acc = 0.0
         best_train_loss = 0.0
-        best_valid_acc = 0.0     # <-- Track Best Valid Acc
-        best_valid_loss = 0.0    # <-- Track Best Valid Loss
+        best_valid_acc = 0.0
+        
+        # [UPDATED]: Initialize valid loss to infinity for minimization
+        best_valid_loss = float('inf')  
         best_epoch = -1
         
         print(f"   -> LR: {base_lr} Started")
@@ -808,14 +810,14 @@ for depth in depths:
             curr_valid_loss = float(np.mean(all_valid_loss))    # <-- Calculate Mean Valid Loss
             curr_valid_acc = float(np.mean(all_valid_accuracy)) # <-- Calculate Mean Valid Acc
             
-            # --- NEW: Update BEST metrics based on test accuracy ---
-            if curr_test_acc > best_test_acc:
-                best_test_acc = curr_test_acc
+            # --- [UPDATED LOGIC]: Update BEST metrics based on MINIMAL VALIDATION LOSS ---
+            if curr_valid_loss < best_valid_loss:
+                best_valid_loss = curr_valid_loss    # Update min valid loss
+                best_valid_acc = curr_valid_acc      
+                best_test_acc = curr_test_acc        # Snapshot metrics at this epoch
                 best_test_loss = curr_test_loss
                 best_train_acc = curr_train_acc
                 best_train_loss = curr_train_loss
-                best_valid_acc = curr_valid_acc      # <-- Save corresponding valid acc
-                best_valid_loss = curr_valid_loss    # <-- Save corresponding valid loss
                 best_epoch = epoch + 1
 
             # Save current epoch results
@@ -830,7 +832,6 @@ for depth in depths:
             current_results["train_epoch_loss"].append(curr_train_loss)
 
             # Print per-epoch stats
-            # Added Validation stats to print
             print(f"LR: {base_lr}, Epoch: {epoch+1}, Train Loss: {curr_train_loss:.4f}, Valid Loss: {curr_valid_loss:.4f}, Test Loss: {curr_test_loss:.4f}, Train Acc: {curr_train_acc:.4f}, Valid Acc: {curr_valid_acc:.4f}, Test Acc: {curr_test_acc:.4f}")
             
             # Save JSON after every epoch
@@ -840,7 +841,6 @@ for depth in depths:
             model.train()
 
         # --- NEW: Final Summary Print after all epochs for this LR ---
-        # Added Validation stats to final summary
         print(f"   -> LR {base_lr} Done. Best Result (Ep {best_epoch}): Test Acc {best_test_acc:.4f}, Test Loss {best_test_loss:.4f}, Valid Acc {best_valid_acc:.4f}, Valid Loss {best_valid_loss:.4f}, Train Acc {best_train_acc:.4f}, Train Loss {best_train_loss:.4f}")
         
         # Optional: Save Best metrics into the summary part of results
