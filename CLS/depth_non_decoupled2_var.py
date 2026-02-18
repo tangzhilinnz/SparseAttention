@@ -125,7 +125,7 @@ def img_to_patch_pt(x, patch_size, flatten_channels=True):
         x - torch.Tensor representing the image of shape [B, H, W, C]
         patch_size - Number of pixels per dimension of the patches (integer)
         flatten_channels - If True, the patches will be returned in a flattened format
-                                        as a feature vector instead of a image grid.
+                             as a feature vector instead of a image grid.
     """
     x = x.permute(0, 2, 3, 1)
     B, H, W, C = x.shape
@@ -350,7 +350,7 @@ class DecoupledAttBlockFn(Function):
 
         out = torch.einsum("bhqk, bhkd -> bhqd", attn, values)  # [b,h,n,d]
         out_merge = rearrange(out, "b h n d -> b n (h d)")        # [b,n,d_model]
-        out_proj = out_merge @ o_fwd.T                            # [b,n,d_model]
+        out_proj = out_merge @ o_fwd.T                                # [b,n,d_model]
 
         y = h + alpha * out_proj
         return y, queries-queries_ref, keys-keys_ref, values-values_ref, scaling*(energy-energy_ref), att_minus
@@ -396,7 +396,7 @@ class DecoupledAttBlockFn(Function):
         grad_o_fwd = grad_out_proj.reshape(-1, d_model).T @ out_merge.reshape(-1, d_model)
 
         # Use o_fwd instead of o_bwd for backprop to previous layer
-        grad_out_merge = grad_out_proj @ o_fwd                # [b,n,d_model]
+        grad_out_merge = grad_out_proj @ o_fwd                 # [b,n,d_model]
         grad_out = rearrange(grad_out_merge, "b n (h d) -> b h n d", h=num_heads)  # [b,h,n,d]
 
         # ===== 4) out = A @ V =====
@@ -737,6 +737,8 @@ for depth in depths:
         best_test_loss = 0.0
         best_train_acc = 0.0
         best_train_loss = 0.0
+        best_valid_acc = 0.0     # <-- Track Best Valid Acc
+        best_valid_loss = 0.0    # <-- Track Best Valid Loss
         best_epoch = -1
         
         print(f"   -> LR: {base_lr} Started")
@@ -803,6 +805,8 @@ for depth in depths:
             curr_train_acc = float(np.mean(all_train_accuracy))
             curr_test_loss = float(np.mean(all_test_loss))
             curr_test_acc = float(np.mean(all_acc))
+            curr_valid_loss = float(np.mean(all_valid_loss))    # <-- Calculate Mean Valid Loss
+            curr_valid_acc = float(np.mean(all_valid_accuracy)) # <-- Calculate Mean Valid Acc
             
             # --- NEW: Update BEST metrics based on test accuracy ---
             if curr_test_acc > best_test_acc:
@@ -810,6 +814,8 @@ for depth in depths:
                 best_test_loss = curr_test_loss
                 best_train_acc = curr_train_acc
                 best_train_loss = curr_train_loss
+                best_valid_acc = curr_valid_acc      # <-- Save corresponding valid acc
+                best_valid_loss = curr_valid_loss    # <-- Save corresponding valid loss
                 best_epoch = epoch + 1
 
             # Save current epoch results
@@ -817,14 +823,15 @@ for depth in depths:
             current_results["epochs"].append(epoch + 1)
             current_results["train_loss"].append(float(np.mean(all_train_loss)))
             current_results["test_loss"].append(curr_test_loss)
-            current_results["valid_loss"].append(float(np.mean(all_valid_loss)))
+            current_results["valid_loss"].append(curr_valid_loss) # <-- Save to JSON
             current_results["train_accuracy"].append(curr_train_acc)
             current_results["test_accuracy"].append(curr_test_acc)
-            current_results["valid_accuracy"].append(float(np.mean(all_valid_accuracy)))
+            current_results["valid_accuracy"].append(curr_valid_acc) # <-- Save to JSON
             current_results["train_epoch_loss"].append(curr_train_loss)
 
             # Print per-epoch stats
-            print(f"LR: {base_lr}, Epoch: {epoch+1}, Train Loss: {curr_train_loss:.4f}, Test Loss: {curr_test_loss:.4f}, Train Acc: {curr_train_acc:.4f}, Test Acc: {curr_test_acc:.4f}")
+            # Added Validation stats to print
+            print(f"LR: {base_lr}, Epoch: {epoch+1}, Train Loss: {curr_train_loss:.4f}, Valid Loss: {curr_valid_loss:.4f}, Test Loss: {curr_test_loss:.4f}, Train Acc: {curr_train_acc:.4f}, Valid Acc: {curr_valid_acc:.4f}, Test Acc: {curr_test_acc:.4f}")
             
             # Save JSON after every epoch
             with open(f"{my_path}/{task_name}.json", 'w') as f:
@@ -833,7 +840,8 @@ for depth in depths:
             model.train()
 
         # --- NEW: Final Summary Print after all epochs for this LR ---
-        print(f"   -> LR {base_lr} Done. Best Result: Test Acc {best_test_acc:.4f}, Test Loss {best_test_loss:.4f}, Train Acc {best_train_acc:.4f}, Train Loss {best_train_loss:.4f} (Ep {best_epoch})")
+        # Added Validation stats to final summary
+        print(f"   -> LR {base_lr} Done. Best Result (Ep {best_epoch}): Test Acc {best_test_acc:.4f}, Test Loss {best_test_loss:.4f}, Valid Acc {best_valid_acc:.4f}, Valid Loss {best_valid_loss:.4f}, Train Acc {best_train_acc:.4f}, Train Loss {best_train_loss:.4f}")
         
         # Optional: Save Best metrics into the summary part of results
         results["summary"] = results.get("summary", {})
@@ -841,6 +849,8 @@ for depth in depths:
             "best_epoch": best_epoch,
             "test_acc": best_test_acc,
             "test_loss": best_test_loss,
+            "valid_acc": best_valid_acc,
+            "valid_loss": best_valid_loss,
             "train_acc": best_train_acc,
             "train_loss": best_train_loss
         }
