@@ -376,6 +376,30 @@ from torch.profiler import profile, record_function, ProfilerActivity
 
 
 
+def sync_model_weights(model_ref, model_tri):
+    """Explicitly copies weights from the reference model to the Triton model."""
+    with torch.no_grad():
+        # --- Sync Y Updates (Bottom-Up) ---
+        model_tri.Wq_y.weight.copy_(model_ref.Wq_y.weight)
+        model_tri.Wk_y.weight.copy_(model_ref.Wk_y.weight)
+        model_tri.Wv_y.weight.copy_(model_ref.Wv_y.weight)
+        
+        model_tri.out_proj_y.weight.copy_(model_ref.out_proj_y.weight)
+        # out_proj has a bias by default, Wq/Wk/Wv do not (bias=False)
+        if model_ref.out_proj_y.bias is not None:
+            model_tri.out_proj_y.bias.copy_(model_ref.out_proj_y.bias)
+
+        # --- Sync X Updates (Top-Down) ---
+        model_tri.Wq_x.weight.copy_(model_ref.Wq_x.weight)
+        model_tri.Wk_x.weight.copy_(model_ref.Wk_x.weight)
+        model_tri.Wv_x.weight.copy_(model_ref.Wv_x.weight)
+        
+        model_tri.out_proj_x.weight.copy_(model_ref.out_proj_x.weight)
+        if model_ref.out_proj_x.bias is not None:
+            model_tri.out_proj_x.bias.copy_(model_ref.out_proj_x.bias)
+
+
+
 import torch
 import triton
 import math
@@ -403,7 +427,8 @@ def run_full_suite():
     model_tri = HierarchicalAttention(dim, H, dropout=0.0).cuda().to(check_dtype).eval()
 
     # CRITICAL FIX: Synchronize weights so both models compute the exact same math
-    model_tri.load_state_dict(model_ref.state_dict())
+    # model_tri.load_state_dict(model_ref.state_dict())
+    sync_model_weights(model_ref, model_tri)
     
     # 3. Create Inputs
     x_base = torch.randn(B, N, dim, device='cuda', dtype=check_dtype).clamp(-1, 1)
@@ -582,7 +607,8 @@ def run_full_suite_update_X_from_Y():
     model_tri.eval()
 
     # Synchronize weights so both models compute the exact same math
-    model_tri.load_state_dict(model_ref.state_dict())
+    # model_tri.load_state_dict(model_ref.state_dict())
+    sync_model_weights(model_ref, model_tri)
 
     # 3. Create Inputs
     x_base = torch.randn(B, N, dim, device='cuda', dtype=check_dtype).clamp(-1, 1)
