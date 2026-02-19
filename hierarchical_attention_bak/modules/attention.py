@@ -8,13 +8,11 @@ from ..ops.functional import build_parent_nodes, hierarchical_attention
 
 
 class HierarchicalAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int, dropout: float = 0.1, window_size: int = 16):
+    def __init__(self, dim: int, num_heads: int, dropout: float = 0.1):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
-
-        self.window_size = window_size
 
         # --- Y Updates (Bottom-Up) ---
         self.Wq_y = nn.Linear(dim, dim, bias=False)
@@ -211,8 +209,7 @@ class HierarchicalAttention(nn.Module):
             Q, K_full, V_full, 
             idx_table,      # Forward Topology
             gather_table,
-            active_mask,     # Mask Table
-            self.window_size
+            active_mask     # Mask Table
         )
     
         return output_leaf_heads.view(B, N, D)

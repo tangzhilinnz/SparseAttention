@@ -112,19 +112,26 @@ class BuildParentNodesFunc(torch.autograd.Function):
 
 class HierarchicalAttentionFunc(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, Q, K, V, idx_table, gather_table, mask_table=None):
+    def forward(ctx, Q, K, V, idx_table, gather_table, mask_table=None, window_size=16):
         # Alignment checks
         Q = Q.contiguous(); K = K.contiguous(); V = V.contiguous()
         idx_table = idx_table.contiguous()
-        if mask_table is not None: mask_table = mask_table.contiguous()
+        if mask_table is not None:
+            mask_table = mask_table.contiguous()
 
         B, N, H, D = Q.shape
         LEVELS = idx_table.shape[1]
+
+        # Window Logic
+        RADIUS = window_size
+        WINDOW_TOTAL_WIDTH = 2 * RADIUS + 1
         
         Out = torch.empty_like(Q)
         
-        # Save weights for backward: [B, N, H, 1 + LEVELS]
-        Weights = torch.empty((B, N, H, 1 + LEVELS), device=Q.device, dtype=torch.float32)
+        # Weights Tensor: [B, N, H, Window_Width + Hierarchy_Levels]
+        # Stores attention weights for backward pass
+        # Weights = torch.empty((B, N, H, 1 + LEVELS), device=Q.device, dtype=torch.float32)
+        Weights = torch.empty((B, N, H, WINDOW_TOTAL_WIDTH + LEVELS), device=Q.device, dtype=torch.float32)
         
         HAS_MASK = (mask_table is not None)
         mask_ptr_safe = mask_table if HAS_MASK else Q # Dummy ptr
@@ -150,12 +157,13 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             D=D, LEVELS=LEVELS,
             BLOCK_D=BLOCK_D, BLOCK_LEVELS=BLOCK_LEVELS,
             HAS_MASK=HAS_MASK,
+            RADIUS=RADIUS,
+            N=N,
             num_warps=2
         )
         
-        # [UPDATE] Save mask_table for backward. PyTorch handles 'None' correctly.
         ctx.save_for_backward(Q, K, V, idx_table, gather_table, Weights, mask_table)
-        ctx.constants = (sm_scale, H, BLOCK_H, D, BLOCK_D, LEVELS, BLOCK_LEVELS)
+        ctx.constants = (sm_scale, H, BLOCK_H, D, BLOCK_D, LEVELS, BLOCK_LEVELS, RADIUS, WINDOW_TOTAL_WIDTH)
         return Out
 
 
@@ -163,7 +171,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
     def backward(ctx, grad_output):
         # 1. Retrieve Tensors
         Q, K, V, idx_table, gather_table, Weights, mask_table = ctx.saved_tensors
-        sm_scale, H, BLOCK_H, D, BLOCK_D, LEVELS, BLOCK_LEVELS = ctx.constants
+        sm_scale, H, BLOCK_H, D, BLOCK_D, LEVELS, BLOCK_LEVELS, RADIUS, WINDOW_SIZE = ctx.constants
 
         # View as 4D
         grad_output = grad_output.contiguous()
@@ -182,7 +190,9 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             *grad_output_4d.stride(), *Weights.stride(), *V.stride(), 
             *idx_table.stride(), *DS.stride(),            
             sm_scale, H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=32, 
-            LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS, HAS_MASK=HAS_MASK, num_warps=2
+            LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS, HAS_MASK=HAS_MASK,
+            RADIUS=RADIUS, WINDOW_SIZE=WINDOW_SIZE, N=N,
+            num_warps=2
         )
 
         # --- SETUP PARALLELISM ---
@@ -191,19 +201,19 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         dK = torch.zeros_like(K, dtype=torch.float32)
         dV = torch.zeros_like(V, dtype=torch.float32)
 
-        dQ = torch.empty_like(Q)
-
         # --- BRANCH 2: dK/dV (Dependent on dS) ---
         
         # Step A: Leaf Kernel (Level 0)
-        grid_leaf = (N, B)
+        grid_window = (N, B)
         # FIXED: Added 'tri_attn.' prefix
-        tri_attn.hierarchical_attention_backward_dK_dV_leaf_kernel[grid_leaf](
-            DS, Q, Weights, grad_output_4d, gather_table,
+        tri_attn.hierarchical_attention_backward_dK_dV_window_kernel[grid_window](
+            DS, Q, Weights, grad_output_4d,
             dK, dV,
             *DS.stride(), *Q.stride(), *Weights.stride(), 
-            *grad_output_4d.stride(), *dK.stride(), *gather_table.stride(),
-            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D, num_warps=2
+            *grad_output_4d.stride(), *dK.stride(),
+            H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
+            RADIUS=RADIUS, WINDOW_SIZE=WINDOW_SIZE, N=N,
+            num_warps=2
         )
 
         # --- Dynamic CUTOFF_LEVEL Logic (Heuristic from helper) ---
@@ -255,17 +265,18 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             )
 
         # --- BRANCH 1: dQ (Independent) ---
+        dQ = torch.empty_like(Q)
         grid_dq = (N, B)
-        # FIXED: Added 'tri_attn.' prefix
+
         tri_attn.hierarchical_attention_backward_dQ_kernel[grid_dq](
             DS, K, idx_table, dQ, mask_ptr_safe,
             *DS.stride(), *K.stride(), *idx_table.stride(), *dQ.stride(),
             H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=32, LEVELS=LEVELS,
-            HAS_MASK=HAS_MASK, num_warps=2
+            HAS_MASK=HAS_MASK, RADIUS=RADIUS, WINDOW_SIZE=WINDOW_SIZE, N=N,
+            num_warps=2
         )
             
-        #return dQ, dK, dV, None, None, None
-        return dQ, dK.to(K.dtype), dV.to(V.dtype), None, None, None
+        return dQ, dK.to(K.dtype), dV.to(V.dtype), None, None, None, None
 
 
 # =================================================================
@@ -275,5 +286,5 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
 def build_parent_nodes(Q_p, K_p, V_p, K_c, V_c):
     return BuildParentNodesFunc.apply(Q_p, K_p, V_p, K_c, V_c)
 
-def hierarchical_attention(Q, K, V, idx_table, gather_table, mask_table=None):
-    return HierarchicalAttentionFunc.apply(Q, K, V, idx_table, gather_table, mask_table)
+def hierarchical_attention(Q, K, V, idx_table, gather_table, mask_table=None, window_size=16):
+    return HierarchicalAttentionFunc.apply(Q, K, V, idx_table, gather_table, mask_table, window_size)

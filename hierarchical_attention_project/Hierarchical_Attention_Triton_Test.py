@@ -364,76 +364,80 @@ from torch.profiler import profile, record_function, ProfilerActivity
 # ... (Assuming they are defined in the file above) ...
 
 def run_full_suite():
+    # ==========================================================================
+    # 1. SETUP & CORRECTNESS CHECK
+    # ==========================================================================
+    check_dtype = torch.float16
+
     print(f"{'='*60}")
-    print("1. CORRECTNESS CHECK (Float16)")
+    print(f"1. CORRECTNESS CHECK ({check_dtype}) - cross_update_Y")
     print(f"{'='*60}")
 
     # 1. Setup Dimensions
-    # We use N=2048 for correctness to be fast, but FP16 allows larger if needed.
-    B, N, D, H = 2, 32768, 64, 16 
-    dim = H * D
-    
-    dtype = torch.float16
+    B, N, head_dim, H = 2, 32768, 64, 16 
+    dim = head_dim * H
 
-    # 2. Initialize Model 
-    # Ensure model is in Float16
-    model = HierarchicalSparseAttentionTriton(dim, H, dropout=0.0).cuda().to(dtype)
-    
-    # 3. Create Inputs (Float16)
-    #x = torch.randn(B, N, dim, device='cuda', dtype=dtype)
-    #y = torch.randn(B, N - 1, dim, device='cuda', dtype=dtype)
+    # 2. Initialize BOTH Models (Dropout=0.0 for deterministic check)
+    model_ref = HierarchicalSparseAttentionRef(dim, H, dropout=0.0).cuda().to(check_dtype).eval()
+    model_tri = HierarchicalAttention(dim, H, dropout=0.0).cuda().to(check_dtype).eval()
 
-    x = torch.randn(B, N, dim, device='cuda', dtype=dtype).clamp(-1, 1)
-    y = torch.randn(B, N - 1, dim, device='cuda', dtype=dtype).clamp(-1, 1)
-
-    print(f"Input Shapes -> X: {x.shape}, Y: {y.shape}, Dtype: {x.dtype}")
+    # CRITICAL FIX: Synchronize weights so both models compute the exact same math
+    model_tri.load_state_dict(model_ref.state_dict())
     
-    assert y.shape[1] == N - 1, f"Sanity Check Failed"
+    # 3. Create Inputs
+    x_base = torch.randn(B, N, dim, device='cuda', dtype=check_dtype).clamp(-1, 1)
+    y_base = torch.randn(B, N - 1, dim, device='cuda', dtype=check_dtype).clamp(-1, 1)
+
+    print(f"Input Shapes -> X: {x_base.shape}, Y: {y_base.shape}, Dtype: {x_base.dtype}")
+    assert y_base.shape[1] == N - 1, f"Sanity Check Failed"
+    
+    # [REAL TRAINING SIMULATION]
+    # cross_update_Y outputs the updated parents, so output shape is (B, N-1, dim)
+    dout = torch.randn(B, N - 1, dim, device='cuda', dtype=check_dtype)
 
     # -------------------------------------------------
     # 4. Run PyTorch Reference Path
     # -------------------------------------------------
-    x_ref = x.clone().detach().requires_grad_(True)
-    y_ref = y.clone().detach().requires_grad_(True)
+    x_ref = x_base.clone().detach().requires_grad_(True)
+    y_ref = y_base.clone().detach().requires_grad_(True)
     
-    model.sizes = None; model.offsets = None 
-    out_ref = model.cross_update_Y_Ref(x_ref, y_ref)
-    loss_ref = out_ref.sum()
-    loss_ref.backward()
+    model_ref.sizes = None; model_ref.offsets = None 
+    
+    out_ref = model_ref.cross_update_Y(x_ref, y_ref)
+    out_ref.backward(dout)
     
     # -------------------------------------------------
     # 5. Run Triton Kernel Path
     # -------------------------------------------------
-    x_tri = x.clone().detach().requires_grad_(True)
-    y_tri = y.clone().detach().requires_grad_(True)
+    x_tri = x_base.clone().detach().requires_grad_(True)
+    y_tri = y_base.clone().detach().requires_grad_(True)
     
-    model.sizes = None; model.offsets = None
-    out_tri = model.cross_update_Y(x_tri, y_tri)
-    loss_tri = out_tri.sum()
-    loss_tri.backward()
+    model_tri.sizes = None; model_tri.offsets = None
+    
+    out_tri = model_tri.cross_update_Y(x_tri, y_tri)
+    out_tri.backward(dout)
     
     # -------------------------------------------------
     # 6. Compare Results
     # -------------------------------------------------
     # Move to float32 for accurate diff calculation
-    diff_out = (out_ref - out_tri).abs().max().item()
-    diff_grad_x = (x_ref.grad - x_tri.grad).abs().max().item()
-    diff_grad_y = (y_ref.grad - y_tri.grad).abs().max().item()
+    diff_out = (out_ref.float() - out_tri.float()).abs().max().item()
+    diff_grad_x = (x_ref.grad.float() - x_tri.grad.float()).abs().max().item()
+    diff_grad_y = (y_ref.grad.float() - y_tri.grad.float()).abs().max().item()
     
     print(f"Max Diff Output:   {diff_out:.6f}")
     print(f"Max Diff Grad X:   {diff_grad_x:.6f}")
     print(f"Max Diff Grad Y:   {diff_grad_y:.6f}")
     
-    # Relaxed tolerance for FP16 (1e-2 is typical for accumulation noise)
+    # Relaxed tolerance for FP16 (1e-2 is typical for accumulation noise in FP16)
     tol = 1e-2 
     try:
         assert torch.allclose(out_ref, out_tri, atol=tol), "Forward pass mismatch!"
         assert torch.allclose(x_ref.grad, x_tri.grad, atol=tol), "Gradient X mismatch!"
         assert torch.allclose(y_ref.grad, y_tri.grad, atol=tol), "Gradient Y mismatch!"
-        print(f"SUCCESS: Triton kernel matches PyTorch reference (within FP16 tolerance).")
+        print(f"SUCCESS: Triton kernel matches PyTorch reference (within {check_dtype} tolerance).")
     except AssertionError as e:
-        print(f"\n{e}")
-        # Don't stop, proceed to benchmark to see speed even if precision is slightly off
+        print(f"\nFAILURE: {e}")
         
     # ==========================================================================
     # 2. PERFORMANCE BENCHMARK (Float16 - Large Scale)
@@ -445,30 +449,27 @@ def run_full_suite():
     # Config: Massive scale
     #B, N, D, H = 64, 1024, 512, 8
     #B, N, D, H = 128, 256, 512, 8
-    B, N, D, H = 1, 2048 * 256, 512, 8
+    B, N, head_dim, H = 1, 2048 * 256, 64, 8
     #B, N, D, H = 2, 2048 * 64, 512, 8
     #B, N, D, H = 32, 4096, 512, 8
     #B, N, D, H = 128, 1024, 512, 8 
     #B, N, D, H = 128, 512, 512, 8 
     #B, N, D, H = 64, 2048, 512, 8
     # B, N, D, H = 16, 4096, 1024, 16 # Alternative config
+    dim = head_dim * H
+    print(f"Config: B={B}, N={N}, D={dim} (HeadDim={head_dim}), H={H}, dtype={check_dtype}")
 
-    print(f"Config: B={B}, N={N}, D={D}, H={H}, dtype={dtype}")
-
-    # Re-init model
-    model = HierarchicalSparseAttentionTriton(dim=D, num_heads=H, dropout=0.0).to('cuda').to(dtype)
-    model.eval() 
+    # Re-init models
+    model_ref = HierarchicalSparseAttentionRef(dim, H, dropout=0.0).cuda().to(check_dtype).eval()
+    model_tri = HierarchicalAttention(dim, H, dropout=0.0).cuda().to(check_dtype).eval()
 
     # Create large inputs 
-    x = torch.randn(B, N, D, device='cuda', dtype=dtype, requires_grad=True)
-    y_in = torch.randn(B, N-1, D, device='cuda', dtype=dtype, requires_grad=True)
+    x_bench = torch.randn(B, N, dim, device='cuda', dtype=check_dtype, requires_grad=True)
+    y_bench = torch.randn(B, N - 1, dim, device='cuda', dtype=check_dtype, requires_grad=True)
     
-    model.sizes = None
-    # Dry run 
-    out_warm = model.cross_update_Y(x, y_in)
-    out_warm.sum().backward()
-    model.zero_grad(); x.grad = None; y_in.grad = None
-
+    # Benchmarking Gradients
+    dout_bench = torch.randn(B, N - 1, dim, device='cuda', dtype=check_dtype)
+    
     # --- Timing Setup ---
     num_warmup = 5
     num_trials = 20 
@@ -478,16 +479,16 @@ def run_full_suite():
     # A. Measure PyTorch Reference 
     print("  Running PyTorch Reference (FWD + BWD)...")
     for _ in range(num_warmup): 
-        out = model.cross_update_Y_Ref(x, y_in)
-        out.sum().backward()
-        model.zero_grad(); x.grad = None; y_in.grad = None
+        out = model_ref.cross_update_Y(x_bench, y_bench)
+        out.backward(dout_bench)
+        model_ref.zero_grad(); x_bench.grad = None; y_bench.grad = None
 
     torch.cuda.synchronize()
     start.record()
     for _ in range(num_trials):
-        out = model.cross_update_Y_Ref(x, y_in)
-        out.sum().backward()
-        model.zero_grad(); x.grad = None; y_in.grad = None
+        out = model_ref.cross_update_Y(x_bench, y_bench)
+        out.backward(dout_bench)
+        model_ref.zero_grad(); x_bench.grad = None; y_bench.grad = None
     end.record()
     torch.cuda.synchronize()
     ms_ref = start.elapsed_time(end)
@@ -495,27 +496,25 @@ def run_full_suite():
     # B. Measure Triton Kernel
     print("  Running Triton Kernel (FWD + BWD)...")
     for _ in range(num_warmup): 
-        out = model.cross_update_Y(x, y_in)
-        out.sum().backward()
-        model.zero_grad(); x.grad = None; y_in.grad = None
+        out = model_tri.cross_update_Y(x_bench, y_bench)
+        out.backward(dout_bench)
+        model_tri.zero_grad(); x_bench.grad = None; y_bench.grad = None
 
     torch.cuda.synchronize()
     start.record()
     for _ in range(num_trials):
-        out = model.cross_update_Y(x, y_in)
-        out.sum().backward()
-        model.zero_grad(); x.grad = None; y_in.grad = None
+        out = model_tri.cross_update_Y(x_bench, y_bench)
+        out.backward(dout_bench)
+        model_tri.zero_grad(); x_bench.grad = None; y_bench.grad = None
     end.record()
     torch.cuda.synchronize()
-    ms_opt = start.elapsed_time(end)
+    ms_tri = start.elapsed_time(end)
 
     # Results
     print("-" * 50)
     print(f"  PyTorch Avg Time (Fwd+Bwd): {ms_ref/num_trials:.3f} ms")
-    print(f"  PyTorch Tot Time (Fwd+Bwd): {ms_ref:.3f} ms")
-    print(f"  Triton  Avg Time (Fwd+Bwd): {ms_opt/num_trials:.3f} ms")
-    print(f"  Triton  Tot Time (Fwd+Bwd): {ms_opt:.3f} ms")
-    print(f"  >>> Speedup: {ms_ref/ms_opt:.2f}x")
+    print(f"  Triton  Avg Time (Fwd+Bwd): {ms_tri/num_trials:.3f} ms")
+    print(f"  >>> Speedup: {ms_ref/ms_tri:.2f}x")
     print("-" * 50)
 
     # ==========================================================================
@@ -526,144 +525,20 @@ def run_full_suite():
     print(f"{'='*60}")
 
     print("Profiling Triton Kernel Trace...")
-    model.zero_grad(); x.grad = None; y_in.grad = None
+    model_tri.zero_grad(); x_bench.grad = None; y_bench.grad = None
 
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
-        with record_function("Triton_Step"):
+        with record_function("Triton_Cross_Update_Y"):
             for _ in range(5): 
-                out = model.cross_update_Y(x, y_in)
-                out.sum().backward()
-                model.zero_grad(); x.grad = None; y_in.grad = None
+                out = model_tri.cross_update_Y(x_bench, y_bench)
+                out.backward(dout_bench)
+                model_tri.zero_grad(); x_bench.grad = None; y_bench.grad = None
 
     print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=100))
 
 
-
-
 def run_full_suite_update_X_from_Y():
-    # ==========================================================================
-    # 1. SETUP & CORRECTNESS CHECK
-    # ==========================================================================
-    # [CONFIG] Choose your dtype here: torch.float32 or torch.float16
-    #check_dtype = torch.float16
-    #
-    #print(f"{'='*60}")
-    #print(f"1. CORRECTNESS CHECK ({check_dtype}) - update_X_from_Y")
-    #print(f"{'='*60}")
-    #
-    ## 1. Setup Dimensions for Correctness
-    ## N needs to be a power of 2 usually for easier tree construction logic.
-    ##B, N, D, H = 1, 2048 * 128, 64, 16
-    ##B, N, D, H = 16, 2048, 64, 16
-    #B, N, D, H = 2, 2048 * 32, 64, 16
-    ##B, N, D, H = 2, 64, 64, 16
-    #dim = H * D
-    #
-    ## 2. Initialize Model (Dropout=0.0 for deterministic check)
-    #model = HierarchicalSparseAttentionTriton(dim, H, dropout=0.0).cuda().to(check_dtype)
-    #model.eval()
-    #
-    ## 3. Create Inputs
-    ## update_X_from_Y takes leaves (x) and parents (y).
-    #x = torch.randn(B, N, dim, device='cuda', dtype=check_dtype).clamp(-1, 1)
-    #y = torch.randn(B, N - 1, dim, device='cuda', dtype=check_dtype).clamp(-1, 1)
-    #
-    ## Optional mask (can be None, but good to test with None first for basic sanity)
-    ##mask = True
-    ##mask = torch.ones((B, N), dtype=torch.bool, device='cuda')
-    #mask=None
-    #
-    #print(f"Input Shapes -> X: {x.shape}, Y: {y.shape}, Dtype: {x.dtype}")
-    #
-    ## -------------------------------------------------
-    ## 4. Run PyTorch Reference Path
-    ## -------------------------------------------------
-    #x_ref = x.clone().detach().requires_grad_(True)
-    #y_ref = y.clone().detach().requires_grad_(True)
-    #
-    #model.sizes = None; model.offsets = None 
-    #
-    ## Forward Ref
-    #out_ref = model.update_X_from_Y_Ref(x_ref, y_ref, mask=mask)
-    #
-    ## Backward Ref
-    #loss_ref = out_ref.sum()
-    #loss_ref.backward()
-    #
-    ## -------------------------------------------------
-    ## 5. Run Triton Kernel Path
-    ## -------------------------------------------------
-    #x_tri = x.clone().detach().requires_grad_(True)
-    #y_tri = y.clone().detach().requires_grad_(True)
-    #
-    #model.sizes = None; model.offsets = None
-    #
-    ## Forward Triton
-    #out_tri = model.update_X_from_Y(x_tri, y_tri, mask=mask)
-    #
-    ## Backward Triton
-    #loss_tri = out_tri.sum()
-    #loss_tri.backward()
-    #
-    ## -------------------------------------------------
-    ## 6. Compare Results
-    ## -------------------------------------------------
-    ## Cast to float32 for accurate diff calculation regardless of input type
-    #diff_out = (out_ref.float() - out_tri.float()).abs().max().item()
-    #diff_grad_x = (x_ref.grad.float() - x_tri.grad.float()).abs().max().item()
-    #diff_grad_y = (y_ref.grad.float() - y_tri.grad.float()).abs().max().item()
-    #
-    #print(f"Max Diff Output:   {diff_out:.8f}")
-    #print(f"Max Diff Grad X:   {diff_grad_x:.8f}")
-    #print(f"Max Diff Grad Y:   {diff_grad_y:.8f}")
-    #
-    #print(f"   -> Ref Grad Y Mean: {y_ref.grad.float().abs().mean():.4f} | Max: {y_ref.grad.float().abs().max():.4f}")
-    #print(f"   -> Tri Grad Y Mean: {y_tri.grad.float().abs().mean():.4f} | Max: {y_tri.grad.float().abs().max():.4f}")
-    #    
-    ## Dynamic tolerance based on dtype
-    ## FP32: stricter (e.g., 1e-4), FP16: looser (e.g., 1e-2)
-    #tol = 1e-3 if check_dtype == torch.float32 else 5e-2
-    #
-    ##try:
-    #assert torch.allclose(out_ref, out_tri, atol=tol), f"Forward pass mismatch! (tol={tol})"
-    #assert torch.allclose(x_ref.grad, x_tri.grad, atol=tol), f"Gradient X mismatch! (tol={tol})"
-    ##assert torch.allclose(y_ref.grad, y_tri.grad, atol=tol), f"Gradient Y mismatch! (tol={tol})"
-    ##print(f"SUCCESS: Triton kernel matches PyTorch reference (within {check_dtype} tolerance).")
-    #    
-    ## --- ANALYSIS: Breakdown Error by Level ---
-    #print(f"\n{'='*30}")
-    #print("ANALYSIS: Grad Y Error by Level")
-    #print(f"{'='*30}")
-    #    
-    ## We need the topology to mapping nodes to levels
-    #tables = model._get_lookup_table(N, is_causal=(mask is not None), device='cuda')
-    #gather_info = tables['backward_gather'] # [Total_Nodes, 3] -> [Start, End, Level]
-    #    
-    ## All nodes: 0..Total-1. But Y corresponds to Parents (Nodes N..Total-1)
-    ## Note: Y has shape [B, N-1, D] corresponding to nodes N to 2N-2.
-    #    
-    ## Get Levels for all Y nodes
-    ## gather_info Index N corresponds to Y index 0
-    #total_nodes = 2*N - 1
-    #y_node_indices = torch.arange(N, total_nodes, device='cuda')
-    #y_levels = gather_info[y_node_indices, 2] # Level of each Y node
-    #    
-    #diff_y = (y_ref.grad.float() - y_tri.grad.float()).abs().sum(dim=-1) # [B, N-1]
-    #    
-    ## Bucket by level
-    #max_lvl = int(math.log2(N))
-    #print(f"{'Level':<6} | {'Count':<8} | {'Max Diff':<12} | {'Mean Diff':<12}")
-    #print("-" * 50)
-    #    
-    #for lvl in range(1, max_lvl + 1):
-    #        mask_lvl = (y_levels == lvl)
-    #        if mask_lvl.any():
-    #            errs = diff_y[:, mask_lvl]
-    #            print(f"{lvl:<6} | {errs.numel():<8} | {errs.max().item():<12.8f} | {errs.mean().item():<12.8f}")
-    #print("-" * 50)
-    #print("Explanation: Higher levels sum more gradients (2^L terms), causing higher FP accumulation error.")
-
-    # [CONFIG] Choose your dtype here: torch.float32 or torch.float16
+    
     check_dtype = torch.float16
 
     print(f"{'='*60}")
@@ -672,40 +547,45 @@ def run_full_suite_update_X_from_Y():
 
     # 1. Setup Dimensions for Correctness
     # B, N, D, H = 1, 2048 * 128, 64, 16
-    #B, N, D, H = 16, 2048, 64, 16
-    B, N, D, H = 2, 2048 * 32, 64, 16
+    B, N, D, H = 16, 2048, 64, 16
+    # B, N, D, H = 2, 2048 * 32, 64, 16
     # B, N, D, H = 2, 64, 64, 16
     dim = H * D
+    window_size_set = 64
 
     # 2. Initialize Model (Dropout=0.0 for deterministic check)
-    model = HierarchicalSparseAttentionTriton(dim, H, dropout=0.0).cuda().to(check_dtype)
-    model.eval()
+    model_ref = HierarchicalSparseAttentionRef(dim, H, dropout=0.0, window_size=window_size_set).cuda().to(check_dtype)
+    model_tri = HierarchicalAttention(dim, H, dropout=0.0, window_size=window_size_set).cuda().to(check_dtype)
+
+    model_ref.eval()
+    model_tri.eval()
+
+    # Synchronize weights so both models compute the exact same math
+    model_tri.load_state_dict(model_ref.state_dict())
 
     # 3. Create Inputs
-    # update_X_from_Y takes leaves (x) and parents (y).
-    x = torch.randn(B, N, dim, device='cuda', dtype=check_dtype).clamp(-1, 1)
-    y = torch.randn(B, N - 1, dim, device='cuda', dtype=check_dtype).clamp(-1, 1)
+    x_base = torch.randn(B, N, dim, device='cuda', dtype=check_dtype).clamp(-1, 1)
+    y_base = torch.randn(B, N - 1, dim, device='cuda', dtype=check_dtype).clamp(-1, 1)
 
-    # [NEW] Create Random Incoming Gradients (dout)
-    # Instead of sum(), we use random gradients to catch indexing/broadcasting bugs.
-    dout = torch.randn_like(x, device='cuda', dtype=check_dtype)
+    # Create Random Incoming Gradients (dout)
+    dout = torch.randn_like(x_base, device='cuda', dtype=check_dtype)
 
     # Optional mask 
     #mask = None
     mask = torch.ones((B, N), dtype=torch.bool, device='cuda')
 
-    print(f"Input Shapes -> X: {x.shape}, Y: {y.shape}, Dtype: {x.dtype}")
+    print(f"Input Shapes -> X: {x_base.shape}, Y: {y_base.shape}, Dtype: {x_base.dtype}")
 
     # -------------------------------------------------
     # 4. Run PyTorch Reference Path
     # -------------------------------------------------
-    x_ref = x.clone().detach().requires_grad_(True)
-    y_ref = y.clone().detach().requires_grad_(True)
+    x_ref = x_base.clone().detach().requires_grad_(True)
+    y_ref = y_base.clone().detach().requires_grad_(True)
 
-    model.sizes = None; model.offsets = None 
+    model_ref.sizes = None; model_ref.offsets = None
 
     # Forward Ref
-    out_ref = model.update_X_from_Y_Ref(x_ref, y_ref, mask=mask)
+    out_ref = model_ref.update_X_from_Y(x_ref, y_ref, mask=mask)
 
     # Backward Ref (Inject Random Gradients)
     out_ref.backward(dout)
@@ -713,13 +593,13 @@ def run_full_suite_update_X_from_Y():
     # -------------------------------------------------
     # 5. Run Triton Kernel Path
     # -------------------------------------------------
-    x_tri = x.clone().detach().requires_grad_(True)
-    y_tri = y.clone().detach().requires_grad_(True)
+    x_tri = x_base.clone().detach().requires_grad_(True)
+    y_tri = y_base.clone().detach().requires_grad_(True)
 
-    model.sizes = None; model.offsets = None
+    model_tri.sizes = None; model_tri.offsets = None
 
     # Forward Triton
-    out_tri = model.update_X_from_Y(x_tri, y_tri, mask=mask)
+    out_tri = model_tri.update_X_from_Y(x_tri, y_tri, mask=mask)
 
     # Backward Triton (Inject SAME Random Gradients)
     out_tri.backward(dout)
@@ -738,7 +618,6 @@ def run_full_suite_update_X_from_Y():
 
     print(f"   -> Ref Grad Y Mean: {y_ref.grad.float().abs().mean():.4f} | Max: {y_ref.grad.float().abs().max():.4f}")
     print(f"   -> Tri Grad Y Mean: {y_tri.grad.float().abs().mean():.4f} | Max: {y_tri.grad.float().abs().max():.4f}")
-
 
     # Calculate magnitudes
     grad_ref_mag = y_ref.grad.float().abs().mean()
@@ -765,39 +644,6 @@ def run_full_suite_update_X_from_Y():
         print(f"SUCCESS: Triton kernel matches PyTorch reference (within {check_dtype} tolerance).")
     except AssertionError as e:
         print(f"FAILURE: {e}")
-    
-    # --- ANALYSIS: Breakdown Error by Level ---
-    print(f"\n{'='*30}")
-    print("ANALYSIS: Grad Y Error by Level")
-    print(f"{'='*30}")
-    
-    # We need the topology to mapping nodes to levels
-    tables = model._get_lookup_table(N, is_causal=(mask is not None), device='cuda')
-    gather_info = tables['backward_gather'] # [Total_Nodes, 3] -> [Start, End, Level]
-    
-    # All nodes: 0..Total-1. But Y corresponds to Parents (Nodes N..Total-1)
-    # Note: Y has shape [B, N-1, D] corresponding to nodes N to 2N-2.
-    
-    # Get Levels for all Y nodes
-    # gather_info Index N corresponds to Y index 0
-    total_nodes = 2*N - 1
-    y_node_indices = torch.arange(N, total_nodes, device='cuda')
-    y_levels = gather_info[y_node_indices, 2] # Level of each Y node
-    
-    diff_y = (y_ref.grad.float() - y_tri.grad.float()).abs().sum(dim=-1) # [B, N-1]
-    
-    # Bucket by level
-    max_lvl = int(math.log2(N))
-    print(f"{'Level':<6} | {'Count':<8} | {'Max Diff':<12} | {'Mean Diff':<12}")
-    print("-" * 50)
-    
-    for lvl in range(1, max_lvl + 1):
-            mask_lvl = (y_levels == lvl)
-            if mask_lvl.any():
-                errs = diff_y[:, mask_lvl]
-                print(f"{lvl:<6} | {errs.numel():<8} | {errs.max().item():<12.8f} | {errs.mean().item():<12.8f}")
-    print("-" * 50)
-    print("Explanation: Higher levels sum more gradients (2^L terms), causing higher FP accumulation error.")
 
     # ==========================================================================
     # 2. PERFORMANCE BENCHMARK (Float16 - Large Scale)
@@ -820,20 +666,16 @@ def run_full_suite_update_X_from_Y():
 
     print(f"Config: B={B}, N={N}, D={dim} (HeadDim={D}), H={H}, dtype={check_dtype}")
 
-    # Re-init model
-    model = HierarchicalSparseAttentionTriton(dim=dim, num_heads=H, dropout=0.0).to('cuda').to(check_dtype)
-    model.eval() 
+    model_ref = HierarchicalSparseAttentionRef(dim, H, dropout=0.0).cuda().to(check_dtype).eval()
+    model_tri = HierarchicalAttention(dim, H, dropout=0.0).cuda().to(check_dtype).eval()
 
-    # Create large inputs 
-    x = torch.randn(B, N, dim, device='cuda', dtype=check_dtype, requires_grad=True)
-    y_in = torch.randn(B, N - 1, dim, device='cuda', dtype=check_dtype, requires_grad=True)
+    x_bench = torch.randn(B, N, dim, device='cuda', dtype=check_dtype, requires_grad=True)
+    y_bench = torch.randn(B, N - 1, dim, device='cuda', dtype=check_dtype, requires_grad=True)
     
-    model.sizes = None
-    
-    # Warmup / Dry run 
-    out_warm = model.update_X_from_Y(x, y_in)
-    out_warm.sum().backward()
-    model.zero_grad(); x.grad = None; y_in.grad = None
+    # [REAL TRAINING SIMULATION] 
+    # Generate the gradient tensor that would come from the upstream layers (e.g., MLP)
+    # Shape matches the output of the forward pass: (B, N, dim)
+    dout_bench = torch.randn_like(x_bench, device='cuda', dtype=check_dtype)
 
     # --- Timing Setup ---
     num_warmup = 5
@@ -844,16 +686,16 @@ def run_full_suite_update_X_from_Y():
     # A. Measure PyTorch Reference 
     print("  Running PyTorch Reference (FWD + BWD)...")
     for _ in range(num_warmup): 
-        out = model.update_X_from_Y_Ref(x, y_in)
-        out.sum().backward()
-        model.zero_grad(); x.grad = None; y_in.grad = None
+        out = model_ref.update_X_from_Y(x_bench, y_bench)
+        out.backward(dout_bench)  # Inject real upstream gradients
+        model_ref.zero_grad(); x_bench.grad = None; y_bench.grad = None
 
     torch.cuda.synchronize()
     start.record()
     for _ in range(num_trials):
-        out = model.update_X_from_Y_Ref(x, y_in)
-        out.sum().backward()
-        model.zero_grad(); x.grad = None; y_in.grad = None
+        out = model_ref.update_X_from_Y(x_bench, y_bench)
+        out.backward(dout_bench)  # Inject real upstream gradients
+        model_ref.zero_grad(); x_bench.grad = None; y_bench.grad = None
     end.record()
     torch.cuda.synchronize()
     ms_ref = start.elapsed_time(end)
@@ -861,25 +703,24 @@ def run_full_suite_update_X_from_Y():
     # B. Measure Triton Kernel
     print("  Running Triton Kernel (FWD + BWD)...")
     for _ in range(num_warmup): 
-        out = model.update_X_from_Y(x, y_in)
-        out.sum().backward()
-        model.zero_grad(); x.grad = None; y_in.grad = None
+        out = model_tri.update_X_from_Y(x_bench, y_bench)
+        out.backward(dout_bench)  # Inject real upstream gradients
+        model_tri.zero_grad(); x_bench.grad = None; y_bench.grad = None
 
     torch.cuda.synchronize()
     start.record()
     for _ in range(num_trials):
-        out = model.update_X_from_Y(x, y_in)
-        out.sum().backward()
-        model.zero_grad(); x.grad = None; y_in.grad = None
+        out = model_tri.update_X_from_Y(x_bench, y_bench)
+        out.backward(dout_bench)  # Inject real upstream gradients
+        model_tri.zero_grad(); x_bench.grad = None; y_bench.grad = None
     end.record()
     torch.cuda.synchronize()
-    ms_opt = start.elapsed_time(end)
+    ms_tri = start.elapsed_time(end)
 
-    # Results
     print("-" * 50)
     print(f"  PyTorch Avg Time (Fwd+Bwd): {ms_ref/num_trials:.3f} ms")
-    print(f"  Triton  Avg Time (Fwd+Bwd): {ms_opt/num_trials:.3f} ms")
-    print(f"  >>> Speedup: {ms_ref/ms_opt:.2f}x")
+    print(f"  Triton  Avg Time (Fwd+Bwd): {ms_tri/num_trials:.3f} ms")
+    print(f"  >>> Speedup: {ms_ref/ms_tri:.2f}x")
     print("-" * 50)
 
     # ==========================================================================
@@ -890,14 +731,14 @@ def run_full_suite_update_X_from_Y():
     print(f"{'='*60}")
 
     print("Profiling Triton Kernel Trace...")
-    model.zero_grad(); x.grad = None; y_in.grad = None
+    model_tri.zero_grad(); x_bench.grad = None; y_bench.grad = None
 
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
         with record_function("Triton_Update_X_From_Y"):
             for _ in range(5): 
-                out = model.update_X_from_Y(x, y_in)
-                out.sum().backward()
-                model.zero_grad(); x.grad = None; y_in.grad = None
+                out = model_tri.update_X_from_Y(x_bench, y_bench)
+                out.backward(dout_bench)  # Inject real upstream gradients
+                model_tri.zero_grad(); x_bench.grad = None; y_bench.grad = None
 
     print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=100))
 

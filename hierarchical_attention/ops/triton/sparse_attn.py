@@ -8,17 +8,12 @@ def hierarchical_attention_forward_kernel(
     Lookup_ptr, Mask_ptr, 
     Out_ptr, W_ptr, 
     
-    # Strides (Q)
+    # Strides
     sq_b, sq_n, sq_h, sq_d,
-    # Strides (K)
     sk_b, sk_n, sk_h, sk_d,
-    # Strides (V) <--- [FIX]: Explicit V strides added
     sv_b, sv_n, sv_h, sv_d,
-    # Strides (Topology)
     sl_n, sl_lvl,
-    # Strides (Out)
     so_b, so_n, so_h, so_d,
-    # Strides (Weights)
     sw_b, sw_n, sw_h, sw_lvl,
     
     # Constants
@@ -29,44 +24,45 @@ def hierarchical_attention_forward_kernel(
     LEVELS: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_LEVELS: tl.constexpr, 
-    HAS_MASK: tl.constexpr 
+    HAS_MASK: tl.constexpr,
+    RADIUS: tl.constexpr,
+    N: tl.constexpr 
 ):
     node_idx = tl.program_id(0)
     b_idx = tl.program_id(1)
+    
+    # Compile-time window size for loop unrolling
+    WINDOW_SIZE: tl.constexpr = 2 * RADIUS + 1
 
-    # 1. Setup
+    # 1. Setup Coordinates
     h_idx = tl.arange(0, BLOCK_H)
     mask_h = h_idx < H
     offs_d = tl.arange(0, BLOCK_D)
     offs_lvl = tl.arange(0, BLOCK_LEVELS)
     mask_lvl = offs_lvl < LEVELS
 
-    # 2. Load Topology
+    # 2. Load Topology (Hierarchy)
     off_lookup = node_idx * sl_n + offs_lvl * sl_lvl
     neighbor_indices = tl.load(Lookup_ptr + off_lookup, mask=mask_lvl, other=0)
     
     neighbor_mask_val = tl.zeros([BLOCK_LEVELS], dtype=tl.int1)
     if HAS_MASK:
-        # User confirmed: 1 = Mask Out (Ignore), 0 = Valid (Keep)
         val_int8 = tl.load(Mask_ptr + off_lookup, mask=mask_lvl, other=1).to(tl.int8)
         neighbor_mask_val = (val_int8 != 0)
 
     # 3. Base Pointers
     k_batch_base = K_ptr + b_idx * sk_b
-    
-    # [FIX]: Use V specific stride for batch
     v_batch_base = V_ptr + b_idx * sv_b
-    
-    off_node_self = node_idx * sk_n
     off_node_cross = neighbor_indices * sk_n 
 
     q_ptr = Q_ptr + (b_idx * sq_b) + (node_idx * sq_n) + \
             (h_idx[:, None] * sq_h) + (offs_d[None, :] * sq_d)
 
-    acc_self = tl.zeros([BLOCK_H], dtype=tl.float32)
+    # Accumulators
+    acc_window = tl.zeros([BLOCK_H, WINDOW_SIZE], dtype=tl.float32)
     acc_cross = tl.zeros([BLOCK_H, BLOCK_LEVELS], dtype=tl.float32)
 
-    # 4. Score Loop
+    # 4. Main Loop over D (Outer Loop)
     for off_d_start in range(0, D, BLOCK_D):
         cur_offs_d = off_d_start + offs_d
         d_mask = cur_offs_d < D
@@ -74,13 +70,39 @@ def hierarchical_attention_forward_kernel(
         
         q = tl.load(q_ptr, mask=mask_q, other=0.0)
         
-        # --- K SELF ---
-        ptr_k_self = k_batch_base + off_node_self + \
-                     (h_idx[:, None] * sk_h) + (cur_offs_d[None, :] * sk_d)
-        k_self = tl.load(ptr_k_self, mask=mask_q, other=0.0)
-        acc_self += tl.sum(q * k_self, axis=1)
+        # -------------------------------------------------------------
+        # 4.1. SAFE SLIDING WINDOW LOOP
+        # -------------------------------------------------------------
+        for w in tl.static_range(0, WINDOW_SIZE):
+            offset = w - RADIUS
+            neighbor_idx = node_idx + offset
 
-        # --- K CROSS ---
+            # A. Compute Validity Tensors (Pure Math)
+            # Check Geometric Bounds [0, N)
+            is_valid_geom = (neighbor_idx >= 0) & (neighbor_idx < N)
+            
+            # B. Safe Indexing (Avoid Negative Pointer Arithmetic)
+            # If invalid, we force index to 0. The value will be masked out later.
+            # This prevents SegFaults / Illegal Memory Access.
+            safe_neighbor_idx = tl.where(is_valid_geom, neighbor_idx, 0)
+            
+            # C. Load Mask
+            # We only load if geometry is valid.
+            mask_win_load = mask_q & is_valid_geom
+
+            # D. Pointer Math (Using Safe Index)
+            ptr_k_win = k_batch_base + (safe_neighbor_idx * sk_n) + \
+                        (h_idx[:, None] * sk_h) + (cur_offs_d[None, :] * sk_d)
+            
+            k_val = tl.load(ptr_k_win, mask=mask_win_load, other=0.0)
+            
+            # E. Accumulate
+            score = tl.sum(q * k_val, axis=1)
+            acc_window[:, w] += score
+
+        # -------------------------------------------------------------
+        # 4.2. HIERARCHICAL CROSS LOOP
+        # -------------------------------------------------------------
         ptr_k_cross = k_batch_base + \
                       off_node_cross[None, :, None] + \
                       (h_idx[:, None, None] * sk_h) + \
@@ -92,35 +114,60 @@ def hierarchical_attention_forward_kernel(
         acc_cross += tl.sum(q[:, None, :] * k_cross, axis=2)
         q_ptr += BLOCK_D * sq_d
 
-    # 5. Softmax
-    acc_self = acc_self * sm_scale
+    # 5. Post-Loop Masking (Apply -inf ONCE)
+    acc_window = acc_window * sm_scale
     acc_cross = acc_cross * sm_scale
     
-    # Apply Masking (1 = Mask Out / -inf)
+    # --- [CRITICAL FIX] Correct Tensor Masking Logic ---
+    for w in tl.static_range(0, WINDOW_SIZE):
+        offset = w - RADIUS
+        neighbor_idx = node_idx + offset
+        
+        # 1. Recompute Validity
+        is_valid_geom = (neighbor_idx >= 0) & (neighbor_idx < N)
+        is_causal = (neighbor_idx <= node_idx)
+
+        # 2. Determine Mask Condition (Tensor Logic)
+        # Mask if: (Out of Bounds) OR (Has Mask AND Is Future)
+        should_mask = (~is_valid_geom)
+        if HAS_MASK:
+            should_mask = should_mask | (~is_causal)
+        
+        # 3. Apply -inf (Broadcast check)
+        acc_window[:, w] = tl.where(should_mask, -float('inf'), acc_window[:, w])
+
+    # Apply Hierarchy Masks
     mask_broadcast = (offs_lvl >= LEVELS)
     if HAS_MASK:
         mask_broadcast = mask_broadcast | neighbor_mask_val
-        
     acc_cross = tl.where(mask_broadcast[None, :], -float('inf'), acc_cross)
     
+    # 6. Softmax & Reduction
     max_cross = tl.max(acc_cross, axis=1)
-    max_all = tl.maximum(acc_self, max_cross)
+    max_window = tl.max(acc_window, axis=1)
+    max_all = tl.maximum(max_window, max_cross)
     
-    exp_self = tl.exp(acc_self - max_all)
+    exp_window = tl.exp(acc_window - max_all[:, None])
     exp_cross = tl.exp(acc_cross - max_all[:, None])
     
-    denom = exp_self + tl.sum(exp_cross, axis=1)
-    w_self = exp_self / denom 
+    denom = tl.sum(exp_window, axis=1) + tl.sum(exp_cross, axis=1)
+    
+    # --- [CRITICAL FIX] Numerical Stability ---
+    # Guard against NaN if all inputs are masked (e.g. at boundary)
+    denom = tl.maximum(denom, 1.0e-5)
+
+    w_window = exp_window / denom[:, None]
     w_cross = exp_cross / denom[:, None]
 
     # Save Weights
     w_base_ptr = W_ptr + (b_idx * sw_b) + (node_idx * sw_n) + (h_idx * sw_h)
-    tl.store(w_base_ptr + (0 * sw_lvl), w_self, mask=mask_h)
+    offs_win = tl.arange(0, WINDOW_SIZE)
+    tl.store(w_base_ptr[:, None] + (offs_win[None, :] * sw_lvl), w_window, mask=mask_h[:, None])
     
-    w_cross_ptr = w_base_ptr[:, None] + ((1 + offs_lvl[None, :]) * sw_lvl)
+    w_cross_ptr = w_base_ptr[:, None] + ((WINDOW_SIZE + offs_lvl[None, :]) * sw_lvl)
     tl.store(w_cross_ptr, w_cross, mask=mask_h[:, None] & mask_lvl[None, :])
 
-    # 6. Weighted Sum Loop
+    # 7. Weighted Sum (Value Aggregation)
     out_base_ptr = Out_ptr + (b_idx * so_b) + (node_idx * so_n) + \
                    (h_idx[:, None] * so_h) + (offs_d[None, :] * so_d)
 
@@ -128,21 +175,34 @@ def hierarchical_attention_forward_kernel(
         cur_offs_d = off_d_start + offs_d
         d_mask = cur_offs_d < D
         mask_op = mask_h[:, None] & d_mask[None, :]
+        out_acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
 
-        # --- V SELF ---
-        # [FIX]: Use sv_h and sv_d
-        ptr_v_self = v_batch_base + off_node_self + \
-                     (h_idx[:, None] * sv_h) + (cur_offs_d[None, :] * sv_d)
-        v_self = tl.load(ptr_v_self, mask=mask_op, other=0.0)
-        out_acc = w_self[:, None] * v_self
-        
-        # --- V CROSS ---
-        # [FIX]: Use sv_h and sv_d
+        # --- V WINDOW LOOP ---
+        for w in tl.static_range(0, WINDOW_SIZE):
+            offset = w - RADIUS
+            neighbor_idx = node_idx + offset
+            
+            # Validity Logic again
+            is_valid_geom = (neighbor_idx >= 0) & (neighbor_idx < N)
+            safe_neighbor_idx = tl.where(is_valid_geom, neighbor_idx, 0)
+            
+            # Optimization: Mask the LOAD.
+            # Even if we load 0.0, we multiply by w_window which is 0.0 (if masked), so result is safe.
+            mask_win_v = mask_op & is_valid_geom
+            
+            ptr_v_win = v_batch_base + (safe_neighbor_idx * sv_n) + \
+                        (h_idx[:, None] * sv_h) + (cur_offs_d[None, :] * sv_d)
+            
+            v_val = tl.load(ptr_v_win, mask=mask_win_v, other=0.0)
+            
+            out_acc += w_window[:, w][:, None] * v_val
+
+        # --- V CROSS LOOP ---
         ptr_v_cross = v_batch_base + \
                       off_node_cross[None, :, None] + \
                       (h_idx[:, None, None] * sv_h) + \
                       (cur_offs_d[None, None, :] * sv_d)
-                      
+        
         mask_v = mask_h[:, None, None] & mask_lvl[None, :, None] & d_mask[None, None, :]
         v_cross = tl.load(ptr_v_cross, mask=mask_v, other=0.0)
         
@@ -158,216 +218,203 @@ def hierarchical_attention_forward_kernel(
 @triton.jit
 def hierarchical_attention_backward_dS_kernel(
     DO_ptr, W_ptr, V_ptr, Lookup_ptr, DS_ptr, Mask_ptr,
-    # Strides for dO
     sdo_b, sdo_n, sdo_h, sdo_d,
-    # Strides for W
     sw_b, sw_n, sw_h, sw_lvl,
-    # Strides for V (Now separate from K)
     sv_b, sv_n, sv_h, sv_d,
-    # Strides for Lookup/Topology
     sl_n, sl_lvl,
-    # Strides for DS
     sds_b, sds_n, sds_h, sds_lvl,
-    
     sm_scale,
     H: tl.constexpr, BLOCK_H: tl.constexpr,
     D: tl.constexpr, BLOCK_D: tl.constexpr,
     LEVELS: tl.constexpr, BLOCK_LEVELS: tl.constexpr,
-    HAS_MASK: tl.constexpr # <--- Added Flag
+    HAS_MASK: tl.constexpr,
+    RADIUS: tl.constexpr, WINDOW_SIZE: tl.constexpr, N: tl.constexpr
 ):
     node_idx = tl.program_id(0)
     b_idx = tl.program_id(1)
-
+    
     h_idx = tl.arange(0, BLOCK_H)
     mask_h = h_idx < H
     offs_lvl = tl.arange(0, BLOCK_LEVELS)
     
-    # -----------------------------------------------------------
-    # 1. Mask Logic & Topology Load
-    # -----------------------------------------------------------
-    # Boundary Check: Are we within the max levels?
+    # 1. Topology Load
     mask_lvl_bounds = offs_lvl < LEVELS
     off_lookup = node_idx * sl_n + offs_lvl * sl_lvl
-    
     neighbor_indices = tl.load(Lookup_ptr + off_lookup, mask=mask_lvl_bounds, other=0)
 
-    # Combined Mask: (In Bounds) AND (Not Masked by User)
-    # Start with bounds
+    # Calculate Strict Mask (for math correctness)
     mask_valid_cross = mask_lvl_bounds
-    
     if HAS_MASK:
-        # Load User Mask (1 = Ignore/Masked, 0 = Keep)
         val_int8 = tl.load(Mask_ptr + off_lookup, mask=mask_lvl_bounds, other=1).to(tl.int8)
         mask_valid_cross = mask_valid_cross & (val_int8 == 0)
 
-    # -----------------------------------------------------------
-    # 2. Load Weights (W)
-    # -----------------------------------------------------------
+    # 2. Pointers
     w_base = W_ptr + (b_idx * sw_b) + (node_idx * sw_n) + (h_idx * sw_h)
+    ds_base = DS_ptr + (b_idx * sds_b) + (node_idx * sds_n) + (h_idx * sds_h)
     
-    # Self Weight
-    w_self = tl.load(w_base + (0 * sw_lvl), mask=mask_h, other=0.0)
-    
-    # Cross Weight
-    # DEFENSIVE: Apply mask_valid_cross. If masked, w_cross becomes 0.0.
-    w_cross = tl.load(w_base[:, None] + ((1 + offs_lvl[None, :]) * sw_lvl), 
-                      mask=mask_h[:, None] & mask_valid_cross[None, :], other=0.0)
-
-    # -----------------------------------------------------------
-    # 3. Compute dP = dot(dO, V)
-    # -----------------------------------------------------------
-    dp_self = tl.zeros([BLOCK_H], dtype=tl.float32)
-    dp_cross = tl.zeros([BLOCK_H, BLOCK_LEVELS], dtype=tl.float32)
-
-    # Use explicit SV strides for V pointer calculation
     v_batch_base = V_ptr + b_idx * sv_b
     do_batch_base = DO_ptr + (b_idx * sdo_b) + (node_idx * sdo_n)
     
-    off_node_self = node_idx * sv_n
-    off_node_cross = neighbor_indices * sv_n
+    # 3. Pre-load Weights
+    # Window Weights
+    offs_win = tl.arange(0, WINDOW_SIZE)
+    w_window_ptr = w_base[:, None] + (offs_win[None, :] * sw_lvl)
+    w_window_cache = tl.load(w_window_ptr, mask=mask_h[:, None], other=0.0)
 
-    for off_d in range(0, D, BLOCK_D):
-        offs_d = off_d + tl.arange(0, BLOCK_D)
-        mask_d = offs_d < D
-        mask_op = mask_h[:, None] & mask_d[None, :]
+    # Cross Weights
+    # We use strict mask here so we load 0.0 for invalid nodes
+    w_cross_ptr = w_base[:, None] + ((WINDOW_SIZE + offs_lvl[None, :]) * sw_lvl)
+    w_cross = tl.load(w_cross_ptr, mask=mask_h[:, None] & mask_valid_cross[None, :], other=0.0)
 
-        # Load dO
-        do = tl.load(do_batch_base + (h_idx[:, None]*sdo_h) + (offs_d[None, :]*sdo_d), 
-                     mask=mask_op, other=0.0)
-        
-        # Load V Self (using sv strides)
-        ptr_v_self = v_batch_base + off_node_self + (h_idx[:, None]*sv_h) + (offs_d[None, :]*sv_d)
-        v_self = tl.load(ptr_v_self, mask=mask_op, other=0.0)
-        
-        # Load V Cross (using sv strides)
-        ptr_v_cross = v_batch_base + off_node_cross[None, :, None] + \
-                      (h_idx[:, None, None]*sv_h) + (offs_d[None, None, :]*sv_d)
-        
-        # DEFENSIVE: Apply mask_valid_cross to V load.
-        # This prevents loading 'NaNs' or garbage from padding tokens.
-        mask_v_cross = mask_h[:, None, None] & mask_valid_cross[None, :, None] & mask_d[None, None, :]
-        v_cross = tl.load(ptr_v_cross, mask=mask_v_cross, other=0.0)
-
-        dp_self += tl.sum(do * v_self, axis=1)
-        dp_cross += tl.sum(do[:, None, :] * v_cross, axis=2)
-
-    # -----------------------------------------------------------
-    # 4. Compute dS (Softmax Gradient)
-    # -----------------------------------------------------------
-    sum_wdp = (w_self * dp_self) + tl.sum(w_cross * dp_cross, axis=1)
+    # 4. Merged D Loop (Efficiency: Single Pass over dO)
+    dp_window = tl.zeros([BLOCK_H, WINDOW_SIZE], dtype=tl.float32)
+    dp_cross = tl.zeros([BLOCK_H, BLOCK_LEVELS], dtype=tl.float32)
     
-    ds_self = w_self * (dp_self - sum_wdp) * sm_scale
-    ds_cross = w_cross * (dp_cross - sum_wdp[:, None]) * sm_scale
-
-    # -----------------------------------------------------------
-    # 5. Store dS
-    # -----------------------------------------------------------
-    ds_base = DS_ptr + (b_idx * sds_b) + (node_idx * sds_n) + (h_idx * sds_h)
-    
-    tl.store(ds_base + (0 * sds_lvl), ds_self, mask=mask_h)
-    
-    ds_cross_ptr = ds_base[:, None] + ((1 + offs_lvl[None, :]) * sds_lvl)
-    
-    # SAFE STORE: We use mask_lvl_bounds (bounds only), NOT mask_valid_cross.
-    # Why? If a node is masked, ds_cross is 0.0 (because w_cross was 0.0).
-    # We WANT to write this 0.0 to memory to overwrite any garbage in uninitialized DS.
-    # If we masked the store, DS would retain random values from empty_like().
-    tl.store(ds_cross_ptr, ds_cross, mask=mask_h[:, None] & mask_lvl_bounds[None, :])
-
-
-# ------------------------------------------------------------------
-#  Backward Kernel 2a: SPECIALIZED LEAF KERNEL (Level 0)
-# ------------------------------------------------------------------
-# Hardcoded for Level 0: 
-# - Self Interaction
-# - Single Neighbor Gather (Width=1)
-# - No Loops, No Branching overhead
-@triton.jit
-def hierarchical_attention_backward_dK_dV_leaf_kernel(
-    DS_ptr, Q_ptr, W_ptr, DO_ptr, Gather_Table_ptr,
-    DK_ptr, DV_ptr,
-    sds_b, sds_n, sds_h, sds_lvl,
-    sq_b, sq_n, sq_h, sq_d,
-    sw_b, sw_n, sw_h, sw_lvl,
-    sdo_b, sdo_n, sdo_h, sdo_d,
-    sdk_b, sdk_node, sdk_h, sdk_d,
-    sg_node, sg_dim,
-    H: tl.constexpr, BLOCK_H: tl.constexpr,
-    D: tl.constexpr, BLOCK_D: tl.constexpr
-):
-    node_id = tl.program_id(0)
-    b_idx = tl.program_id(1)
-
-    offs_h = tl.arange(0, BLOCK_H)
-    mask_h = offs_h < H
-
-    # -----------------------------------------------------------
-    # 1. Pre-Load DS and W (Invariant across D)
-    # -----------------------------------------------------------
-    # These are scalars per head, so we can load them once and reuse them
-    # for every chunk of D. This saves significant memory bandwidth.
-
-    # --- Self Pointers ---
-    off_ds = (b_idx * sds_b) + (node_id * sds_n)
-    off_w = (b_idx * sw_b) + (node_id * sw_n)
-    
-    ds_self = tl.load(DS_ptr + off_ds + (offs_h[:, None] * sds_h), mask=mask_h[:, None], other=0.0)
-    w_self = tl.load(W_ptr + off_w + (offs_h[:, None] * sw_h), mask=mask_h[:, None], other=0.0)
-
-    # --- Sibling Pointers & Check ---
-    tab_ptr = Gather_Table_ptr + (node_id * sg_node)
-    sibling_leaf = tl.load(tab_ptr + 0)
-    
-    has_sibling = (sibling_leaf != -1)
-    ds_sib = tl.zeros([BLOCK_H, 1], dtype=tl.float32)
-    w_sib = tl.zeros([BLOCK_H, 1], dtype=tl.float32)
-
-    if has_sibling:
-        w_idx = 1
-        off_ds_sib = (b_idx * sds_b) + (sibling_leaf * sds_n) + (w_idx * sds_lvl)
-        off_w_sib = (b_idx * sw_b) + (sibling_leaf * sw_n) + (w_idx * sw_lvl)
-        
-        ds_sib = tl.load(DS_ptr + off_ds_sib + (offs_h[:, None] * sds_h), mask=mask_h[:, None], other=0.0)
-        w_sib = tl.load(W_ptr + off_w_sib + (offs_h[:, None] * sw_h), mask=mask_h[:, None], other=0.0)
-
-    # -----------------------------------------------------------
-    # 2. Loop over Dimension D (The Fix)
-    # -----------------------------------------------------------
-    # We process D in chunks of BLOCK_D.
-    off_q = (b_idx * sq_b) + (node_id * sq_n)
-    off_do = (b_idx * sdo_b) + (node_id * sdo_n)
-    
-    # Sibling Q/dO Base Pointers
-    off_q_sib = (b_idx * sq_b) + (sibling_leaf * sq_n)
-    off_do_sib = (b_idx * sdo_b) + (sibling_leaf * sdo_n)
+    off_node_cross = neighbor_indices * sv_n 
 
     for off_d_start in range(0, D, BLOCK_D):
         offs_d = off_d_start + tl.arange(0, BLOCK_D)
         mask_d = offs_d < D
         mask_op = mask_h[:, None] & mask_d[None, :]
 
-        # --- Self Computation ---
-        q_self = tl.load(Q_ptr + off_q + (offs_h[:, None] * sq_h) + (offs_d[None, :] * sq_d), mask=mask_op, other=0.0)
-        do_self = tl.load(DO_ptr + off_do + (offs_h[:, None] * sdo_h) + (offs_d[None, :] * sdo_d), mask=mask_op, other=0.0)
-        
-        # dK = dS * Q | dV = W * dO
-        dk_acc = ds_self * q_self
-        dv_acc = w_self * do_self
+        # Load dO ONCE
+        do = tl.load(do_batch_base + (h_idx[:, None]*sdo_h) + (offs_d[None, :]*sdo_d), 
+                     mask=mask_op, other=0.0)
 
-        # --- Sibling Computation ---
-        if has_sibling:
-            q_sib = tl.load(Q_ptr + off_q_sib + (offs_h[:, None] * sq_h) + (offs_d[None, :] * sq_d), mask=mask_op, other=0.0)
-            do_sib = tl.load(DO_ptr + off_do_sib + (offs_h[:, None] * sdo_h) + (offs_d[None, :] * sdo_d), mask=mask_op, other=0.0)
+        # --- A. Accumulate Window dP ---
+        for w in tl.static_range(0, WINDOW_SIZE):
+            offset = w - RADIUS
+            neighbor_idx = node_idx + offset
             
-            #dk_acc += ds_sib * q_sib
-            #dv_acc += w_sib * do_sib
-            dk_acc += ds_sib * q_sib
-            dv_acc += w_sib * do_sib
+            is_valid_geom = (neighbor_idx >= 0) & (neighbor_idx < N)
+            safe_neighbor = tl.where(is_valid_geom, neighbor_idx, 0)
+            mask_load = mask_op & is_valid_geom
+            
+            ptr_v = v_batch_base + (safe_neighbor * sv_n) + \
+                    (h_idx[:, None] * sv_h) + (offs_d[None, :] * sv_d)
+            
+            v = tl.load(ptr_v, mask=mask_load, other=0.0)
+            dp_window[:, w] += tl.sum(do * v, axis=1)
 
-        # --- Store Chunk ---
-        off_out = (b_idx * sdk_b) + (node_id * sdk_node)
-        tl.store(DK_ptr + off_out + (offs_h[:, None] * sdk_h) + (offs_d[None, :] * sdk_d), dk_acc, mask=mask_op)
-        tl.store(DV_ptr + off_out + (offs_h[:, None] * sdk_h) + (offs_d[None, :] * sdk_d), dv_acc, mask=mask_op)
+        # --- B. Accumulate Cross dP ---
+        ptr_v_cross = v_batch_base + off_node_cross[None, :, None] + \
+                      (h_idx[:, None, None]*sv_h) + (offs_d[None, None, :]*sv_d)
+        
+        mask_v = mask_h[:, None, None] & mask_valid_cross[None, :, None] & mask_d[None, None, :]
+        v_cross = tl.load(ptr_v_cross, mask=mask_v, other=0.0)
+        
+        dp_cross += tl.sum(do[:, None, :] * v_cross, axis=2)
+
+    # 5. Compute Scaling Factor
+    sum_wdp = tl.sum(w_window_cache * dp_window, axis=1) + tl.sum(w_cross * dp_cross, axis=1)
+
+    # 6. Store Results
+    # Window Store
+    ds_window = w_window_cache * (dp_window - sum_wdp[:, None]) * sm_scale
+    ds_win_ptr = ds_base[:, None] + (offs_win[None, :] * sds_lvl)
+    tl.store(ds_win_ptr, ds_window, mask=mask_h[:, None])
+
+    # Cross Store
+    ds_cross = w_cross * (dp_cross - sum_wdp[:, None]) * sm_scale
+    ds_cross_ptr = ds_base[:, None] + ((WINDOW_SIZE + offs_lvl[None, :]) * sds_lvl)
+    
+    # [CRITICAL FIX] Use Wide Mask (mask_lvl_bounds).
+    # Since w_cross is 0.0 for masked nodes, ds_cross is 0.0.
+    # We MUST write this 0.0 to memory to overwrite the garbage from empty_like().
+    tl.store(ds_cross_ptr, ds_cross, mask=mask_h[:, None] & mask_lvl_bounds[None, :])
+
+
+# ------------------------------------------------------------------
+#  Backward Kernel 2a: SPECIALIZED window KERNEL (Level 0)
+# ------------------------------------------------------------------
+@triton.jit
+def hierarchical_attention_backward_dK_dV_window_kernel(
+    DS_ptr, Q_ptr, W_ptr, DO_ptr,
+    DK_ptr, DV_ptr,
+    sds_b, sds_n, sds_h, sds_lvl,
+    sq_b, sq_n, sq_h, sq_d,
+    sw_b, sw_n, sw_h, sw_lvl,
+    sdo_b, sdo_n, sdo_h, sdo_d,
+    sdk_b, sdk_n, sdk_h, sdk_d,
+    H: tl.constexpr, BLOCK_H: tl.constexpr,
+    D: tl.constexpr, BLOCK_D: tl.constexpr,
+    RADIUS: tl.constexpr, WINDOW_SIZE: tl.constexpr, N: tl.constexpr
+):
+    node_id = tl.program_id(0)
+    b_idx = tl.program_id(1)
+
+    # 1. Coordinate Setup
+    offs_h = tl.arange(0, BLOCK_H)
+    mask_h = offs_h < H
+    
+    # Base Pointers
+    off_out = (b_idx * sdk_b) + (node_id * sdk_n)
+    
+    # Base pointer parts for DS/W that don't depend on window/D
+    ds_base = DS_ptr + (b_idx * sds_b)
+    w_base  = W_ptr  + (b_idx * sw_b)
+    q_base  = Q_ptr  + (b_idx * sq_b)
+    do_base = DO_ptr + (b_idx * sdo_b)
+
+    # 2. Main Loop over D (Tiling D to keep registers manageable)
+    for off_d_start in range(0, D, BLOCK_D):
+        offs_d = off_d_start + tl.arange(0, BLOCK_D)
+        mask_d = offs_d < D
+        
+        # Combined Mask for Vector Loads [BLOCK_H, BLOCK_D]
+        mask_op = mask_h[:, None] & mask_d[None, :]
+
+        dk_acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
+        dv_acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
+
+        # 3. Window Accumulation Loop
+        for w in tl.static_range(0, WINDOW_SIZE):
+            offset = w - RADIUS
+            source_idx = node_id - offset 
+
+            # A. Validity
+            is_valid_geom = (source_idx >= 0) & (source_idx < N)
+            
+            # [Optimization] Early continue logic isn't possible in Triton static loops easily
+            # without complex masking. We use the 'safe index + mask' pattern.
+            
+            safe_src = tl.where(is_valid_geom, source_idx, 0)
+            
+            # B. Masks
+            # Scalar mask for DS/W (broadcasting over Head)
+            # Use 'is_valid_geom' (scalar) broadcasted
+            mask_scalar = mask_h[:, None] & is_valid_geom
+            
+            # Vector mask for Q/dO
+            mask_vec = mask_op & is_valid_geom
+
+            # C. Load Scalars (DS, W)
+            # off: [Batch] + [Source] + [Window_Index] + [Head]
+            off_ds = ds_base + (safe_src * sds_n) + (w * sds_lvl) + (offs_h[:, None] * sds_h)
+            off_w  = w_base  + (safe_src * sw_n)  + (w * sw_lvl)  + (offs_h[:, None] * sw_h)
+            
+            ds_val = tl.load(off_ds, mask=mask_scalar, other=0.0)
+            w_val  = tl.load(off_w,  mask=mask_scalar, other=0.0)
+
+            # D. Load Vectors (Q, dO)
+            # off: [Batch] + [Source] + [Head] + [D]
+            off_q  = q_base  + (safe_src * sq_n)  + (offs_h[:, None] * sq_h)  + (offs_d[None, :] * sq_d)
+            off_do = do_base + (safe_src * sdo_n) + (offs_h[:, None] * sdo_h) + (offs_d[None, :] * sdo_d)
+
+            q_src  = tl.load(off_q,  mask=mask_vec, other=0.0)
+            do_src = tl.load(off_do, mask=mask_vec, other=0.0)
+
+            # E. Fused Multiply Add (FMA)
+            # dk += ds (scalar_broadcast) * q (vector)
+            dk_acc += ds_val * q_src
+            dv_acc += w_val * do_src
+
+        # 4. Store Tile
+        ptr_dk = DK_ptr + off_out + (offs_h[:, None] * sdk_h) + (offs_d[None, :] * sdk_d)
+        ptr_dv = DV_ptr + off_out + (offs_h[:, None] * sdk_h) + (offs_d[None, :] * sdk_d)
+        
+        tl.store(ptr_dk, dk_acc, mask=mask_op)
+        tl.store(ptr_dv, dv_acc, mask=mask_op)
 
 
 # ------------------------------------------------------------------
@@ -654,106 +701,119 @@ def hierarchical_attention_backward_high_level_kernel(
 @triton.jit
 def hierarchical_attention_backward_dQ_kernel(
     DS_ptr, K_ptr, Lookup_ptr, DQ_ptr, Mask_ptr,
+    # Strides
     sds_b, sds_n, sds_h, sds_lvl,
     sk_b, sk_n, sk_h, sk_d,
     sl_n, sl_lvl,
     sdq_b, sdq_n, sdq_h, sdq_d,
+    # Constants
     H: tl.constexpr, BLOCK_H: tl.constexpr,
-    D: tl.constexpr, 
-    BLOCK_D: tl.constexpr,
+    D: tl.constexpr, BLOCK_D: tl.constexpr,
     LEVELS: tl.constexpr, 
-    HAS_MASK: tl.constexpr
+    HAS_MASK: tl.constexpr,
+    RADIUS: tl.constexpr, WINDOW_SIZE: tl.constexpr, N: tl.constexpr
 ):
     node_idx = tl.program_id(0)
     b_idx = tl.program_id(1)
-
-    h_idx = tl.arange(0, BLOCK_H)
-    mask_h = h_idx < H
-
-    # -----------------------------------------------------------
-    # 1. Pre-calculate Base Pointers
-    # -----------------------------------------------------------
-    # DS Base: [Node, Head]
-    ds_base = DS_ptr + (b_idx * sds_b) + (node_idx * sds_n) + (h_idx * sds_h)
     
-    # DQ Base: [Node, Head]
-    dq_base = DQ_ptr + (b_idx * sdq_b) + (node_idx * sdq_n) + (h_idx[:, None] * sdq_h)
+    # 1. Coordinate Setup [FIX: Define offs_h explicitly]
+    offs_h = tl.arange(0, BLOCK_H)
+    mask_h = offs_h < H
 
+    # 2. Base Pointers (Using offs_h, not h_idx)
+    # DS Base: [Node, Head]
+    ds_base = DS_ptr + (b_idx * sds_b) + (node_idx * sds_n) + (offs_h[:, None] * sds_h)
+    
     # K Batch Base: [Batch]
     k_batch_base = K_ptr + b_idx * sk_b
-
-    # Pre-load Self DS (reused across D loop)
-    # Shape: [BLOCK_H]
-    ds_self = tl.load(ds_base + (0 * sds_lvl), mask=mask_h, other=0.0)
+    
+    # DQ Base: [Node, Head]
+    dq_base = DQ_ptr + (b_idx * sdq_b) + (node_idx * sdq_n) + (offs_h[:, None] * sdq_h)
 
     # -----------------------------------------------------------
-    # 2. Outer Loop over D (Chunked for Registers)
+    # Outer Loop over D (Chunked for Registers)
     # -----------------------------------------------------------
     for off_d_start in range(0, D, BLOCK_D):
         offs_d = off_d_start + tl.arange(0, BLOCK_D)
         mask_d = offs_d < D
+        
+        # Combined Mask for Vector Loads [BLOCK_H, BLOCK_D]
         mask_op = mask_h[:, None] & mask_d[None, :]
 
-        # -------------------------------------------------------
-        # A. Process Self (Level 0)
-        # -------------------------------------------------------
-        # K Self Pointer: [Node, Head, D_Chunk]
-        off_k_self = (node_idx * sk_n) + \
-                     (h_idx[:, None] * sk_h) + \
-                     (offs_d[None, :] * sk_d)
-                     
-        k_self = tl.load(k_batch_base + off_k_self, mask=mask_op, other=0.0)
-
-        # Init Accumulator (FP32 for Precision)
-        # dQ = dS_self * K_self
-        dq_acc = ds_self[:, None].to(tl.float32) * k_self.to(tl.float32)
+        dq_acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
 
         # -------------------------------------------------------
-        # B. Inner Loop over Levels (The Optimization)
+        # A. Window Loop (Replaces Self/Level 0)
+        # -------------------------------------------------------
+        for w in tl.static_range(0, WINDOW_SIZE):
+            offset = w - RADIUS
+            neighbor_idx = node_idx + offset
+            
+            # Validity Check
+            is_valid_geom = (neighbor_idx >= 0) & (neighbor_idx < N)
+            
+            # Safe Indexing (Avoid Negative Pointers)
+            safe_neighbor = tl.where(is_valid_geom, neighbor_idx, 0)
+            
+            # Masks
+            # Scalar mask for dS (Head only)
+            # [CRITICAL FIX] We MUST mask dS load with geometry to avoid reading 
+            # garbage/zeros from invalid window slots that weren't written to.
+            mask_scalar = mask_h[:, None] & is_valid_geom
+            
+            # Vector mask for K (Head & D)
+            mask_vec = mask_op & is_valid_geom
+
+            # 1. Load dS for this window position [BLOCK_H]
+            # DS Index is exactly 'w'
+            ds_val = tl.load(ds_base + (w * sds_lvl), mask=mask_scalar, other=0.0)
+
+            # 2. Load K from neighbor [BLOCK_H, BLOCK_D]
+            # Use offs_h (not h_idx)
+            off_k = (safe_neighbor * sk_n) + (offs_h[:, None] * sk_h) + (offs_d[None, :] * sk_d)
+            k_val = tl.load(k_batch_base + off_k, mask=mask_vec, other=0.0)
+
+            # 3. Accumulate
+            dq_acc += ds_val * k_val
+
+        # -------------------------------------------------------
+        # B. Hierarchy Loop (Updated Offsets)
         # -------------------------------------------------------
         for lvl_idx in range(LEVELS):
-            # 1. Load Topology for this level
+            # 1. Load Topology
             off_lookup = node_idx * sl_n + lvl_idx * sl_lvl
             
-            # Since 'node_idx' and 'lvl_idx' are valid, no mask needed for lookup
-            p_idx = tl.load(Lookup_ptr + off_lookup)
-
-            # 2. Check Validity (Mask + Topology)
+            # [Minor Safety] Mask the topology load for consistency
+            # Since lvl_idx < LEVELS (constexpr), this is safe, but clean.
+            mask_lvl = lvl_idx < LEVELS
+            p_idx = tl.load(Lookup_ptr + off_lookup, mask=mask_lvl, other=-1)
+            
+            # 2. Check Validity
             is_valid = (p_idx != -1)
             if HAS_MASK:
-                mask_val = tl.load(Mask_ptr + off_lookup).to(tl.int8)
+                mask_val = tl.load(Mask_ptr + off_lookup, mask=mask_lvl, other=1).to(tl.int8)
                 is_valid = is_valid & (mask_val == 0)
 
-            # 3. Load dS for this level [BLOCK_H]
-            # Offset: (lvl + 1) because level 0 is Self
-            ds_ptr_lvl = ds_base + ((lvl_idx + 1) * sds_lvl)
+            # 3. Load dS for this hierarchy level
+            # [CRITICAL UPDATE] Offset is now WINDOW_SIZE + lvl_idx
+            ds_cross_ptr = ds_base + ((WINDOW_SIZE + lvl_idx) * sds_lvl)
             
-            # Mask logic: Head must be valid AND Edge must be valid
-            mask_load = mask_h & is_valid
-            
-            ds_cross = tl.load(ds_ptr_lvl, mask=mask_load, other=0.0)
+            # Strictly mask dS load with is_valid
+            ds_cross = tl.load(ds_cross_ptr, mask=mask_h[:, None] & is_valid, other=0.0)
 
-            # 4. Load K for this Parent [BLOCK_H, BLOCK_D]
-            # Safe Parent Index (redirect invalid to 0)
+            # 4. Load K for this Parent
             safe_p_idx = tl.where(is_valid, p_idx, 0)
-            
-            # Pointer: [Parent_Node, Head, D_Chunk]
-            off_k_cross = (safe_p_idx * sk_n) + \
-                          (h_idx[:, None] * sk_h) + \
-                          (offs_d[None, :] * sk_d)
-            
-            # Mask logic for K: (Head & Valid_Edge & Dim)
-            mask_k = mask_load[:, None] & mask_d[None, :]
-            
+            mask_k = mask_op & is_valid
+
+            # Use offs_h (not h_idx)
+            off_k_cross = (safe_p_idx * sk_n) + (offs_h[:, None] * sk_h) + (offs_d[None, :] * sk_d)
             k_cross = tl.load(k_batch_base + off_k_cross, mask=mask_k, other=0.0)
 
-            # 5. Accumulate (FP32)
-            # dq += dS_cross * K_cross
-            dq_acc += ds_cross[:, None].to(tl.float32) * k_cross.to(tl.float32)
+            # 5. Accumulate
+            dq_acc += ds_cross * k_cross
 
         # -------------------------------------------------------
         # C. Write Result
         # -------------------------------------------------------
-        # Cast back to original dtype
         off_dq_out = offs_d[None, :] * sdq_d
         tl.store(dq_base + off_dq_out, dq_acc.to(DQ_ptr.dtype.element_ty), mask=mask_op)

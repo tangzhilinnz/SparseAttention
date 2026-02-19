@@ -233,35 +233,74 @@ import matplotlib.pyplot as plt
 
 import matplotlib.pyplot as plt
 
+## --- SHARED X-AXIS ---
+#lrs = [0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0]
+#
+## --- DATA FOR DEPTH 3 (Orange) ---
+#train_loss_3 = [1.3951, 1.3420, 1.2514, 1.2507, 1.2500, 1.2146, 1.2368, 1.2175, 1.2431, 1.2306]
+#test_loss_3  = [1.3905, 1.3423, 1.2551, 1.2603, 1.2468, 1.2164, 1.2336, 1.2238, 1.2430, 1.2377]
+#valid_loss_3 = [1.3766, 1.3161, 1.2153, 1.2272, 1.2078, 1.1744, 1.1895, 1.1840, 1.2036, 1.1979]
+#
+#train_acc_3  = [0.4884, 0.5096, 0.5487, 0.5457, 0.5491, 0.5592, 0.5525, 0.5582, 0.5491, 0.5536]
+#test_acc_3   = [0.4902, 0.5031, 0.5451, 0.5384, 0.5405, 0.5636, 0.5545, 0.5553, 0.5457, 0.5489]
+#valid_acc_3  = [0.4922, 0.5113, 0.5638, 0.5596, 0.5641, 0.5807, 0.5695, 0.5779, 0.5656, 0.5684]
+#
+## --- DATA FOR DEPTH 6 (Red) ---
+#train_loss_6 = [1.3756, 1.2961, 1.2495, 1.2118, 1.1738, 1.1564, 1.1550, 1.1683, 1.1512, 1.1538]
+#test_loss_6  = [1.3677, 1.2940, 1.2579, 1.2101, 1.1851, 1.1682, 1.1672, 1.1802, 1.1660, 1.1783]
+#valid_loss_6 = [1.3479, 1.2630, 1.2318, 1.1794, 1.1449, 1.1323, 1.1354, 1.1454, 1.1388, 1.1448]
+#
+#train_acc_6  = [0.4962, 0.5310, 0.5461, 0.5597, 0.5744, 0.5804, 0.5802, 0.5767, 0.5817, 0.5841]
+#test_acc_6   = [0.5055, 0.5315, 0.5471, 0.5660, 0.5700, 0.5766, 0.5768, 0.5725, 0.5785, 0.5744]
+#valid_acc_6  = [0.5133, 0.5440, 0.5554, 0.5800, 0.5889, 0.5955, 0.5948, 0.5903, 0.5937, 0.5808]
+#
+## --- DATA FOR DEPTH 9 (Purple) ---
+#train_loss_9 = [1.3789, 1.3177, 1.2802, 1.2588, 1.2555, 1.2096, 1.2095, 1.2037, 1.1407, 1.1463]
+#test_loss_9  = [1.3391, 1.3087, 1.2725, 1.2527, 1.2478, 1.2144, 1.2182, 1.2277, 1.1804, 1.1971]
+#valid_loss_9 = [1.3245, 1.2874, 1.2467, 1.2247, 1.2221, 1.1844, 1.1878, 1.1936, 1.1466, 1.1539]
+#
+#train_acc_9  = [0.4920, 0.5204, 0.5356, 0.5466, 0.5510, 0.5659, 0.5686, 0.5664, 0.5915, 0.5865]
+#test_acc_9   = [0.5130, 0.5246, 0.5404, 0.5447, 0.5525, 0.5596, 0.5595, 0.5594, 0.5774, 0.5636]
+#valid_acc_9  = [0.5166, 0.5281, 0.5457, 0.5628, 0.5595, 0.5770, 0.5728, 0.5713, 0.5990, 0.5869]
+
 # --- SHARED X-AXIS ---
 lrs = [0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0]
 
 # --- DATA FOR DEPTH 3 (Orange) ---
-train_loss_3 = [1.3951, 1.3712, 1.2514, 1.2507, 1.2402, 1.2146, 1.2368, 1.2175, 1.2431, 1.2306]
-test_loss_3  = [1.3905, 1.3691, 1.2551, 1.2603, 1.2450, 1.2164, 1.2336, 1.2238, 1.2430, 1.2377]
-train_acc_3  = [0.4884, 0.4981, 0.5487, 0.5457, 0.5482, 0.5592, 0.5525, 0.5582, 0.5491, 0.5536]
-test_acc_3   = [0.4902, 0.5046, 0.5451, 0.5384, 0.5464, 0.5636, 0.5545, 0.5553, 0.5457, 0.5489]
+train_loss_3 = [1.6670, 1.4562, 1.4215, 1.4178, 1.4172, 1.4028, 1.3988, 1.3822, 1.3515, 1.3468]
+test_loss_3  = [1.6097, 1.4451, 1.3998, 1.3909, 1.3802, 1.3656, 1.3579, 1.3445, 1.3232, 1.3249]
+valid_loss_3 = [1.6134, 1.4323, 1.3853, 1.3803, 1.3713, 1.3570, 1.3488, 1.3332, 1.3088, 1.3084]
+
+train_acc_3  = [0.3797, 0.4630, 0.4782, 0.4831, 0.4864, 0.4916, 0.4935, 0.4994, 0.5068, 0.5099]
+test_acc_3   = [0.4055, 0.4782, 0.4915, 0.4996, 0.5055, 0.5087, 0.5153, 0.5208, 0.5256, 0.5222]
+valid_acc_3  = [0.4080, 0.4776, 0.4906, 0.4995, 0.5033, 0.5132, 0.5149, 0.5133, 0.5219, 0.5263]
 
 # --- DATA FOR DEPTH 6 (Red) ---
-train_loss_6 = [1.3756, 1.2961, 1.2495, 1.2118, 1.1738, 1.1564, 1.1550, 1.1683, 1.1512, 1.1273]
-test_loss_6  = [1.3677, 1.2940, 1.2579, 1.2101, 1.1851, 1.1682, 1.1672, 1.1802, 1.1660, 1.1670]
-train_acc_6  = [0.4962, 0.5310, 0.5461, 0.5597, 0.5744, 0.5804, 0.5802, 0.5767, 0.5817, 0.5925]
-test_acc_6   = [0.5055, 0.5315, 0.5471, 0.5660, 0.5700, 0.5766, 0.5768, 0.5725, 0.5785, 0.5803]
+train_loss_6 = [1.5954, 1.4802, 1.4308, 1.3985, 1.3408, 1.3221, 1.2839, 1.2815, 1.2821, 1.2853]
+test_loss_6  = [1.5193, 1.3957, 1.3900, 1.3404, 1.3360, 1.3137, 1.2789, 1.2800, 1.2767, 1.2867]
+valid_loss_6 = [1.5120, 1.3844, 1.3724, 1.3212, 1.3118, 1.2849, 1.2494, 1.2527, 1.2437, 1.2535]
+
+train_acc_6  = [0.4014, 0.4509, 0.4743, 0.4866, 0.5096, 0.5208, 0.5323, 0.5390, 0.5400, 0.5281]
+test_acc_6   = [0.4342, 0.4861, 0.4906, 0.5118, 0.5139, 0.5285, 0.5365, 0.5374, 0.5363, 0.5311]
+valid_acc_6  = [0.4473, 0.4946, 0.5011, 0.5250, 0.5185, 0.5411, 0.5501, 0.5520, 0.5536, 0.5435]
 
 # --- DATA FOR DEPTH 9 (Purple) ---
-train_loss_9 = [1.3789, 1.3219, 1.2802, 1.2596, 1.2555, 1.2096, 1.2033, 1.2037, 1.1407, 1.1720]
-test_loss_9  = [1.3391, 1.3163, 1.2725, 1.2512, 1.2478, 1.2144, 1.2265, 1.2277, 1.1804, 1.2029]
-train_acc_9  = [0.4920, 0.5187, 0.5356, 0.5404, 0.5510, 0.5659, 0.5637, 0.5664, 0.5915, 0.5785]
-test_acc_9   = [0.5130, 0.5252, 0.5404, 0.5496, 0.5525, 0.5596, 0.5603, 0.5594, 0.5774, 0.5660]
+train_loss_9 = [1.5153, 1.4166, 1.3759, 1.3361, 1.3168, 1.3297, 1.2935, 1.2876, 1.2661, 1.2609]
+test_loss_9  = [1.4846, 1.3958, 1.3517, 1.3138, 1.3048, 1.2929, 1.2895, 1.2877, 1.2747, 1.2823]
+valid_loss_9 = [1.4746, 1.3784, 1.3314, 1.2899, 1.2785, 1.2666, 1.2674, 1.2633, 1.2455, 1.2529]
+
+train_acc_9  = [0.4357, 0.4746, 0.4894, 0.5071, 0.5126, 0.5123, 0.5281, 0.5248, 0.5341, 0.5371]
+test_acc_9   = [0.4554, 0.4891, 0.5049, 0.5152, 0.5176, 0.5261, 0.5303, 0.5273, 0.5354, 0.5313]
+valid_acc_9  = [0.4628, 0.4953, 0.5038, 0.5297, 0.5336, 0.5361, 0.5421, 0.5383, 0.5371, 0.5390]
 
 
 def plot_metric(y1, y2, y3, ylabel_text, ylim_range, legend_loc='best'):
     plt.figure(figsize=(10, 6))
     
-    # Plot depths with consistent styling
-    plt.plot(lrs, y1, color='orange', marker='o', markersize=6, linewidth=2.0, label='Depth=3')
-    plt.plot(lrs, y2, color='red', marker='o', markersize=6, linewidth=2.0, label='Depth=6')
-    plt.plot(lrs, y3, color='purple', marker='o', markersize=6, linewidth=2.0, label='Depth=9')
+    # Plot depths with reduced thickness and dot size
+    plt.plot(lrs, y1, color='orange', marker='o', markersize=4, linewidth=1.0, label='Depth=3')
+    plt.plot(lrs, y2, color='red', marker='o', markersize=4, linewidth=1.0, label='Depth=6')
+    plt.plot(lrs, y3, color='purple', marker='o', markersize=4, linewidth=1.0, label='Depth=9')
     
     # Labeling
     plt.xlabel('Learning Rate', fontsize=18, fontweight='bold')
@@ -279,7 +318,7 @@ def plot_metric(y1, y2, y3, ylabel_text, ylim_range, legend_loc='best'):
     if ylim_range:
         plt.ylim(ylim_range)
     
-    # Border styling
+    # Border styling (Keeping the outer box border intact)
     ax = plt.gca()
     for spine in ax.spines.values():
         spine.set_linewidth(2.0)
@@ -289,14 +328,20 @@ def plot_metric(y1, y2, y3, ylabel_text, ylim_range, legend_loc='best'):
 
 # --- GENERATE PLOTS WITH NEW RANGES ---
 
-# 1. Train Loss (Range: 1.1 - 1.45)
-plot_metric(train_loss_3, train_loss_6, train_loss_9, 'Train Loss', ylim_range=(1.1, 1.45), legend_loc='upper right')
+# 1. Train Loss (Range: 1.20 - 1.70)
+plot_metric(train_loss_3, train_loss_6, train_loss_9, 'Train Loss', ylim_range=(1.20, 1.70), legend_loc='upper right')
 
-# 2. Test Loss (Range: 1.1 - 1.45)
-plot_metric(test_loss_3, test_loss_6, test_loss_9, 'Test Loss', ylim_range=(1.1, 1.45), legend_loc='upper right')
+# 2. Test Loss (Range: 1.20 - 1.70)
+plot_metric(test_loss_3, test_loss_6, test_loss_9, 'Test Loss', ylim_range=(1.20, 1.70), legend_loc='upper right')
 
-# 3. Train Accuracy (Range: 0.45 - 0.62)
-plot_metric(train_acc_3, train_acc_6, train_acc_9, 'Train Accuracy', ylim_range=(0.45, 0.62), legend_loc='lower right')
+# 3. Valid Loss (Range: 1.20 - 1.70)
+plot_metric(valid_loss_3, valid_loss_6, valid_loss_9, 'Valid Loss', ylim_range=(1.20, 1.70), legend_loc='upper right')
 
-# 4. Test Accuracy (Range: 0.45 - 0.62)
-plot_metric(test_acc_3, test_acc_6, test_acc_9, 'Test Accuracy', ylim_range=(0.45, 0.62), legend_loc='lower right')
+# 4. Train Accuracy (Range: 0.35 - 0.58)
+plot_metric(train_acc_3, train_acc_6, train_acc_9, 'Train Accuracy', ylim_range=(0.35, 0.58), legend_loc='lower right')
+
+# 5. Test Accuracy (Range: 0.35 - 0.58)
+plot_metric(test_acc_3, test_acc_6, test_acc_9, 'Test Accuracy', ylim_range=(0.35, 0.58), legend_loc='lower right')
+
+# 6. Valid Accuracy (Range: 0.35 - 0.58)
+plot_metric(valid_acc_3, valid_acc_6, valid_acc_9, 'Valid Accuracy', ylim_range=(0.35, 0.58), legend_loc='lower right')
