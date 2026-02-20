@@ -177,8 +177,16 @@ def hierarchical_attention_forward_kernel(
             v_val = tl.load(ptr_v_win, mask=mask_win_v, other=0.0)
             
             # Extract the column first
-            w_val = w_window[:, w]
-            # Then broadcast and multiply on a new line
+            v_val = tl.load(ptr_v_win, mask=mask_win_v, other=0.0)
+            
+            # 1. Create a mask for the exact column w
+            mask_w = (tl.arange(0, BLOCK_WINDOW) == w)[None, :]
+            
+            # 2. Extract column w by zeroing everything else and summing along the window axis
+            # This cleanly extracts a [BLOCK_H] shape tensor
+            w_val = tl.sum(tl.where(mask_w, w_window, 0.0), axis=1)
+            
+            # 3. Broadcast to [BLOCK_H, BLOCK_D] and multiply
             out_acc += w_val[:, None] * v_val
 
         ptr_v_cross = v_batch_base + off_node_cross[None, :, None] + \
