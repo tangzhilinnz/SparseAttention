@@ -113,7 +113,6 @@ class BuildParentNodesFunc(torch.autograd.Function):
 class HierarchicalAttentionFunc(torch.autograd.Function):
     @staticmethod
     def forward(ctx, Q, K, V, idx_table, gather_table, mask_table=None, window_size=16):
-        # Alignment checks
         Q = Q.contiguous(); K = K.contiguous(); V = V.contiguous()
         idx_table = idx_table.contiguous()
         if mask_table is not None:
@@ -122,19 +121,17 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         B, N, H, D = Q.shape
         LEVELS = idx_table.shape[1]
 
-        # Window Logic
         RADIUS = window_size
         WINDOW_TOTAL_WIDTH = 2 * RADIUS + 1
         
-        Out = torch.empty_like(Q)
+        # [NEW] Calculate padded block window size for Triton allocations
+        BLOCK_WINDOW = triton.next_power_of_2(WINDOW_TOTAL_WIDTH)
         
-        # Weights Tensor: [B, N, H, Window_Width + Hierarchy_Levels]
-        # Stores attention weights for backward pass
-        # Weights = torch.empty((B, N, H, 1 + LEVELS), device=Q.device, dtype=torch.float32)
+        Out = torch.empty_like(Q)
         Weights = torch.empty((B, N, H, WINDOW_TOTAL_WIDTH + LEVELS), device=Q.device, dtype=torch.float32)
         
         HAS_MASK = (mask_table is not None)
-        mask_ptr_safe = mask_table if HAS_MASK else Q # Dummy ptr
+        mask_ptr_safe = mask_table if HAS_MASK else Q
         
         grid = (N, B)
         BLOCK_H = triton.next_power_of_2(H)
@@ -142,7 +139,6 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         BLOCK_D = min(64, triton.next_power_of_2(D))
         sm_scale = 1.0 / math.sqrt(D)
         
-        # FIXED: Added 'tri_attn.' prefix
         tri_attn.hierarchical_attention_forward_kernel[grid](
             Q, K, V,
             idx_table, mask_ptr_safe,
@@ -156,6 +152,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             H=H, BLOCK_H=BLOCK_H,
             D=D, LEVELS=LEVELS,
             BLOCK_D=BLOCK_D, BLOCK_LEVELS=BLOCK_LEVELS,
+            BLOCK_WINDOW=BLOCK_WINDOW, # [NEW] Injecting padded size
             HAS_MASK=HAS_MASK,
             RADIUS=RADIUS,
             N=N,
@@ -163,34 +160,33 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         )
         
         ctx.save_for_backward(Q, K, V, idx_table, gather_table, Weights, mask_table)
-        ctx.constants = (sm_scale, H, BLOCK_H, D, BLOCK_D, LEVELS, BLOCK_LEVELS, RADIUS, WINDOW_TOTAL_WIDTH)
+        # [NEW] Saving BLOCK_WINDOW to ctx
+        ctx.constants = (sm_scale, H, BLOCK_H, D, BLOCK_D, LEVELS, BLOCK_LEVELS, RADIUS, WINDOW_TOTAL_WIDTH, BLOCK_WINDOW)
         return Out
-
 
     @staticmethod
     def backward(ctx, grad_output):
-        # 1. Retrieve Tensors
         Q, K, V, idx_table, gather_table, Weights, mask_table = ctx.saved_tensors
-        sm_scale, H, BLOCK_H, D, BLOCK_D, LEVELS, BLOCK_LEVELS, RADIUS, WINDOW_SIZE = ctx.constants
+        # [NEW] Unpack BLOCK_WINDOW
+        sm_scale, H, BLOCK_H, D, BLOCK_D, LEVELS, BLOCK_LEVELS, RADIUS, WINDOW_SIZE, BLOCK_WINDOW = ctx.constants
 
-        # View as 4D
         grad_output = grad_output.contiguous()
         B, N = Q.shape[0], Q.shape[1]
         grad_output_4d = grad_output.view(B, N, H, D)
         
-        # 2. Compute dS (Main Stream)
         DS = torch.empty_like(Weights)
         grid_ds = (N, B)
         HAS_MASK = (mask_table is not None)
         mask_ptr_safe = mask_table if HAS_MASK else Weights
         
-        # FIXED: Added 'tri_attn.' prefix
         tri_attn.hierarchical_attention_backward_dS_kernel[grid_ds](
             grad_output_4d, Weights, V, idx_table, DS, mask_ptr_safe,
             *grad_output_4d.stride(), *Weights.stride(), *V.stride(), 
             *idx_table.stride(), *DS.stride(),            
             sm_scale, H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=32, 
-            LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS, HAS_MASK=HAS_MASK,
+            LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS, 
+            BLOCK_WINDOW=BLOCK_WINDOW, # [NEW] Injecting padded size
+            HAS_MASK=HAS_MASK,
             RADIUS=RADIUS, WINDOW_SIZE=WINDOW_SIZE, N=N,
             num_warps=2
         )
