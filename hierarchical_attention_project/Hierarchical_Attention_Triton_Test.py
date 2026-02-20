@@ -597,12 +597,12 @@ def run_full_suite_update_X_from_Y():
 
     # 1. Setup Dimensions for Correctness
     # B, N, D, H = 1, 2048 * 128, 64, 16
-    B, N, D, H = 16, 2048, 64, 16
+    B, N, D, H = 16, 2048 * 16, 64, 16
     # B, N, D, H = 2, 2048 * 32, 64, 16
     # B, N, D, H = 2, 64, 64, 16
     # B, N, D, H = 16, 256, 64, 16
     dim = H * D
-    window_size_set = 64
+    window_size_set = 32
 
     # 2. Initialize Model (Dropout=0.0 for deterministic check)
     model_ref = HierarchicalSparseAttentionRef(dim, H, dropout=0.0, window_size=window_size_set).cuda().to(check_dtype)
