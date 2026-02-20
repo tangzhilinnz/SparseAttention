@@ -85,7 +85,10 @@ def hierarchical_attention_forward_kernel(
             k_val = tl.load(ptr_k_win, mask=mask_win_load, other=0.0)
             
             score = tl.sum(q * k_val, axis=1)
-            acc_window[:, w] += score
+            # Create a [1, BLOCK_WINDOW] mask that is True only at column w
+            mask_w = (tl.arange(0, BLOCK_WINDOW) == w)[None, :]
+            # Update the whole tensor using tl.where
+            acc_window = tl.where(mask_w, acc_window + score[:, None], acc_window)
 
         # 4.2. HIERARCHICAL CROSS LOOP
         ptr_k_cross = k_batch_base + off_node_cross[None, :, None] + \
@@ -118,7 +121,9 @@ def hierarchical_attention_forward_kernel(
         if HAS_MASK:
             should_mask = should_mask | (~is_causal)
         
-        acc_window[:, w] = tl.where(should_mask, -float('inf'), acc_window[:, w])
+        mask_w = (tl.arange(0, BLOCK_WINDOW) == w)[None, :]
+        # Apply -inf only where the column matches `w` AND it should be masked
+        acc_window = tl.where(mask_w & should_mask, -float('inf'), acc_window)
 
     mask_broadcast = (offs_lvl >= LEVELS)
     if HAS_MASK:
@@ -260,7 +265,10 @@ def hierarchical_attention_backward_dS_kernel(
                     (h_idx[:, None] * sv_h) + (offs_d[None, :] * sv_d)
             
             v = tl.load(ptr_v, mask=mask_load, other=0.0)
-            dp_window[:, w] += tl.sum(do * v, axis=1)
+            score_dp = tl.sum(do * v, axis=1)
+            
+            mask_w = (tl.arange(0, BLOCK_WINDOW) == w)[None, :]
+            dp_window = tl.where(mask_w, dp_window + score_dp[:, None], dp_window)
 
         ptr_v_cross = v_batch_base + off_node_cross[None, :, None] + \
                       (h_idx[:, None, None]*sv_h) + (offs_d[None, None, :]*sv_d)
