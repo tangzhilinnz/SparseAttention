@@ -175,7 +175,11 @@ def hierarchical_attention_forward_kernel(
                         (h_idx[:, None] * sv_h) + (cur_offs_d[None, :] * sv_d)
             
             v_val = tl.load(ptr_v_win, mask=mask_win_v, other=0.0)
-            out_acc += w_window[:, w][:, None] * v_val
+            
+            # Extract the column first
+            w_val = w_window[:, w]
+            # Then broadcast and multiply on a new line
+            out_acc += w_val[:, None] * v_val
 
         ptr_v_cross = v_batch_base + off_node_cross[None, :, None] + \
                       (h_idx[:, None, None] * sv_h) + (cur_offs_d[None, None, :] * sv_d)
