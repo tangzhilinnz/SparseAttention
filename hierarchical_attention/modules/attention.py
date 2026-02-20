@@ -215,7 +215,9 @@ class HierarchicalAttention(nn.Module):
             self.window_size
         )
     
-        return output_leaf_heads.view(B, N, D)
+        #return output_leaf_heads.view(B, N, D)
+        out_fused = output_leaf_heads.view(B, N, D)
+        return self.out_proj_x(out_fused)
 
     def _standard_attention(self, Q, K, V, mask):
         # Q, K, V are already [B, H, N, Dh]
@@ -248,8 +250,10 @@ class HierarchicalAttention(nn.Module):
         if L_Q == L_K == L_V and y is not None:
             # Hierarchical Update
             output_leaf = self.update_X_from_Y(x, y, mask)
-            output = self.out_proj_x(output_leaf)
+            #output = self.out_proj_x(output_leaf)
+            output = output_leaf # It is already projected now!
             return (output, None) if return_attention else output
+
         else:
             # Standard Attention Fallback
             # --- Inline Split ---
