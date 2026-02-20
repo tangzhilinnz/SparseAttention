@@ -306,7 +306,7 @@ class HierarchicalSparseAttentionRef(nn.Module):
         # ---------------------------------------------------------
         # 2. HIERARCHICAL NEIGHBOR LOGITS
         # ---------------------------------------------------------
-        idx_table, _ = self._get_lookup_table(N, device=x.device)
+        idx_table, hier_causal_mask = self._get_lookup_table(N, device=x.device)
         
         # Gather Hierarchical K/V
         hier_k = K_full[:, :, idx_table, :] 
@@ -318,6 +318,10 @@ class HierarchicalSparseAttentionRef(nn.Module):
         # Note: Hierarchy Causal Masking is implicitly handled by table construction
         # (Table only includes valid past/present uncles).
         # We can apply a check if idx_table has invalid entries, but aligned builder uses valid.
+
+        # [CRITICAL FIX] Apply the hierarchy causal mask!
+        if mask is not None:
+            hier_logits = hier_logits.masked_fill(hier_causal_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
 
         # ---------------------------------------------------------
         # 3. FUSION & OUTPUT
