@@ -110,6 +110,7 @@ class BuildParentNodesFunc(torch.autograd.Function):
         
         return dQ, dKp, dVp, dKc, dVc
 
+
 class HierarchicalAttentionFunc(torch.autograd.Function):
     @staticmethod
     def forward(ctx, Q, K, V, idx_table, gather_table, mask_table=None, window_size=16):
@@ -124,7 +125,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         RADIUS = window_size
         WINDOW_TOTAL_WIDTH = 2 * RADIUS + 1
         
-        # [NEW] Calculate padded block window size for Triton allocations
+        # Calculate padded block window size for Triton allocations
         BLOCK_WINDOW = triton.next_power_of_2(WINDOW_TOTAL_WIDTH)
         
         Out = torch.empty_like(Q)
@@ -152,7 +153,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             H=H, BLOCK_H=BLOCK_H,
             D=D, LEVELS=LEVELS,
             BLOCK_D=BLOCK_D, BLOCK_LEVELS=BLOCK_LEVELS,
-            BLOCK_WINDOW=BLOCK_WINDOW, # [NEW] Injecting padded size
+            BLOCK_WINDOW=BLOCK_WINDOW, 
             HAS_MASK=HAS_MASK,
             RADIUS=RADIUS,
             N=N,
@@ -160,15 +161,16 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
         )
         
         ctx.save_for_backward(Q, K, V, idx_table, gather_table, Weights, mask_table)
-        # [NEW] Saving BLOCK_WINDOW to ctx
-        ctx.constants = (sm_scale, H, BLOCK_H, D, BLOCK_D, LEVELS, BLOCK_LEVELS, RADIUS, WINDOW_TOTAL_WIDTH, BLOCK_WINDOW)
+        
+        # Save block size and causal flag for backward
+        is_causal = HAS_MASK
+        ctx.constants = (sm_scale, H, BLOCK_H, D, BLOCK_D, LEVELS, BLOCK_LEVELS, RADIUS, WINDOW_TOTAL_WIDTH, BLOCK_WINDOW, is_causal)
         return Out
 
     @staticmethod
     def backward(ctx, grad_output):
         Q, K, V, idx_table, gather_table, Weights, mask_table = ctx.saved_tensors
-        # [NEW] Unpack BLOCK_WINDOW
-        sm_scale, H, BLOCK_H, D, BLOCK_D, LEVELS, BLOCK_LEVELS, RADIUS, WINDOW_SIZE, BLOCK_WINDOW = ctx.constants
+        sm_scale, H, BLOCK_H, D, BLOCK_D, LEVELS, BLOCK_LEVELS, RADIUS, WINDOW_SIZE, BLOCK_WINDOW, is_causal = ctx.constants
 
         grad_output = grad_output.contiguous()
         B, N = Q.shape[0], Q.shape[1]
@@ -185,23 +187,17 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             *idx_table.stride(), *DS.stride(),            
             sm_scale, H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=32, 
             LEVELS=LEVELS, BLOCK_LEVELS=BLOCK_LEVELS, 
-            BLOCK_WINDOW=BLOCK_WINDOW, # [NEW] Injecting padded size
+            BLOCK_WINDOW=BLOCK_WINDOW, 
             HAS_MASK=HAS_MASK,
             RADIUS=RADIUS, WINDOW_SIZE=WINDOW_SIZE, N=N,
             num_warps=2
         )
 
-        # --- SETUP PARALLELISM ---
-        #dK = torch.zeros_like(K)
-        #dV = torch.zeros_like(V)
         dK = torch.zeros_like(K, dtype=torch.float32)
         dV = torch.zeros_like(V, dtype=torch.float32)
 
-        # --- BRANCH 2: dK/dV (Dependent on dS) ---
-        
-        # Step A: Leaf Kernel (Level 0)
+        # --- KERNEL A: Leaf Kernel (Level 0) ---
         grid_window = (N, B)
-        # FIXED: Added 'tri_attn.' prefix
         tri_attn.hierarchical_attention_backward_dK_dV_window_kernel[grid_window](
             DS, Q, Weights, grad_output_4d,
             dK, dV,
@@ -209,21 +205,19 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
             *grad_output_4d.stride(), *dK.stride(),
             H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
             RADIUS=RADIUS, WINDOW_SIZE=WINDOW_SIZE, N=N,
+            IS_CAUSAL=is_causal, 
             num_warps=2
         )
 
-        # --- Dynamic CUTOFF_LEVEL Logic (Heuristic from helper) ---
-        CUTOFF_LEVEL = get_cutoff_level(N)
+        # Assuming get_cutoff_level is defined elsewhere in your file
+        CUTOFF_LEVEL = get_cutoff_level(N) if 'get_cutoff_level' in globals() else int(math.log2(N)) // 2
         
-        # --- KERNEL A: Low Levels (Split=1) ---
+        # --- KERNEL B: Low Levels (Split=1) ---
         if LEVELS >= 1:
             limit = min(LEVELS, CUTOFF_LEVEL)
-            # Total blocks = N - (N >> limit)
             total_blocks_low = N - (N >> limit)
-            
             grid_low = (total_blocks_low, B)
             
-            # FIXED: Added 'tri_attn.' prefix
             tri_attn.hierarchical_attention_backward_low_level_kernel[grid_low](
                 DS, Q, Weights, grad_output_4d, gather_table,
                 dK, dV,
@@ -232,23 +226,17 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
                 H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
                 N=N, 
                 MAX_LEVEL=limit, 
+                WINDOW_SIZE=WINDOW_SIZE, 
                 num_warps=4
             )
         
-        # --- KERNEL B: High Levels (Split>1) ---
+        # --- KERNEL C: High Levels (Split>1) ---
         if LEVELS > CUTOFF_LEVEL:
             num_high_levels = LEVELS - CUTOFF_LEVEL
-            
-            # Constant blocks per level = N >> (CUTOFF)
-            # Actually, logic dictates: N >> (START_LEVEL - 1)
-            # If START_LEVEL=9, we need N >> 8.
             blocks_per_lvl = N >> CUTOFF_LEVEL
-            
             total_blocks_high = blocks_per_lvl * num_high_levels
-            
             grid_high = (total_blocks_high, B)
             
-            # FIXED: Added 'tri_attn.' prefix
             tri_attn.hierarchical_attention_backward_high_level_kernel[grid_high](
                 DS, Q, Weights, grad_output_4d, gather_table,
                 dK, dV,
@@ -257,6 +245,7 @@ class HierarchicalAttentionFunc(torch.autograd.Function):
                 H=H, BLOCK_H=BLOCK_H, D=D, BLOCK_D=BLOCK_D,
                 N=N,
                 START_LEVEL=CUTOFF_LEVEL + 1,
+                WINDOW_SIZE=WINDOW_SIZE, 
                 num_warps=2
             )
 

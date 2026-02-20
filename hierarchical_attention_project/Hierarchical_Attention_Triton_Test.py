@@ -709,9 +709,9 @@ def run_full_suite_update_X_from_Y():
     # Config: Large scale to saturate GPU
     #B, N, D, H = 32, 4096, 64, 8
     #B, N, D, H = 64, 2048, 64, 8
-    B, N, D, H = 1, 2048 * 64, 64, 8
+    #B, N, D, H = 1, 2048 * 64, 64, 8
     #B, N, D, H = 1, 2048 * 256, 64, 8
-    #B, N, D, H = 128, 512, 64, 8
+    B, N, D, H = 128, 512, 64, 8
     #B, N, D, H = 128, 256, 64, 8
     #B, N, D, H = 64, 1024, 64, 8
     dim = D * H
