@@ -758,7 +758,7 @@ def hierarchical_attention_backward_dQ_kernel(
         # -------------------------------------------------------
         # B. Hierarchy Loop (Updated Offsets)
         # -------------------------------------------------------
-        for lvl_idx in tl.static_range(0, LEVELS):
+        for lvl_idx in range(LEVELS):
             # 1. Load Topology
             off_lookup = node_idx * sl_n + lvl_idx * sl_lvl
             
