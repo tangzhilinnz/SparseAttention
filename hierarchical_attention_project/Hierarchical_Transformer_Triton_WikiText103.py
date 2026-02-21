@@ -240,7 +240,7 @@ class DecoderLayer(nn.Module):
     def __init__(self, d_model, num_heads, d_ff, dropout=0.1):
         super().__init__()
         # [MODIFIED] Use the class from the new library
-        self.self_attn = HierarchicalAttention(d_model, num_heads, dropout)
+        self.self_attn = HierarchicalAttention(d_model, num_heads, dropout, window_size=18)
         self.feed_forward = PositionwiseFeedForward(d_model, d_ff, dropout)
 
         self.norm1 = nn.LayerNorm(d_model)
@@ -626,7 +626,7 @@ if torch.cuda.device_count() > 1:
 model = model.to(device)
 
 # Training parameters
-num_epochs = 100       # WT103 converges slower, but 40 epochs is usually plenty
+num_epochs = 30       # WT103 converges slower, but 40 epochs is usually plenty
 learning_rate = 2e-4  # Standard LR for this model size
 
 print("\n<> Starting Training on WikiText-103...")
