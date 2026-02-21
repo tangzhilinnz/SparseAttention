@@ -600,8 +600,8 @@ def run_full_suite_update_X_from_Y():
     # B, N, D, H = 16, 2048 * 16, 64, 16
     # B, N, D, H = 2, 2048 * 32, 64, 16
     # B, N, D, H = 2, 64, 64, 16
-    # B, N, D, H = 16, 256, 64, 16
-    B, N, D, H = 16, 2048, 64, 16
+    B, N, D, H = 16, 256, 64, 16
+    # B, N, D, H = 16, 2048, 64, 16
     dim = H * D
     window_size_set = 32
 
