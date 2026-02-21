@@ -1,5 +1,5 @@
 ﻿import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 import math
 from dataclasses import dataclass
