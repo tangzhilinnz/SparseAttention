@@ -7,7 +7,7 @@ import sys # Added for path manipulation
 # CRITICAL FIX: GPU SELECTION MUST BE FIRST
 # ==========================================
 # Set this before importing torch or calling torch.cuda to avoid OOM
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 import datasets
 # Essential PyTorch imports
