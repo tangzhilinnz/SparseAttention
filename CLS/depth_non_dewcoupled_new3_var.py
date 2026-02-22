@@ -35,7 +35,13 @@ set_variance = 1.0
 
 # VARIABLE parameters (Iterate over these)
 depths = [3, 6, 9]
-base_lrs = [0.1, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0]
+
+# Generate 10 logarithmically spaced learning rates from 0.1 to 3.0
+base_lrs = (2 ** np.linspace(np.log2(0.1), np.log2(3.0), 10)).tolist()
+
+# Print the generated learning rates rounded to 3 decimal places for easy checking
+formatted_lrs = [f"{lr:.3f}" for lr in base_lrs]
+print(f"Generated base_lrs: {formatted_lrs}")
 
 # 1. Seed Setting
 def set_seed(seed=42):
@@ -114,10 +120,9 @@ def relu_prime(x):
 
 class DecoupledFNNBlockFn(Function):
     @staticmethod
-    def forward(ctx, h, h_norm, U_fwd, U_bwd, W_fwd, W_bwd, U_fwd_copy, W_fwd_copy,
-                alpha, inv_sqrt_n, phi, phi_prime):
+    def forward(ctx, h, h_norm, W_fwd, W_bwd, W_fwd_copy, alpha, inv_sqrt_n, phi, phi_prime):
         # We save h_norm because activations/projections are based on it
-        ctx.save_for_backward(h_norm, W_fwd)
+        ctx.save_for_backward(h_norm, W_fwd, W_bwd)
         ctx.alpha = alpha
         ctx.phi = phi
         ctx.phi_prime = phi_prime
@@ -139,7 +144,7 @@ class DecoupledFNNBlockFn(Function):
 
     @staticmethod
     def backward(ctx, grad_y, grad_x_fwd_diff=None, grad_y_fwd_diff=None):
-        h_norm, W_fwd = ctx.saved_tensors
+        h_norm, W_fwd, W_bwd = ctx.saved_tensors
         alpha = ctx.alpha
         phi = ctx.phi
         phi_prime = ctx.phi_prime
@@ -153,22 +158,21 @@ class DecoupledFNNBlockFn(Function):
         # 2. Gradient for W_fwd
         grad_W_fwd = alpha * torch.einsum("...i,...j->ij", grad_y, a)
 
-        # 3. Gradient w.r.t Inputs
-        # Grad for residual 'h': Direct pass-through
-        grad_h = grad_y 
-
         # Grad for branch 'h_norm': Backprop through W, then Phi
-        grad_a = alpha * (grad_y @ W_fwd) 
-        grad_h_norm = grad_a * da_dh_norm 
+        grad_a = alpha * (grad_y @ W_bwd) 
+        grad_h_norm = grad_a * da_dh_norm
+
+        # Residual gradient
+        grad_h = grad_y.clone()
+
+        # ===== tie bwd grads (Kolen-Pollack style) =====
+        grad_W_bwd = grad_W_fwd.clone()
         
         return (
             grad_h,      # Residual gradient
             grad_h_norm, # Normed input gradient
-            None,        # grad_U_fwd (Unused)
-            None,        # grad_U_bwd (Unused)
             grad_W_fwd,
-            None,        # grad_W_bwd (Unused)
-            None,        # U_fwd_copy
+            grad_W_bwd,
             None,        # W_fwd_copy
             None,        # alpha
             None,        # inv_sqrt_n
@@ -188,20 +192,12 @@ class DecoupledFNN(nn.Module):
         # PRE-NORM Layer
         self.norm = nn.RMSNorm(n, elementwise_affine=False)
 
-        # forward weights
-        self.U_fwd = nn.Parameter(torch.randn(n, n))
         self.W_fwd = nn.Parameter(torch.randn(n, n))
-
-        # fully decoupled
-        self.U_bwd = nn.Parameter(torch.randn(n, n))
         self.W_bwd = nn.Parameter(torch.randn(n, n))
 
-        nn.init.normal_(self.U_fwd, mean=0.0, std=set_variance)
         nn.init.normal_(self.W_fwd, mean=0.0, std=set_variance)
-        nn.init.normal_(self.U_bwd, mean=0.0, std=set_variance)
         nn.init.normal_(self.W_bwd, mean=0.0, std=set_variance)
         
-        self.U_fwd_copy = self.U_fwd.clone().detach().cuda()
         self.W_fwd_copy = self.W_fwd.clone().detach().cuda()
 
         self.alpha = math.sqrt(T / (L * n))
@@ -214,11 +210,8 @@ class DecoupledFNN(nn.Module):
         return DecoupledFNNBlockFn.apply(
             h,          # Residual backbone
             h_norm,     # Normed input for branch
-            self.U_fwd,
-            self.U_bwd,
             self.W_fwd,
             self.W_bwd,
-            self.U_fwd_copy,
             self.W_fwd_copy,
             self.alpha,
             self.inv_sqrt_n,
@@ -239,13 +232,10 @@ class DecoupledAttBlockFn(Function):
         ctx,
         h,                      # [b, n, d_model] - RESIDUAL
         h_norm,                 # [b, n, d_model] - NORMALIZED
-        q_fwd, k_fwd, v_fwd, o_fwd,    
-        q_bwd, k_bwd, v_bwd, o_bwd,    
-        q_fwd_copy, k_fwd_copy, v_fwd_copy, o_fwd_copy,
-        alpha,                  
-        inv_sqrt_n,             
-        num_heads,              
-        softmax,                
+        q_fwd, k_fwd, o_fwd,
+        q_bwd, k_bwd, o_bwd,
+        q_fwd_copy, k_fwd_copy, o_fwd_copy,
+        alpha, inv_sqrt_n, num_heads, softmax,
         softmax_prime=None  
     ):
         # Save h_norm for backward (v_* are unused)
@@ -273,8 +263,7 @@ class DecoupledAttBlockFn(Function):
 
         # 3. Reference Calculations
         query_ref = h_norm @ q_fwd_copy.T
-        key_ref   = h_norm @ k_fwd_copy.T
-        value_ref = h_norm           
+        key_ref   = h_norm @ k_fwd_copy.T       
 
         queries_ref = inv_sqrt_n * rearrange(query_ref, "b s (h d) -> b h s d", h=num_heads)
         keys_ref    = inv_sqrt_n * rearrange(key_ref,   "b s (h d) -> b h s d", h=num_heads)
@@ -330,7 +319,7 @@ class DecoupledAttBlockFn(Function):
         grad_out_proj = alpha * grad_y
         grad_o_fwd = grad_out_proj.reshape(-1, d_model).T @ out_merge.reshape(-1, d_model)
 
-        grad_out_merge = grad_out_proj @ o_fwd
+        grad_out_merge = grad_out_proj @ o_bwd
         grad_out = rearrange(grad_out_merge, "b n (h d) -> b h n d", h=num_heads)
 
         grad_A = torch.einsum("bhqd, bhkd -> bhqk", grad_out, V)
@@ -356,11 +345,15 @@ class DecoupledAttBlockFn(Function):
         grad_k_fwd = grad_key_flat.T   @ h_flat
         
         # 3. Branch Input Gradient (h_norm)
-        grad_h_norm_from_q = grad_query @ q_fwd
-        grad_h_norm_from_k = grad_key   @ k_fwd
+        grad_h_norm_from_q = grad_query @ q_bwd
+        grad_h_norm_from_k = grad_key   @ k_bwd
         grad_h_norm_from_v = grad_value 
         
         grad_h_norm = grad_h_norm_from_q + grad_h_norm_from_k + grad_h_norm_from_v
+
+        grad_q_bwd = grad_q_fwd.clone()
+        grad_k_bwd = grad_k_fwd.clone()
+        grad_o_bwd = grad_o_fwd.clone()
 
         grad_alpha = None
         grad_inv_sqrt_n = None
@@ -371,9 +364,9 @@ class DecoupledAttBlockFn(Function):
         return (
             grad_h,      # Residual
             grad_h_norm, # Normed Branch
-            grad_q_fwd, grad_k_fwd, None, grad_o_fwd, 
-            None, None, None, None,                     
-            None, None, None, None,                     
+            grad_q_fwd, grad_k_fwd, grad_o_fwd, 
+            grad_q_bwd, grad_k_bwd, grad_o_bwd,                     
+            None, None, None,                     
             grad_alpha,
             grad_inv_sqrt_n,
             grad_num_heads,
@@ -430,15 +423,12 @@ class DecoupledAttention(nn.Module):
             h_norm,     # Normed
             self.q_fwd,
             self.k_fwd,
-            None,       # v_fwd
             self.o_fwd,
             self.q_bwd,
             self.k_bwd,
-            None,       # v_bwd
             self.o_bwd,
             self.q_fwd_copy,
             self.k_fwd_copy,
-            None,       # v_fwd_copy
             self.o_fwd_copy,
             self.alpha,
             self.inv_sqrt_n,
@@ -527,18 +517,22 @@ def calculate_vit_sequence_length(total_dim=3072, channels=3, patch_size=4):
 
 def set_optimizer_with_different_lr_decoupled(model, width, depth, base_lr=0.0):
     params = []
-    # Note: Using the passed 'depth' variable for scaling
     scale_factor = width * math.sqrt(depth)
     
     for name, param in model.named_parameters():
-        if "q_fwd" in name or "k_fwd" in name or "v_fwd" in name or "U_fwd" in name:
+        if "q_fwd" in name or "k_fwd" in name:
             params.append({'params': param, 'lr': base_lr * scale_factor})
-        elif "o_bwd" in name or "W_bwd" in name:
+        elif "o_bwd" in name:
             params.append({'params': param, 'lr': base_lr * scale_factor})
+        elif any(k in name for k in ["o_fwd", "q_bwd", "k_bwd", "W_fwd", "W_bwd"]):
+            params.append({'params': param, 'lr': base_lr * width})
         else:
             params.append({'params': param, 'lr': base_lr * width})
+            
     optimizer = optim.SGD(params)
     return optimizer
+
+
 
 # Initialization
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
