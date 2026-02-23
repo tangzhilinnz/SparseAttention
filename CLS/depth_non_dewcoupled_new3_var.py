@@ -26,7 +26,7 @@ from einops import rearrange, reduce, repeat
 # -----------------------------------------------------------------------------
 # FIXED parameters
 width = 256
-seed = 1
+seeds = [42, 111, 1356]
 epochs = 20
 patch_size = 8
 T = 1
