@@ -26,6 +26,36 @@ from einops import rearrange, reduce, repeat
 # -----------------------------------------------------------------------------
 # FIXED parameters
 width = 256
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+
+import math
+from dataclasses import dataclass
+from typing import Optional, Tuple
+import random
+import json
+import argparse
+import numpy as np
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import torch.utils.checkpoint
+from torch.autograd import Function
+from torch.utils.data import Subset
+import torchvision
+import torchvision.transforms as transforms
+from einops import rearrange, reduce, repeat
+
+# -----------------------------------------------------------------------------
+# Hyperparameters & Setup
+# -----------------------------------------------------------------------------
+# FIXED parameters
+width = 256
+epochs = 20           
+seed = 1
 seeds = [42, 111, 1356]
 epochs = 20
 patch_size = 8
@@ -54,7 +84,7 @@ def set_seed(seed=42):
     torch.backends.cudnn.benchmark = False
     os.environ['PYTHONHASHSEED'] = str(seed)
 
-#set_seed(seed)
+set_seed(seed)
 
 # -----------------------------------------------------------------------------
 # Data Preparation
@@ -585,20 +615,8 @@ for depth in depths:
 
         # --- SEED LOOP ---
         for s_idx, current_seed in enumerate(seeds):
+            # Reset random seeds so model weights initialize uniquely for this seed
             set_seed(current_seed)
-
-            g = torch.Generator()
-            g.manual_seed(current_seed)
-            perm = torch.randperm(num_train, generator=g).tolist()
-            valid_idx = perm[:valid_size]
-            train_idx = perm[valid_size:]
-
-            trainset = Subset(trainset_full, train_idx)
-            validset = Subset(validset_full, valid_idx)
-
-            trainloader = torch.utils.data.DataLoader(trainset, batch_size=batch_size, shuffle=True)
-            validloader = torch.utils.data.DataLoader(validset, batch_size=test_batch_size, shuffle=False)
-            testloader_seed = torch.utils.data.DataLoader(testset, batch_size=test_batch_size, shuffle=False)
 
             seqlen = int(calculate_vit_sequence_length(total_dim=3072, channels=3, patch_size=patch_size))
             input_dim = int(3072/seqlen)
@@ -629,7 +647,7 @@ for depth in depths:
                 all_train_accuracy = []
                 
                 with torch.no_grad():
-                    for batch_idx, (data, target) in enumerate(tqdm(testloader_seed, desc="Test", leave=False)):
+                    for batch_idx, (data, target) in enumerate(tqdm(testloader, desc="Test", leave=False)):
                         data, target = data.to(device), target.to(device)
                         data = img_to_patch_pt(data, patch_size=patch_size, flatten_channels=True)
                         output, mid_layers = model(data)
@@ -680,7 +698,7 @@ for depth in depths:
                 hist_valid_acc[s_idx, epoch] = curr_valid_acc_val 
                 hist_train_epoch_loss[s_idx, epoch] = curr_train_epoch_loss_val
                 
-                # --- NEW PRINT: Per Seed, Per Epoch ---
+                # --- PRINT: Per Seed, Per Epoch ---
                 print(f"   [Seed {current_seed} | Ep {epoch+1}/{epochs}] "
                       f"Train Loss: {curr_train_epoch_loss_val:.4f}, Train Acc: {curr_train_acc_val:.4f} | "
                       f"Valid Loss: {curr_valid_loss_val:.4f}, Valid Acc: {curr_valid_acc_val:.4f} | "
@@ -698,7 +716,7 @@ for depth in depths:
         avg_valid_acc = np.mean(hist_valid_acc, axis=0)
         avg_train_epoch_loss = np.mean(hist_train_epoch_loss, axis=0)
 
-        # --- NEW PRINT: Averaged Per Epoch ---
+        # --- PRINT: Averaged Per Epoch ---
         print(f"\n   --- AVERAGED RESULTS ACROSS {num_seeds} SEEDS (LR: {base_lr}) ---")
         for ep in range(epochs):
             print(f"   [Averaged | Ep {ep+1}/{epochs}] "
