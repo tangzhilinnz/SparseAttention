@@ -690,6 +690,7 @@ my_path = "/home/ztang13/workspace/SparseAttention/CLS/data"
 if not os.path.exists(my_path):
     os.makedirs(my_path)
 
+
 print("=================================================================================")
 print(f"STARTING GRID SEARCH | Depths: {depths} | LRs: {base_lrs} | Seeds: {seeds}")
 print("=================================================================================")
@@ -820,6 +821,12 @@ for depth in depths:
                 hist_valid_loss[s_idx, epoch] = float(np.mean(all_valid_loss))    
                 hist_valid_acc[s_idx, epoch] = float(np.mean(all_valid_accuracy)) 
                 hist_train_loss[s_idx, epoch] = float(np.mean(all_train_loss))
+                
+                # --- PRINT: Per Seed, Per Epoch ---
+                print(f"   [Seed {current_seed} | Ep {epoch+1}/{epochs}] "
+                      f"Train Loss: {hist_train_epoch_loss[s_idx, epoch]:.4f}, Train Acc: {hist_train_acc[s_idx, epoch]:.4f} | "
+                      f"Valid Loss: {hist_valid_loss[s_idx, epoch]:.4f}, Valid Acc: {hist_valid_acc[s_idx, epoch]:.4f} | "
+                      f"Test Loss: {hist_test_loss[s_idx, epoch]:.4f}, Test Acc: {hist_test_acc[s_idx, epoch]:.4f}")
 
         # ==========================================================
         # After all 3 seeds are done for this LR, calculate averages
@@ -833,6 +840,15 @@ for depth in depths:
         avg_test_acc = np.mean(hist_test_acc, axis=0)
         avg_valid_acc = np.mean(hist_valid_acc, axis=0)
         avg_train_epoch_loss = np.mean(hist_train_epoch_loss, axis=0)
+        
+        # --- PRINT: Averaged Per Epoch ---
+        print(f"\n   --- AVERAGED RESULTS ACROSS {num_seeds} SEEDS (LR: {base_lr}) ---")
+        for ep in range(epochs):
+            print(f"   [Averaged | Ep {ep+1}/{epochs}] "
+                  f"Train Loss: {avg_train_epoch_loss[ep]:.4f}, Train Acc: {avg_train_acc[ep]:.4f} | "
+                  f"Valid Loss: {avg_valid_loss[ep]:.4f}, Valid Acc: {avg_valid_acc[ep]:.4f} | "
+                  f"Test Loss: {avg_test_loss[ep]:.4f}, Test Acc: {avg_test_acc[ep]:.4f}")
+        print("   -----------------------------------------------------------------\n")
 
         # Find the BEST epoch based on the lowest AVERAGED validation loss
         best_epoch_idx = np.argmin(avg_valid_loss) # Returns the index (0 to 19)
