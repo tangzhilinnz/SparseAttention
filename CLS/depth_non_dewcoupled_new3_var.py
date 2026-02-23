@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 
 import math
 from dataclasses import dataclass
@@ -27,7 +27,7 @@ from einops import rearrange, reduce, repeat
 # FIXED parameters
 width = 256
 seed = 1
-epochs = 30
+epochs = 20
 patch_size = 8
 T = 1
 num_head = 1
@@ -540,171 +540,205 @@ my_path = "/home/ztang13/workspace/SparseAttention/CLS/data"
 if not os.path.exists(my_path):
     os.makedirs(my_path)
 
+
+
 print("=================================================================================")
-print(f"STARTING EXPERIMENTS | Depths: {depths} | LRs: {base_lrs}")
+print(f"STARTING EXPERIMENTS | Depths: {depths} | LRs: {base_lrs} | Seeds: {seeds}")
 print("=================================================================================")
 
 for depth in depths:
-    # We save ONE json per Depth, covering all LRs
-    task_name = "depth-decoupled-prenorm-var01ep30-depth:{}-width:{}-seed:{}".format(depth, width, seed)
+    task_name = "depth-decoupled-prenorm-var01ep{}-depth:{}-width:{}-seeds_averaged".format(epochs, depth, width)
     
-    # Structure to hold results
     results = {
         "task_info": {
-            "width": width, "depth": depth, "T": T, "seed": seed, "epochs": epochs, "base_lrs": base_lrs
+            "width": width, "depth": depth, "T": T, "seeds_used": seeds, "epochs": epochs, "base_lrs": base_lrs
         },
-        "summary": {},    # To store the Best Acc/Loss for each LR
-        "training_results": {} # To store per-epoch logs for each LR (matches your old structure key)
+        "summary": {},    
+        "training_results": {} 
     }
     
     print(f"\nProcessing Depth {depth}...")
 
     for base_lr in base_lrs:
-        set_seed(seed)
-
-        seqlen = int(calculate_vit_sequence_length(total_dim=3072, channels=3, patch_size=patch_size))
-        input_dim = int(3072/seqlen)
+        print(f"   -> LR: {base_lr} Started across {len(seeds)} independent seeds")
         
-        # Re-init model for each depth/LR combination
-        model = DecoupledVitModel(L=depth, n=width, seqlen=seqlen, input_dim=input_dim, num_heads=num_head, T=T).to(device)
-        optimizer = set_optimizer_with_different_lr_decoupled(model, width, depth, base_lr=base_lr)
-        criterion = nn.CrossEntropyLoss()
-
         lr_key = f"lr_{base_lr}"
         results["training_results"][lr_key] = {
-            "epochs": [],
+            "epochs": list(range(1, epochs + 1)),
             "train_loss": [],
             "test_loss": [],
-            "valid_loss": [],       # <-- Added
+            "valid_loss": [],
             "train_accuracy": [],
             "test_accuracy": [],
-            "valid_accuracy": [],   # <-- Added
+            "valid_accuracy": [],
             "train_epoch_loss": []
         }
         
-        # Track best performance for this LR
-        best_test_acc = 0.0
-        min_test_loss = 0.0
-        best_epoch = -1
-        
-        # --- NEW TRACKING VARIABLES ---
-        best_epoch_train_acc = 0.0
-        best_epoch_train_loss = 0.0
-        
-        # NEW: Initialize Valid tracking for MINIMIZATION
-        best_valid_loss = float('inf')
-        best_valid_acc = 0.0
-        
-        all_train_loss = []
-        
-        print(f"   -> LR: {base_lr} Started")
-        
-        for epoch in range(epochs):
-            # 1. Train Step
-            model.train()
-            for batch_idx, (data, target) in enumerate(tqdm(trainloader, desc=f"Ep {epoch+1} Train", leave=False)):
-                data, target = data.to(device), target.to(device)
-                data = img_to_patch_pt(data, patch_size=patch_size, flatten_channels=True)
-                optimizer.zero_grad()
-                output, mid_layers = model(data)
-                loss = criterion(output, target)
-                loss.backward()
-                all_train_loss.append(loss.item())
-                optimizer.step()
-            
-            # 2. Evaluation Step
-            model.eval()
-            all_train_loss_after_epoch = []
-            all_test_loss = []
-            all_acc = []
-            all_train_accuracy = []
-            
-            # Test Loop
-            with torch.no_grad():
-                for batch_idx, (data, target) in enumerate(tqdm(testloader, desc="Test", leave=False)):
-                    data, target = data.to(device), target.to(device)
-                    data = img_to_patch_pt(data, patch_size=patch_size, flatten_channels=True)
-                    output, mid_layers = model(data)
-                    loss = criterion(output, target)
-                    acc = (output.argmax(dim=1) == target).float().mean()
-                    all_test_loss.append(loss.item())
-                    all_acc.append(acc.item())
-            
-            # Train Eval Loop
-            with torch.no_grad():
-                for batch_idx, (data, target) in enumerate(tqdm(trainloader, desc="Train Eval", leave=False)):
-                    data, target = data.to(device), target.to(device)
-                    data = img_to_patch_pt(data, patch_size=patch_size, flatten_channels=True)
-                    output, mid_layers = model(data)
-                    loss = criterion(output, target)
-                    all_train_loss_after_epoch.append(loss.item())
-                    _, predicted = output.max(1)
-                    correct = predicted.eq(target).sum().item()
-                    accuracy = correct / target.size(0)
-                    all_train_accuracy.append(accuracy)
-            
-            # Valid Loop
-            all_valid_loss = []
-            all_valid_accuracy = []
-            with torch.no_grad():
-                for batch_idx, (data, target) in enumerate(tqdm(validloader, desc="Valid", leave=False)):
-                    data, target = data.to(device), target.to(device)
-                    data = img_to_patch_pt(data, patch_size=patch_size, flatten_channels=True)
-                    output, mid_layers = model(data)
-                    loss = criterion(output, target)
-                    all_valid_loss.append(loss.item())
-                    acc = (output.argmax(dim=1) == target).float().mean()
-                    all_valid_accuracy.append(acc.item())
+        num_seeds = len(seeds)
+        hist_train_loss = np.zeros((num_seeds, epochs))
+        hist_test_loss = np.zeros((num_seeds, epochs))
+        hist_valid_loss = np.zeros((num_seeds, epochs))
+        hist_train_acc = np.zeros((num_seeds, epochs))
+        hist_test_acc = np.zeros((num_seeds, epochs))
+        hist_valid_acc = np.zeros((num_seeds, epochs))
+        hist_train_epoch_loss = np.zeros((num_seeds, epochs))
 
-            # Store metrics
-            current_results = results["training_results"][lr_key]
-            curr_train_loss = float(np.mean(all_train_loss)) 
-            curr_test_loss = float(np.mean(all_test_loss))
-            curr_valid_loss = float(np.mean(all_valid_loss))    # <-- Calc Mean
-            curr_train_acc = float(np.mean(all_train_accuracy))
-            curr_test_acc = float(np.mean(all_acc))
-            curr_valid_acc = float(np.mean(all_valid_accuracy)) # <-- Calc Mean
-            curr_train_epoch_loss = float(np.mean(all_train_loss_after_epoch))
+        # --- SEED LOOP ---
+        for s_idx, current_seed in enumerate(seeds):
+            set_seed(current_seed)
 
-            current_results["epochs"].append(epoch + 1)
-            current_results["train_loss"].append(curr_train_loss)
-            current_results["test_loss"].append(curr_test_loss)
-            current_results["valid_loss"].append(curr_valid_loss) # <-- Save
-            current_results["train_accuracy"].append(curr_train_acc)
-            current_results["test_accuracy"].append(curr_test_acc)
-            current_results["valid_accuracy"].append(curr_valid_acc) # <-- Save
-            current_results["train_epoch_loss"].append(curr_train_epoch_loss)
+            g = torch.Generator()
+            g.manual_seed(current_seed)
+            perm = torch.randperm(num_train, generator=g).tolist()
+            valid_idx = perm[:valid_size]
+            train_idx = perm[valid_size:]
+
+            trainset = Subset(trainset_full, train_idx)
+            validset = Subset(validset_full, valid_idx)
+
+            trainloader = torch.utils.data.DataLoader(trainset, batch_size=batch_size, shuffle=True)
+            validloader = torch.utils.data.DataLoader(validset, batch_size=test_batch_size, shuffle=False)
+            testloader_seed = torch.utils.data.DataLoader(testset, batch_size=test_batch_size, shuffle=False)
+
+            seqlen = int(calculate_vit_sequence_length(total_dim=3072, channels=3, patch_size=patch_size))
+            input_dim = int(3072/seqlen)
             
-            # --- UPDATED BEST LOGIC (Based on Min Valid Loss) ---
-            if curr_valid_loss < best_valid_loss:
-                best_valid_loss = curr_valid_loss  # New Min
-                best_valid_acc = curr_valid_acc
+            model = DecoupledVitModel(L=depth, n=width, seqlen=seqlen, input_dim=input_dim, num_heads=num_head, T=T).to(device)
+            optimizer = set_optimizer_with_different_lr_decoupled(model, width, depth, base_lr=base_lr)
+            criterion = nn.CrossEntropyLoss()
+
+            all_train_loss = [] 
+
+            # --- EPOCH LOOP ---
+            for epoch in range(epochs):
+                model.train()
+                for batch_idx, (data, target) in enumerate(tqdm(trainloader, desc=f"D{depth}|LR{base_lr}|S{current_seed}|Ep{epoch+1} Train", leave=False)):
+                    data, target = data.to(device), target.to(device)
+                    data = img_to_patch_pt(data, patch_size=patch_size, flatten_channels=True)
+                    optimizer.zero_grad()
+                    output, mid_layers = model(data)
+                    loss = criterion(output, target)
+                    loss.backward()
+                    all_train_loss.append(loss.item())
+                    optimizer.step()
                 
-                # Snapshot other metrics at this epoch
-                best_test_acc = curr_test_acc
-                min_test_loss = curr_test_loss
-                best_epoch = epoch + 1
-                best_epoch_train_acc = curr_train_acc
-                best_epoch_train_loss = curr_train_epoch_loss
+                model.eval()
+                all_train_loss_after_epoch = []
+                all_test_loss = []
+                all_acc = []
+                all_train_accuracy = []
+                
+                with torch.no_grad():
+                    for batch_idx, (data, target) in enumerate(tqdm(testloader_seed, desc="Test", leave=False)):
+                        data, target = data.to(device), target.to(device)
+                        data = img_to_patch_pt(data, patch_size=patch_size, flatten_channels=True)
+                        output, mid_layers = model(data)
+                        loss = criterion(output, target)
+                        acc = (output.argmax(dim=1) == target).float().mean()
+                        all_test_loss.append(loss.item())
+                        all_acc.append(acc.item())
+                
+                with torch.no_grad():
+                    for batch_idx, (data, target) in enumerate(tqdm(trainloader, desc="Train Eval", leave=False)):
+                        data, target = data.to(device), target.to(device)
+                        data = img_to_patch_pt(data, patch_size=patch_size, flatten_channels=True)
+                        output, mid_layers = model(data)
+                        loss = criterion(output, target)
+                        all_train_loss_after_epoch.append(loss.item())
+                        _, predicted = output.max(1)
+                        correct = predicted.eq(target).sum().item()
+                        accuracy = correct / target.size(0)
+                        all_train_accuracy.append(accuracy)
+                
+                all_valid_loss = []
+                all_valid_accuracy = []
+                with torch.no_grad():
+                    for batch_idx, (data, target) in enumerate(tqdm(validloader, desc="Valid", leave=False)):
+                        data, target = data.to(device), target.to(device)
+                        data = img_to_patch_pt(data, patch_size=patch_size, flatten_channels=True)
+                        output, mid_layers = model(data)
+                        loss = criterion(output, target)
+                        all_valid_loss.append(loss.item())
+                        acc = (output.argmax(dim=1) == target).float().mean()
+                        all_valid_accuracy.append(acc.item())
 
-            print(f"LR: {base_lr}, Epoch: {epoch+1}, Train Loss: {curr_train_epoch_loss:.4f}, Valid Loss: {curr_valid_loss:.4f}, Test Loss: {curr_test_loss:.4f}, Train Acc: {curr_train_acc:.4f}, Valid Acc: {curr_valid_acc:.4f}, Test Acc: {curr_test_acc:.4f}")
+                # Calculate current values
+                curr_train_loss_val = float(np.mean(all_train_loss))
+                curr_test_loss_val = float(np.mean(all_test_loss))
+                curr_valid_loss_val = float(np.mean(all_valid_loss))    
+                curr_train_acc_val = float(np.mean(all_train_accuracy))
+                curr_test_acc_val = float(np.mean(all_acc))
+                curr_valid_acc_val = float(np.mean(all_valid_accuracy)) 
+                curr_train_epoch_loss_val = float(np.mean(all_train_loss_after_epoch))
+
+                # Populate history arrays for this specific seed and epoch
+                hist_train_loss[s_idx, epoch] = curr_train_loss_val 
+                hist_test_loss[s_idx, epoch] = curr_test_loss_val
+                hist_valid_loss[s_idx, epoch] = curr_valid_loss_val    
+                hist_train_acc[s_idx, epoch] = curr_train_acc_val
+                hist_test_acc[s_idx, epoch] = curr_test_acc_val
+                hist_valid_acc[s_idx, epoch] = curr_valid_acc_val 
+                hist_train_epoch_loss[s_idx, epoch] = curr_train_epoch_loss_val
+                
+                # --- NEW PRINT: Per Seed, Per Epoch ---
+                print(f"   [Seed {current_seed} | Ep {epoch+1}/{epochs}] "
+                      f"Train Loss: {curr_train_epoch_loss_val:.4f}, Train Acc: {curr_train_acc_val:.4f} | "
+                      f"Valid Loss: {curr_valid_loss_val:.4f}, Valid Acc: {curr_valid_acc_val:.4f} | "
+                      f"Test Loss: {curr_test_loss_val:.4f}, Test Acc: {curr_test_acc_val:.4f}")
+
+        # ==========================================================
+        # After all seeds finish for this LR: Average the results
+        # ==========================================================
         
-        # Save Summary for this LR
+        avg_train_loss = np.mean(hist_train_loss, axis=0)
+        avg_test_loss = np.mean(hist_test_loss, axis=0)
+        avg_valid_loss = np.mean(hist_valid_loss, axis=0)
+        avg_train_acc = np.mean(hist_train_acc, axis=0)
+        avg_test_acc = np.mean(hist_test_acc, axis=0)
+        avg_valid_acc = np.mean(hist_valid_acc, axis=0)
+        avg_train_epoch_loss = np.mean(hist_train_epoch_loss, axis=0)
+
+        # --- NEW PRINT: Averaged Per Epoch ---
+        print(f"\n   --- AVERAGED RESULTS ACROSS {num_seeds} SEEDS (LR: {base_lr}) ---")
+        for ep in range(epochs):
+            print(f"   [Averaged | Ep {ep+1}/{epochs}] "
+                  f"Train Loss: {avg_train_epoch_loss[ep]:.4f}, Train Acc: {avg_train_acc[ep]:.4f} | "
+                  f"Valid Loss: {avg_valid_loss[ep]:.4f}, Valid Acc: {avg_valid_acc[ep]:.4f} | "
+                  f"Test Loss: {avg_test_loss[ep]:.4f}, Test Acc: {avg_test_acc[ep]:.4f}")
+        print("   -----------------------------------------------------------------")
+
+        best_epoch_idx = np.argmin(avg_valid_loss) 
+        best_epoch = best_epoch_idx + 1
+        
+        best_valid_loss_val = avg_valid_loss[best_epoch_idx]
+        best_valid_acc_val = avg_valid_acc[best_epoch_idx]
+        best_test_loss_val = avg_test_loss[best_epoch_idx]
+        best_test_acc_val = avg_test_acc[best_epoch_idx]
+        best_train_loss_val = avg_train_epoch_loss[best_epoch_idx]
+        best_train_acc_val = avg_train_acc[best_epoch_idx]
+
+        current_results = results["training_results"][lr_key]
+        current_results["train_loss"] = avg_train_loss.tolist()
+        current_results["test_loss"] = avg_test_loss.tolist()
+        current_results["valid_loss"] = avg_valid_loss.tolist()
+        current_results["train_accuracy"] = avg_train_acc.tolist()
+        current_results["test_accuracy"] = avg_test_acc.tolist()
+        current_results["valid_accuracy"] = avg_valid_acc.tolist()
+        current_results["train_epoch_loss"] = avg_train_epoch_loss.tolist()
+
         results["summary"][lr_key] = {
-            "best_test_acc": best_test_acc,
-            "min_test_loss": min_test_loss,
-            "best_valid_acc": best_valid_acc,   # <-- Added
-            "best_valid_loss": best_valid_loss, # <-- Added
-            "best_epoch": best_epoch,
-            "best_epoch_train_acc": best_epoch_train_acc,
-            "best_epoch_train_loss": best_epoch_train_loss
+            "best_epoch": int(best_epoch),
+            "best_test_acc": float(best_test_acc_val),
+            "min_test_loss": float(best_test_loss_val),
+            "best_valid_acc": float(best_valid_acc_val),
+            "best_valid_loss": float(best_valid_loss_val),
+            "best_epoch_train_acc": float(best_train_acc_val),
+            "best_epoch_train_loss": float(best_train_loss_val)
         }
-        
-        # --- UPDATED FINAL PRINT ---
-        print(f"   -> LR {base_lr} Done. Best Result (Ep {best_epoch}): Test Acc {best_test_acc:.4f}, Test Loss {min_test_loss:.4f}, Valid Acc {best_valid_acc:.4f}, Valid Loss {best_valid_loss:.4f}, Train Acc {best_epoch_train_acc:.4f}, Train Loss {best_epoch_train_loss:.4f}")
 
-        # Save to JSON
+        print(f"   -> LR {base_lr} Best Result (Ep {best_epoch}): Test Acc {best_test_acc_val:.4f}, Test Loss {best_test_loss_val:.4f}, Valid Acc {best_valid_acc_val:.4f}, Valid Loss {best_valid_loss_val:.4f}, Train Acc {best_train_acc_val:.4f}, Train Loss {best_train_loss_val:.4f}")
+
         with open(f"{my_path}/{task_name}.json", 'w') as f:
             json.dump(results, f, indent=2)
 
-print("All experiments completed.")
+print("\nAll experiments completed.")
