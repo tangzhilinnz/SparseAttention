@@ -54,7 +54,7 @@ def set_seed(seed=42):
     torch.backends.cudnn.benchmark = False
     os.environ['PYTHONHASHSEED'] = str(seed)
 
-set_seed(seed)
+#set_seed(seed)
 
 # -----------------------------------------------------------------------------
 # Data Preparation
