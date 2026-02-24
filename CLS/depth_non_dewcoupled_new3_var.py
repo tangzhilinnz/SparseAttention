@@ -1,33 +1,12 @@
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 
-import math
-from dataclasses import dataclass
-from typing import Optional, Tuple
-import random
-import json
-import argparse
-import numpy as np
-from tqdm import tqdm
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-import torch.utils.checkpoint
-from torch.autograd import Function
-from torch.utils.data import Subset
-import torchvision
-import torchvision.transforms as transforms
-from einops import rearrange, reduce, repeat
-
 # -----------------------------------------------------------------------------
 # Hyperparameters & Setup
 # -----------------------------------------------------------------------------
 # FIXED parameters
 width = 256
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 import math
 from dataclasses import dataclass
@@ -234,6 +213,9 @@ class DecoupledFNN(nn.Module):
         self.inv_sqrt_n = 1.0 / math.sqrt(n)
 
     def forward(self, h):
+        # ---> ADD THIS LINE <---
+        self.W_fwd_copy.copy_(self.W_fwd.detach())
+
         # Calculate Normed Input
         h_norm = self.norm(h)
         
@@ -445,6 +427,11 @@ class DecoupledAttention(nn.Module):
         self.inv_sqrt_n = 1.0 / math.sqrt(n) 
 
     def forward(self, h):
+        # ---> ADD THESE THREE LINES <---
+        self.q_fwd_copy.copy_(self.q_fwd.detach())
+        self.k_fwd_copy.copy_(self.k_fwd.detach())
+        self.o_fwd_copy.copy_(self.o_fwd.detach())
+
         # Calculate Normed Input
         h_norm = self.norm(h)
 
