@@ -715,7 +715,7 @@ def train_transformer_model(model, train_loader, valid_loader, criterion=None, n
     patience_counter = 0
     
     # Gradient Accumulation Steps (Simulate larger batch size)
-    accumulation_steps = 8 
+    accumulation_steps = 8
 
     for epoch in range(num_epochs):
         epoch_start_time = time.time()
