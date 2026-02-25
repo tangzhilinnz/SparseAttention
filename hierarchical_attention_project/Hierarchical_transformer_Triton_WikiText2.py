@@ -230,7 +230,7 @@ class DecoderLayer(nn.Module):
         # Note: dim=d_model to match your previous code hyperparameters
         
         # [MODIFIED] Use the imported HierarchicalAttention class
-        self.self_attn = HierarchicalAttention(d_model, num_heads, dropout, window_size=10)
+        self.self_attn = HierarchicalAttention(d_model, num_heads, dropout, window_size=5)
         
         self.feed_forward = PositionwiseFeedForward(d_model, d_ff, dropout)
 
