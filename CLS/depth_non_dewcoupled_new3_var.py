@@ -1,4 +1,5 @@
 import os
+# [UPDATE]: Changed CUDA device from "3" to "2"
 os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 
 # -----------------------------------------------------------------------------
@@ -33,19 +34,21 @@ from einops import rearrange, reduce, repeat
 # -----------------------------------------------------------------------------
 # FIXED parameters
 width = 256
+# [UPDATE]: Reduced epochs from 30 to 20
 epochs = 20           
 seed = 1
+# [UPDATE]: Added an array of seeds to run multiple independent trials and average them
 seeds = [42, 111, 1356]
-epochs = 20
 patch_size = 8
 T = 1
 num_head = 1
 set_variance = 1.0
 
 # VARIABLE parameters (Iterate over these)
+# [UPDATE]: Depth is no longer fixed to 9; now iterating over multiple depths
 depths = [3, 6, 9]
 
-# Generate 10 logarithmically spaced learning rates from 0.1 to 3.0
+# [UPDATE]: Replaced the hardcoded 'base_lrs' list with 10 dynamically generated logarithmically spaced learning rates
 base_lrs = (2 ** np.linspace(np.log2(0.1), np.log2(3.0), 10)).tolist()
 
 # Print the generated learning rates rounded to 3 decimal places for easy checking
@@ -130,6 +133,7 @@ def relu_prime(x):
 class DecoupledFNNBlockFn(Function):
     @staticmethod
     def forward(ctx, h, h_norm, W_fwd, W_bwd, W_fwd_copy, alpha, inv_sqrt_n, phi, phi_prime):
+        # [UPDATE]: Removed U_fwd, U_bwd, U_fwd_copy from the forward inputs and context savings
         # We save h_norm because activations/projections are based on it
         ctx.save_for_backward(h_norm, W_fwd, W_bwd)
         ctx.alpha = alpha
@@ -137,6 +141,7 @@ class DecoupledFNNBlockFn(Function):
         ctx.phi_prime = phi_prime
 
         # 1. Apply activation directly to input h_norm (Pre-Norm)
+        # [UPDATE]: Previously x = inv_sqrt_n * (h @ U_fwd.T), now activation is applied straight to h_norm
         a = phi(h_norm)
         
         # 2. Project Down using W
@@ -159,6 +164,7 @@ class DecoupledFNNBlockFn(Function):
         phi_prime = ctx.phi_prime
 
         # --- UPDATED BACKWARD FORMULA FOR PRE-NORM ---
+        # [UPDATE]: Entire backward pass modified to remove gradients for U_fwd/U_bwd
         
         # 1. Recompute activation 'a' and its derivative w.r.t 'h_norm'
         a = phi(h_norm)
@@ -198,9 +204,11 @@ class DecoupledFNN(nn.Module):
         self.phi = phi
         self.phi_prime = phi_prime
 
+        # [UPDATE]: Introduced Pre-Norm (RMSNorm) layer to the FNN block
         # PRE-NORM Layer
         self.norm = nn.RMSNorm(n, elementwise_affine=False)
 
+        # [UPDATE]: Removed U_fwd and U_bwd parameter instantiations entirely
         self.W_fwd = nn.Parameter(torch.randn(n, n))
         self.W_bwd = nn.Parameter(torch.randn(n, n))
 
@@ -214,8 +222,10 @@ class DecoupledFNN(nn.Module):
 
     def forward(self, h):
         # ---> ADD THIS LINE <---
+        # [UPDATE]: Removed updating U_fwd_copy
         self.W_fwd_copy.copy_(self.W_fwd.detach())
 
+        # [UPDATE]: Calculate Normed Input before passing to DecoupledFNNBlockFn
         # Calculate Normed Input
         h_norm = self.norm(h)
         
@@ -244,12 +254,14 @@ class DecoupledAttBlockFn(Function):
         ctx,
         h,                      # [b, n, d_model] - RESIDUAL
         h_norm,                 # [b, n, d_model] - NORMALIZED
+        # [UPDATE]: Removed v_fwd, v_bwd, and v_fwd_copy from the forward signature
         q_fwd, k_fwd, o_fwd,
         q_bwd, k_bwd, o_bwd,
         q_fwd_copy, k_fwd_copy, o_fwd_copy,
         alpha, inv_sqrt_n, num_heads, softmax,
         softmax_prime=None  
     ):
+        # [UPDATE]: Saving h_norm instead of h, and removed V references in ctx.save_for_backward
         # Save h_norm for backward (v_* are unused)
         ctx.save_for_backward(h_norm, q_fwd, k_fwd, o_fwd, q_bwd, k_bwd, o_bwd, q_fwd_copy, k_fwd_copy, o_fwd_copy)
         ctx.alpha = alpha
@@ -264,6 +276,7 @@ class DecoupledAttBlockFn(Function):
         # 1. Projections (using h_norm for Pre-Norm)
         query = h_norm @ q_fwd.T   
         key   = h_norm @ k_fwd.T   
+        # [UPDATE]: Value projection (h_norm @ v_fwd.T) has been completely removed. Value is now directly h_norm.
         value = h_norm              
 
         queries = inv_sqrt_n * rearrange(query, "b s (h d) -> b h s d", h=num_heads)
@@ -297,6 +310,7 @@ class DecoupledAttBlockFn(Function):
 
     @staticmethod
     def backward(ctx, grad_y, q_diff=None, k_diff=None, v_diff=None, logits_diff=None, attn_diff=None):
+        # [UPDATE]: Retrieved saved tensors updated to reflect removed V weights and addition of h_norm
         # Retrieve saved tensors
         h_norm, q_fwd, k_fwd, o_fwd, q_bwd, k_bwd, o_bwd, q_fwd_copy, k_fwd_copy, o_fwd_copy = ctx.saved_tensors
         alpha = ctx.alpha
@@ -309,6 +323,7 @@ class DecoupledAttBlockFn(Function):
         # Recompute Forward using h_norm
         query = h_norm @ q_fwd.T
         key   = h_norm @ k_fwd.T
+        # [UPDATE]: Removed V computation; value = h_norm
         value = h_norm 
 
         Q = inv_sqrt_n * rearrange(query, "b s (h d) -> b h s d", h=num_heads)
@@ -347,16 +362,19 @@ class DecoupledAttBlockFn(Function):
         grad_query = rearrange(inv_sqrt_n * grad_Q, "b h s d -> b s (h d)")
         grad_key   = rearrange(inv_sqrt_n * grad_K, "b h s d -> b s (h d)")
         
+        # [UPDATE]: grad_value is calculated directly as grad_V, avoiding V projection logic
         grad_value = rearrange(grad_V, "b h s d -> b s (h d)") 
 
         h_flat = h_norm.reshape(-1, d_model)
         grad_query_flat = grad_query.reshape(-1, d_model)
         grad_key_flat   = grad_key.reshape(-1, d_model)
 
+        # [UPDATE]: Removed grad_v_fwd computation
         grad_q_fwd = grad_query_flat.T @ h_flat
         grad_k_fwd = grad_key_flat.T   @ h_flat
         
         # 3. Branch Input Gradient (h_norm)
+        # [UPDATE]: V branch directly passes grad_value to grad_h_norm_from_v without multiplying by v_bwd
         grad_h_norm_from_q = grad_query @ q_bwd
         grad_h_norm_from_k = grad_key   @ k_bwd
         grad_h_norm_from_v = grad_value 
@@ -396,9 +414,11 @@ class DecoupledAttention(nn.Module):
         self.softmax = softmax
         self.softmax_prime = None
 
+        # [UPDATE]: Added Pre-Norm layer for Attention branch
         # PRE-NORM Layer
         self.norm = nn.RMSNorm(n, elementwise_affine=False)
 
+        # [UPDATE]: Removed v_fwd, v_bwd completely
         # forward weights
         self.q_fwd = nn.Parameter(torch.randn(n, n))
         self.k_fwd = nn.Parameter(torch.randn(n, n))
@@ -428,6 +448,7 @@ class DecoupledAttention(nn.Module):
 
     def forward(self, h):
         # ---> ADD THESE THREE LINES <---
+        # [UPDATE]: Removed v_fwd_copy update
         self.q_fwd_copy.copy_(self.q_fwd.detach())
         self.k_fwd_copy.copy_(self.k_fwd.detach())
         self.o_fwd_copy.copy_(self.o_fwd.detach())
@@ -537,6 +558,7 @@ def set_optimizer_with_different_lr_decoupled(model, width, depth, base_lr=0.0):
     scale_factor = width * math.sqrt(depth)
     
     for name, param in model.named_parameters():
+        # [UPDATE]: Removed 'v_fwd' and 'U_fwd' strings from param checking since those weights were deleted
         if "q_fwd" in name or "k_fwd" in name:
             params.append({'params': param, 'lr': base_lr * scale_factor})
         elif "o_bwd" in name:
@@ -563,7 +585,9 @@ print("=========================================================================
 print(f"STARTING EXPERIMENTS | Depths: {depths} | LRs: {base_lrs} | Seeds: {seeds}")
 print("=================================================================================")
 
+# [UPDATE]: Added outer loop for depths
 for depth in depths:
+    # [UPDATE]: Task name format updated to include 'seeds_averaged'
     task_name = "depth-decoupled-prenorm-var01ep{}-depth:{}-width:{}-seeds_averaged".format(epochs, depth, width)
     
     results = {
@@ -576,6 +600,7 @@ for depth in depths:
     
     print(f"\nProcessing Depth {depth}...")
 
+    # [UPDATE]: Loop through the new dynamically created base_lrs list
     for base_lr in base_lrs:
         print(f"   -> LR: {base_lr} Started across {len(seeds)} independent seeds")
         
@@ -592,6 +617,7 @@ for depth in depths:
         }
         
         num_seeds = len(seeds)
+        # [UPDATE]: Initializing history arrays to store variables across multiple seeds for averaging
         hist_train_loss = np.zeros((num_seeds, epochs))
         hist_test_loss = np.zeros((num_seeds, epochs))
         hist_valid_loss = np.zeros((num_seeds, epochs))
@@ -601,6 +627,7 @@ for depth in depths:
         hist_train_epoch_loss = np.zeros((num_seeds, epochs))
 
         # --- SEED LOOP ---
+        # [UPDATE]: New internal loop that tests every model across a list of distinct seeds
         for s_idx, current_seed in enumerate(seeds):
             # Reset random seeds so model weights initialize uniquely for this seed
             set_seed(current_seed)
@@ -694,7 +721,7 @@ for depth in depths:
         # ==========================================================
         # After all seeds finish for this LR: Average the results
         # ==========================================================
-        
+        # [UPDATE]: Calculating the final averaged outputs after all seeds loop
         avg_train_loss = np.mean(hist_train_loss, axis=0)
         avg_test_loss = np.mean(hist_test_loss, axis=0)
         avg_valid_loss = np.mean(hist_valid_loss, axis=0)
@@ -712,6 +739,7 @@ for depth in depths:
                   f"Test Loss: {avg_test_loss[ep]:.4f}, Test Acc: {avg_test_acc[ep]:.4f}")
         print("   -----------------------------------------------------------------")
 
+        # [UPDATE]: Added tracking of "best" epoch variables from the averaged metrics
         best_epoch_idx = np.argmin(avg_valid_loss) 
         best_epoch = best_epoch_idx + 1
         
