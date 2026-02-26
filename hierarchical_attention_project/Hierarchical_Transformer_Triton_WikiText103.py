@@ -188,7 +188,7 @@ vocab_builder = EfficientVocabBuilder(dataset['train'], max_vocab_size=VOCAB_SIZ
 
 # Create Datasets
 print("\n<> Processing Training Data (This may take 1-2 mins)...")
-MAX_LEN = 2048 # Reduced slightly from 4096 to ensure safety with batching on A100
+MAX_LEN = 4096 # Reduced slightly from 4096 to ensure safety with batching on A100
 train_dataset = LargeScaleWikiTextDataset(dataset['train'], vocab_builder, max_len=MAX_LEN)
 
 print("\n<> Processing Validation Data...")
@@ -240,7 +240,7 @@ class DecoderLayer(nn.Module):
     def __init__(self, d_model, num_heads, d_ff, dropout=0.1):
         super().__init__()
         # [MODIFIED] Use the class from the new library
-        self.self_attn = HierarchicalAttention(d_model, num_heads, dropout, window_size=14)
+        self.self_attn = HierarchicalAttention(d_model, num_heads, dropout, window_size=16)
         self.feed_forward = PositionwiseFeedForward(d_model, d_ff, dropout)
 
         self.norm1 = nn.LayerNorm(d_model)
