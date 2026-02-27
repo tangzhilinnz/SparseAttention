@@ -188,7 +188,7 @@ vocab_builder = EfficientVocabBuilder(dataset['train'], max_vocab_size=VOCAB_SIZ
 
 # Create Datasets
 print("\n<> Processing Training Data (This may take 1-2 mins)...")
-MAX_LEN = 4096 # Reduced slightly from 4096 to ensure safety with batching on A100
+MAX_LEN = 2048 # Reduced slightly from 4096 to ensure safety with batching on A100
 train_dataset = LargeScaleWikiTextDataset(dataset['train'], vocab_builder, max_len=MAX_LEN)
 
 print("\n<> Processing Validation Data...")
@@ -626,7 +626,7 @@ if torch.cuda.device_count() > 1:
 model = model.to(device)
 
 # Training parameters
-num_epochs = 30       # WT103 converges slower, but 40 epochs is usually plenty
+num_epochs = 100       # WT103 converges slower, but 40 epochs is usually plenty
 learning_rate = 2e-4  # Standard LR for this model size
 
 print("\n<> Starting Training on WikiText-103...")
