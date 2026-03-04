@@ -89,7 +89,7 @@ set_seed()
 # Initialize GPT-2 BPE Tokenizer for translation/downstream compatibility
 # ==========================================
 print("\n<> Initializing GPT-2 Tokenizer...")
-global_tokenizer = AutoTokenizer.from_pretrained("gpt2")
+global_tokenizer = AutoTokenizer.from_pretrained("gpt2", model_max_length=1000000)
 if global_tokenizer.pad_token is None:
     global_tokenizer.add_special_tokens({'pad_token': '[PAD]'})
 GLOBAL_PAD_TOKEN_ID = global_tokenizer.pad_token_id
