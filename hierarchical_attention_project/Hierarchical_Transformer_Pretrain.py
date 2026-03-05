@@ -825,10 +825,11 @@ def evaluate_wikitext_103(model, test_loader, device, sliding_window=False, stri
         
         # Determine context length from model config
         # Handle DataParallel wrapper if present
-        if isinstance(model, nn.DataParallel):
-            max_len = model.module.d_model if hasattr(model.module, 'd_model') else 2048
-        else:
-            max_len = model.d_model if hasattr(model, 'd_model') else 2048
+        #if isinstance(model, nn.DataParallel):
+        #    max_len = model.module.d_model if hasattr(model.module, 'd_model') else 2048
+        #else:
+        #    max_len = model.d_model if hasattr(model, 'd_model') else 2048
+        max_len = 4096
 
         # 2. Iterate with stride
         with torch.no_grad():
