@@ -433,3 +433,20 @@ Total Tokens: 262144
 Average Loss: 2.9881
 PERPLEXITY  : 19.85
 ==================================================
+
+
+Running Sliding Window Evaluation (This will take longer)...
+
+==================================================
+<> Starting SLIDING WINDOW Evaluation (Stride=512)...
+<> Note: This provides the most accurate Perplexity.
+==================================================
+>> Flattening test data for sliding window...
+Sliding Window: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 504/504 [01:05<00:00,  7.74it/s]
+==================================================
+RESULTS: Sliding Window
+==================================================
+Total Tokens: 258048
+Average Loss: 2.9672
+PERPLEXITY  : 19.44
+==================================================

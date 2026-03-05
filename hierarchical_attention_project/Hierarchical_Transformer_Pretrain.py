@@ -388,16 +388,22 @@ class DecoderLayer(nn.Module):
         # ==========================================
         # --- MODULE 3: GATED DELTA INTEGRATION ---
         # ==========================================
-        alpha = torch.sigmoid(self.alpha_proj(y_norm))
-        beta = torch.sigmoid(self.beta_proj(y_norm))
-        
-        # Calculate the update (delta)
-        # [MODIFIED] Calls the library method
+        #alpha = torch.sigmoid(self.alpha_proj(y_norm))
+        #beta = torch.sigmoid(self.beta_proj(y_norm))
+        #
+        ## Calculate the update (delta)
+        ## [MODIFIED] Calls the library method
+        #y_delta = self.self_attn.cross_update_Y(x, y_in=y_norm)
+        #
+        ## Apply Gated Delta Connection to Y (Replaces simple residual)
+        #y_next = (alpha * y) + (beta * self.dropout(y_delta))
+        # ==========================================
+
+        # Calculate the update (delta) via your custom library
         y_delta = self.self_attn.cross_update_Y(x, y_in=y_norm)
         
-        # Apply Gated Delta Connection to Y (Replaces simple residual)
-        y_next = (alpha * y) + (beta * self.dropout(y_delta))
-        # ==========================================
+        # Apply standard residual connection to Y (Reverting Gated Delta Rule)
+        y_next = y + self.dropout(y_delta)
     
         # PRE-LAYER NORMALIZATION (Apply Norm BEFORE Attention)
         # This significantly improves stability and convergence speed
@@ -755,16 +761,16 @@ if RUN_MODE == "PRETRAIN":
     num_epochs = 50        # WT103 converges slower, but 40 epochs is usually plenty
     learning_rate = 4e-4   # Standard LR for this model size
 
-    #print("\n<> Starting Training on WikiText-103...")
-    #results = train_transformer_model(
-    #    model=model,
-    #    train_loader=train_loader,
-    #    valid_loader=valid_loader,
-    #    criterion=None, 
-    #    num_epochs=num_epochs,
-    #    learning_rate=learning_rate,
-    #    patience=50 
-    #)
+    print("\n<> Starting Training on WikiText-103...")
+    results = train_transformer_model(
+        model=model,
+        train_loader=train_loader,
+        valid_loader=valid_loader,
+        criterion=None, 
+        num_epochs=num_epochs,
+        learning_rate=learning_rate,
+        patience=50 
+    )
 
 
 # ==========================================
