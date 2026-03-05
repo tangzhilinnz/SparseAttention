@@ -755,16 +755,16 @@ if RUN_MODE == "PRETRAIN":
     num_epochs = 50        # WT103 converges slower, but 40 epochs is usually plenty
     learning_rate = 4e-4   # Standard LR for this model size
 
-    print("\n<> Starting Training on WikiText-103...")
-    results = train_transformer_model(
-        model=model,
-        train_loader=train_loader,
-        valid_loader=valid_loader,
-        criterion=None, 
-        num_epochs=num_epochs,
-        learning_rate=learning_rate,
-        patience=50 
-    )
+    #print("\n<> Starting Training on WikiText-103...")
+    #results = train_transformer_model(
+    #    model=model,
+    #    train_loader=train_loader,
+    #    valid_loader=valid_loader,
+    #    criterion=None, 
+    #    num_epochs=num_epochs,
+    #    learning_rate=learning_rate,
+    #    patience=50 
+    #)
 
 
 # ==========================================
