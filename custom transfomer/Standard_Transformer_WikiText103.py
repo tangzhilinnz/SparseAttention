@@ -3,7 +3,7 @@ import os
 # CRITICAL FIX: GPU SELECTION MUST BE FIRST
 # ==========================================
 # Set this before importing torch or calling torch.cuda to avoid OOM
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 import datasets
 # Essential PyTorch imports
@@ -159,7 +159,7 @@ vocab_builder = EfficientVocabBuilder(dataset['train'], max_vocab_size=VOCAB_SIZ
 
 # Create Datasets
 print("\n<> Processing Training Data (This may take 1-2 mins)...")
-MAX_LEN = 2048 # Reduced slightly from 4096 to ensure safety with batching on A100
+MAX_LEN = 4096 # Reduced slightly from 4096 to ensure safety with batching on A100
 train_dataset = LargeScaleWikiTextDataset(dataset['train'], vocab_builder, max_len=MAX_LEN)
 
 print("\n<> Processing Validation Data...")
@@ -626,7 +626,7 @@ model = TransformerLM(
     num_heads=12,         # Standard Base heads (up from 8)
     d_ff=3072,            # Standard FFN size (4x d_model)
     num_layers=12,        # Deep enough for WT103
-    dropout=0.15          # Slightly lower dropout as we have more data
+    dropout=0.1          # Slightly lower dropout as we have more data
 )
 
 # ENABLE MULTI-GPU SUPPORT (DataParallel)
@@ -639,8 +639,8 @@ if torch.cuda.device_count() > 1:
 model = model.to(device)
 
 # Training parameters
-num_epochs = 30       # WT103 converges slower, but 40 epochs is usually plenty
-learning_rate = 2e-4  # Standard LR for this model size
+num_epochs = 50       # WT103 converges slower, but 40 epochs is usually plenty
+learning_rate = 4e-4  # Standard LR for this model size
 
 print("\n<> Starting Training on WikiText-103...")
 results = train_transformer_model(
@@ -650,7 +650,7 @@ results = train_transformer_model(
     criterion=None, 
     num_epochs=num_epochs,
     learning_rate=learning_rate,
-    patience=100 
+    patience=50 
 )
 
 
